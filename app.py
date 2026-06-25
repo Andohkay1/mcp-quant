@@ -6,22 +6,15 @@ import requests, json, re
 from scipy.stats import norm
 
 st.set_page_config(page_title="MCP Quant Dashboard", layout="wide")
-
 st.title("MCP Quant Dashboard")
 
-# -----------------------------
-# CONFIG
-# -----------------------------
 EDGE_THRESHOLD = 5
 MIN_LIQUIDITY = 250
 MAX_DAYS = 10
-NEAR_MONEY = 10
 MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
 
-# -----------------------------
-# ENGINE
-# -----------------------------
+
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
         data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
@@ -33,14 +26,17 @@ class MCPQuantEngine:
     def ewma_volatility(self, close):
         returns = np.log(close / close.shift(1)).dropna()
         variance = returns.var()
+
         for r in returns:
             variance = EWMA_LAMBDA * variance + (1 - EWMA_LAMBDA) * (r ** 2)
+
         return np.sqrt(variance) * np.sqrt(252)
 
     def ewma_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
+
         sigma = vol * np.sqrt(max(days, 1) / 252)
         z = np.log(target / current) / sigma
 
@@ -52,6 +48,7 @@ class MCPQuantEngine:
     def historical_probability(self, ticker, target, days, direction, lookback=252):
         close = self.get_prices(ticker, "5y").tail(lookback)
         current = close.iloc[-1]
+
         required_return = target / current - 1
         future_returns = (close.shift(-days) / close - 1).dropna()
 
@@ -73,10 +70,12 @@ class MCPQuantEngine:
         delta = close.diff()
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
+
         rs = gain.rolling(14).mean() / loss.rolling(14).mean()
         rsi = 100 - (100 / (1 + rs))
 
         score = 0
+
         score += 2 if close.iloc[-1] > ma20.iloc[-1] else -2
         score += 3 if close.iloc[-1] > ma50.iloc[-1] else -3
         score += 5 if close.iloc[-1] > ma200.iloc[-1] else -5
@@ -137,23 +136,33 @@ class MCPQuantEngine:
             "Final Prob %": round(final, 2),
             "Edge %": round(edge, 2),
             "Signal": signal,
-            "Position Size $": 2 if edge >= 5 and edge < 8 else 3 if edge >= 8 and edge < 12 else 5 if edge >= 12 else 0
+            "Position Size $": (
+                2 if edge >= 5 and edge < 8
+                else 3 if edge >= 8 and edge < 12
+                else 5 if edge >= 12
+                else 0
+            )
         }
 
-# -----------------------------
-# SCREENER
-# -----------------------------
+
 asset_map = {
-    "bitcoin": "BTC-USD", "btc": "BTC-USD",
-    "ethereum": "ETH-USD", "eth": "ETH-USD",
+    "bitcoin": "BTC-USD",
+    "btc": "BTC-USD",
+    "ethereum": "ETH-USD",
+    "eth": "ETH-USD",
     "xrp": "XRP-USD",
-    "solana": "SOL-USD", "sol": "SOL-USD",
-    "tesla": "TSLA", "tsla": "TSLA",
-    "nvidia": "NVDA", "nvda": "NVDA",
+    "solana": "SOL-USD",
+    "sol": "SOL-USD",
+    "tesla": "TSLA",
+    "tsla": "TSLA",
+    "nvidia": "NVDA",
+    "nvda": "NVDA",
     "silver": "SI=F",
     "gold": "GC=F",
-    "oil": "CL=F", "wti": "CL=F"
+    "oil": "CL=F",
+    "wti": "CL=F"
 }
+
 
 def find_ticker(market):
     text = str(market).lower()
@@ -162,23 +171,65 @@ def find_ticker(market):
             return ticker
     return None
 
-def extract_target(market):
-    text = str(market).replace(",", "")
-    nums = re.findall(r"\$?(\d+(?:\.\d+)?)", text)
-    nums = [float(x) for x in nums if float(x) < 100000 and float(x) != 2026]
-    return nums[0] if nums else None
+
+def classify_market(market):
+    text = str(market).lower()
+
+    non_price_words = [
+        "ai model", "#1 ai", "model", "election", "nominee", "president",
+        "fed chair", "ceo", "app store", "posts", "tariff",
+        "unemployment", "gdp", "cpi", "inflation", "interest rate",
+        "win", "wins", "champion", "world cup", "ufc", "nba", "nfl",
+        "mlb", "tennis", "candidate"
+    ]
+
+    price_words = [
+        "price", "close above", "close below", "closes above", "closes below",
+        "above $", "below $", "greater than $", "less than $",
+        "reach $", "hit $", "dip to $"
+    ]
+
+    if any(w in text for w in non_price_words):
+        return "event"
+
+    if "between $" in text or "between" in text:
+        return "range"
+
+    if any(w in text for w in price_words):
+        return "price"
+
+    return "event"
+
 
 def infer_direction(market):
     text = str(market).lower()
-    if "above" in text or "reach" in text or "greater" in text:
-        return "above"
-    if "below" in text or "dip" in text or "low" in text:
+
+    if "below" in text or "less than" in text or "dip" in text or "low" in text:
         return "below"
+
     return "above"
+
+
+def extract_target(market):
+    text = str(market).replace(",", "")
+    nums = re.findall(r"\$?(\d+(?:\.\d+)?)", text)
+
+    nums = [
+        float(x)
+        for x in nums
+        if float(x) < 100000 and float(x) != 2026
+    ]
+
+    if not nums:
+        return None
+
+    return nums[0]
+
 
 @st.cache_data(ttl=300)
 def pull_markets():
     url = "https://gamma-api.polymarket.com/markets"
+
     params = {
         "closed": "false",
         "limit": 1000,
@@ -209,14 +260,17 @@ def pull_markets():
         })
 
     df = pd.DataFrame(rows)
+
     df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
     df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.days
 
     df["Ticker"] = df["Market"].apply(find_ticker)
     df["Target"] = df["Market"].apply(extract_target)
     df["Direction"] = df["Market"].apply(infer_direction)
+    df["Market Type"] = df["Market"].apply(classify_market)
 
     df = df[
+        (df["Market Type"] == "price") &
         (df["Ticker"].notna()) &
         (df["Target"].notna()) &
         (df["Days"] >= 0) &
@@ -226,14 +280,29 @@ def pull_markets():
 
     return df
 
-# -----------------------------
-# DASHBOARD
-# -----------------------------
+
 if st.button("Run MCP Screener"):
     markets_df = pull_markets()
 
     st.subheader("Markets Found")
     st.write(len(markets_df))
+
+    st.subheader("Filtered Price Markets")
+    st.dataframe(
+        markets_df[
+            [
+                "Market",
+                "Market Type",
+                "Ticker",
+                "Target",
+                "Direction",
+                "Market Prob %",
+                "Days",
+                "Liquidity"
+            ]
+        ],
+        use_container_width=True
+    )
 
     engine = MCPQuantEngine()
     scored = []
@@ -250,7 +319,7 @@ if st.button("Run MCP Screener"):
                     market_probability=row["Market Prob %"]
                 )
             )
-        except Exception as e:
+        except Exception:
             pass
 
     results = pd.DataFrame(scored)
@@ -267,6 +336,8 @@ if st.button("Run MCP Screener"):
         st.dataframe(buys, use_container_width=True)
 
         results.to_csv("mcp_dashboard_results.csv", index=False)
+
         st.success("Saved results to mcp_dashboard_results.csv")
+
     else:
         st.warning("No scored markets found.")
