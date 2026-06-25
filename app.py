@@ -16,6 +16,7 @@ MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
 JOURNAL_FILE = "mcp_journal.csv"
 
+
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
         data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
@@ -37,20 +38,14 @@ class MCPQuantEngine:
         vol = self.ewma_volatility(close)
         sigma = vol * np.sqrt(max(days, 1) / 252)
         z = np.log(target / current) / sigma
-
-        if direction == "above":
-            return (1 - norm.cdf(z)) * 100
-        return norm.cdf(z) * 100
+        return (1 - norm.cdf(z)) * 100 if direction == "above" else norm.cdf(z) * 100
 
     def historical_probability(self, ticker, target, days, direction, lookback=252):
         close = self.get_prices(ticker, "5y").tail(lookback)
         current = close.iloc[-1]
         required_return = target / current - 1
         future_returns = (close.shift(-days) / close - 1).dropna()
-
-        if direction == "above":
-            return (future_returns >= required_return).mean() * 100
-        return (future_returns <= required_return).mean() * 100
+        return (future_returns >= required_return).mean() * 100 if direction == "above" else (future_returns <= required_return).mean() * 100
 
     def momentum_score(self, ticker):
         close = self.get_prices(ticker, "1y")
@@ -151,11 +146,13 @@ class MCPQuantEngine:
             "Historical Prob %": round(hist, 2),
             "Base Prob %": round(base, 2),
             "Momentum": momentum,
+            "Momentum Adj %": round(mom_adj, 2),
             "Final Prob %": round(final, 2),
             "Edge %": round(edge, 2),
             "Signal": signal,
             "Position Size $": size
         }
+
 
 asset_map = {
     "bitcoin": "BTC-USD", "btc": "BTC-USD",
@@ -168,12 +165,14 @@ asset_map = {
     "oil": "CL=F", "wti": "CL=F"
 }
 
+
 def find_ticker(market):
     text = str(market).lower()
     for key, ticker in asset_map.items():
         if key in text:
             return ticker
     return None
+
 
 def classify_market(market):
     text = str(market).lower()
@@ -205,25 +204,29 @@ def classify_market(market):
 
     return "event"
 
+
 def infer_direction(market):
     text = str(market).lower()
     if "below" in text or "less than" in text or "dip" in text or "low" in text:
         return "below"
     return "above"
 
+
 def extract_numbers(market):
     text = str(market).replace(",", "")
     nums = re.findall(r"\$?(\d+(?:\.\d+)?)", text)
-    nums = [float(x) for x in nums if float(x) < 100000 and float(x) != 2026]
-    return nums
+    return [float(x) for x in nums if float(x) < 100000 and float(x) != 2026]
+
 
 def extract_target(market):
     nums = extract_numbers(market)
     return nums[0] if nums else None
 
+
 def extract_upper(market):
     nums = extract_numbers(market)
     return nums[1] if len(nums) > 1 else None
+
 
 @st.cache_data(ttl=300)
 def pull_markets():
@@ -279,6 +282,7 @@ def pull_markets():
 
     return df
 
+
 def save_to_journal(row):
     journal_row = row.copy()
     journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -293,10 +297,12 @@ def save_to_journal(row):
 
     df.to_csv(JOURNAL_FILE, index=False)
 
+
 def load_journal():
     if os.path.exists(JOURNAL_FILE):
         return pd.read_csv(JOURNAL_FILE)
     return pd.DataFrame()
+
 
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
@@ -346,6 +352,45 @@ with tab1:
 
             st.subheader("Actionable Trades")
             st.dataframe(buys, use_container_width=True)
+
+            st.markdown("---")
+            st.subheader("🔍 Explain Model")
+
+            selected_trade = st.selectbox(
+                "Select a trade to explain",
+                results["Market"].tolist()
+            )
+
+            explain = results[results["Market"] == selected_trade].iloc[0]
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric("Current Price", explain["Current Price"])
+            c1.metric("Market Probability", f"{explain['Market Prob %']}%")
+
+            c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
+            c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
+
+            c3.metric("Final Probability", f"{explain['Final Prob %']}%")
+            c3.metric("Edge", f"{explain['Edge %']}%")
+
+            st.markdown("### Model Components")
+            st.write(f"**Market Type:** {explain['Type']}")
+            st.write(f"**Direction:** {explain['Direction']}")
+            st.write(f"**Target:** {explain['Target']}")
+            st.write(f"**Upper Bound:** {explain['Upper']}")
+            st.write(f"**Days to Expiry:** {explain['Days']}")
+            st.write(f"**Momentum Score:** {explain['Momentum']}")
+            st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
+            st.write(f"**Signal:** {explain['Signal']}")
+            st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+
+            if explain["Signal"] == "BUY YES":
+                st.success("✅ The model believes the true probability is higher than the market price.")
+            elif explain["Signal"] == "BUY NO":
+                st.error("❌ The model believes the true probability is lower than the market price.")
+            else:
+                st.info("⚪ The model does not see enough edge to trade.")
 
             results.to_csv("mcp_dashboard_results.csv", index=False)
             st.success("Saved results to mcp_dashboard_results.csv")
