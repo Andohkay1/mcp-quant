@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests, json, re, os
+import xml.etree.ElementTree as ET
 from scipy.stats import norm
 from datetime import datetime
 
@@ -50,6 +51,7 @@ class MCPQuantEngine:
 
     def momentum_score(self, ticker):
         close = self.get_prices(ticker, "1y")
+
         ma20 = close.rolling(20).mean()
         ma50 = close.rolling(50).mean()
         ma200 = close.rolling(200).mean()
@@ -302,6 +304,32 @@ def pull_markets():
     return df
 
 
+def get_news(ticker, limit=5):
+    query = ticker.replace("-", " ")
+    url = f"https://news.google.com/rss/search?q={query}+finance+stock+crypto&hl=en-US&gl=US&ceid=US:en"
+
+    try:
+        r = requests.get(url, timeout=10)
+        root = ET.fromstring(r.content)
+
+        news = []
+        for item in root.findall(".//item")[:limit]:
+            news.append({
+                "Title": item.find("title").text,
+                "Date": item.find("pubDate").text,
+                "Link": item.find("link").text
+            })
+
+        return pd.DataFrame(news)
+
+    except Exception as e:
+        return pd.DataFrame([{
+            "Title": f"News fetch failed: {e}",
+            "Date": "",
+            "Link": ""
+        }])
+
+
 def fetch_market_by_id(market_id):
     try:
         url = f"https://gamma-api.polymarket.com/markets/{market_id}"
@@ -461,6 +489,35 @@ with tab1:
 
         st.subheader("Actionable Trades")
         st.dataframe(buys, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("📰 News Validation")
+
+        if len(buys) > 0:
+            selected_news_trade = st.selectbox(
+                "Select actionable trade for news",
+                buys["Market"].tolist(),
+                key="news_trade_selectbox"
+            )
+
+            news_row = buys[buys["Market"] == selected_news_trade].iloc[0]
+            ticker_for_news = news_row["Ticker"]
+
+            if st.button("Get News", key="get_news_button"):
+                news_df = get_news(ticker_for_news)
+                st.dataframe(news_df, use_container_width=True)
+
+                st.info("Use news as validation only. News should confirm or reject the model signal, not create a trade by itself.")
+
+                verdict = st.radio(
+                    "Manual News Verdict",
+                    ["Positive", "Neutral", "Negative"],
+                    key="manual_news_verdict"
+                )
+
+                st.write(f"News Verdict: **{verdict}**")
+        else:
+            st.info("No actionable trades. News check skipped.")
 
         st.markdown("---")
         st.subheader("🔍 Explain Model")
