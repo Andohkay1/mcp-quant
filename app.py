@@ -15,6 +15,7 @@ MAX_DAYS = 10
 MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
 JOURNAL_FILE = "mcp_journal.csv"
+STARTING_BANKROLL = 100
 
 
 class MCPQuantEngine:
@@ -49,7 +50,6 @@ class MCPQuantEngine:
 
     def momentum_score(self, ticker):
         close = self.get_prices(ticker, "1y")
-
         ma20 = close.rolling(20).mean()
         ma50 = close.rolling(50).mean()
         ma200 = close.rolling(200).mean()
@@ -96,11 +96,20 @@ class MCPQuantEngine:
 
         return (norm.cdf(z_high) - norm.cdf(z_low)) * 100
 
-    def score_market(self, market, ticker, target, days, direction, market_probability, market_type="price", upper=None):
+    def score_market(self, row):
+        market = row["Market"]
+        ticker = row["Ticker"]
+        target = row["Target"]
+        upper = row["Upper"]
+        days = max(int(row["Days"]), 1)
+        direction = row["Direction"]
+        market_probability = row["Market Prob %"]
+        market_type = row["Market Type"]
+
         close = self.get_prices(ticker, "1y")
         current = close.iloc[-1]
 
-        if market_type == "range" and upper is not None:
+        if market_type == "range" and pd.notna(upper):
             ewma = self.range_probability(ticker, target, upper, days)
             hist = ewma
         else:
@@ -132,16 +141,22 @@ class MCPQuantEngine:
         elif edge >= 12:
             size = 5
 
+        entry_side = "YES" if signal == "BUY YES" else "NO" if signal == "BUY NO" else ""
+        entry_price = market_probability if entry_side == "YES" else row["No Prob %"] if entry_side == "NO" else 0
+
         return {
+            "Market ID": row["Market ID"],
             "Market": market,
             "Ticker": ticker,
             "Current Price": round(current, 4),
             "Target": target,
             "Upper": upper,
+            "Resolution Date": row["Resolution Date"],
             "Days": days,
             "Type": market_type,
             "Direction": direction,
             "Market Prob %": round(market_probability, 2),
+            "No Prob %": round(row["No Prob %"], 2),
             "EWMA Prob %": round(ewma, 2),
             "Historical Prob %": round(hist, 2),
             "Base Prob %": round(base, 2),
@@ -150,7 +165,10 @@ class MCPQuantEngine:
             "Final Prob %": round(final, 2),
             "Edge %": round(edge, 2),
             "Signal": signal,
-            "Position Size $": size
+            "Entry Side": entry_side,
+            "Entry Price %": round(entry_price, 2),
+            "Position Size $": size,
+            "clobTokenIds": row["clobTokenIds"],
         }
 
 
@@ -251,13 +269,14 @@ def pull_markets():
         no_price = float(outcome_prices[1]) * 100 if len(outcome_prices) > 1 else None
 
         rows.append({
+            "Market ID": m.get("id"),
             "Market": m.get("question"),
             "Resolution Date": m.get("endDate"),
             "Market Prob %": yes_price,
             "No Prob %": no_price,
             "Volume": m.get("volumeNum"),
             "Liquidity": m.get("liquidityNum"),
-            "clobTokenIds": m.get("clobTokenIds")
+            "clobTokenIds": m.get("clobTokenIds"),
         })
 
     df = pd.DataFrame(rows)
@@ -283,11 +302,68 @@ def pull_markets():
     return df
 
 
+def fetch_market_by_id(market_id):
+    try:
+        url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def infer_winner_from_market(market):
+    if not market:
+        return None, False
+
+    closed = market.get("closed", False)
+    if not closed:
+        return None, False
+
+    winner = market.get("winningOutcome") or market.get("winner") or market.get("resolution")
+    if winner:
+        winner = str(winner).upper()
+        if "YES" in winner:
+            return "YES", True
+        if "NO" in winner:
+            return "NO", True
+
+    try:
+        prices = json.loads(market.get("outcomePrices", "[]"))
+        if len(prices) >= 2:
+            yes = float(prices[0])
+            no = float(prices[1])
+            if yes > 0.95:
+                return "YES", True
+            if no > 0.95:
+                return "NO", True
+    except Exception:
+        pass
+
+    return None, True
+
+
+def calculate_pnl(entry_side, winner, entry_price_pct, position_size):
+    if not entry_side or not winner or position_size <= 0 or entry_price_pct <= 0:
+        return 0
+
+    entry_price = entry_price_pct / 100
+    shares = position_size / entry_price
+
+    if entry_side == winner:
+        payout = shares * 1
+        return round(payout - position_size, 2)
+
+    return round(-position_size, 2)
+
+
 def save_to_journal(row):
     journal_row = row.copy()
     journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    journal_row["Status"] = "Open"
     journal_row["Result"] = ""
-    journal_row["PnL"] = ""
+    journal_row["PnL"] = 0
 
     if os.path.exists(JOURNAL_FILE):
         df = pd.read_csv(JOURNAL_FILE)
@@ -304,7 +380,43 @@ def load_journal():
     return pd.DataFrame()
 
 
+def update_results():
+    if not os.path.exists(JOURNAL_FILE):
+        return pd.DataFrame(), 0
+
+    df = pd.read_csv(JOURNAL_FILE)
+    updates = 0
+
+    for i, row in df.iterrows():
+        if str(row.get("Status", "")) == "Closed":
+            continue
+
+        market_id = row.get("Market ID")
+        if pd.isna(market_id):
+            continue
+
+        market = fetch_market_by_id(market_id)
+        winner, is_closed = infer_winner_from_market(market)
+
+        if is_closed and winner:
+            pnl = calculate_pnl(
+                entry_side=str(row.get("Entry Side", "")),
+                winner=winner,
+                entry_price_pct=float(row.get("Entry Price %", 0)),
+                position_size=float(row.get("Position Size $", 0))
+            )
+
+            df.loc[i, "Status"] = "Closed"
+            df.loc[i, "Result"] = winner
+            df.loc[i, "PnL"] = pnl
+            updates += 1
+
+    df.to_csv(JOURNAL_FILE, index=False)
+    return df, updates
+
+
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
+
 
 with tab1:
     st.subheader("Run Market Screener")
@@ -318,18 +430,7 @@ with tab1:
 
         for _, row in markets_df.iterrows():
             try:
-                scored.append(
-                    engine.score_market(
-                        market=row["Market"],
-                        ticker=row["Ticker"],
-                        target=row["Target"],
-                        upper=row["Upper"],
-                        days=max(int(row["Days"]), 1),
-                        direction=row["Direction"],
-                        market_probability=row["Market Prob %"],
-                        market_type=row["Market Type"]
-                    )
-                )
+                scored.append(engine.score_market(row))
             except Exception:
                 pass
 
@@ -342,12 +443,11 @@ with tab1:
 
     if "markets_df" in st.session_state:
         markets_df = st.session_state["markets_df"]
-
         st.metric("Markets Found", len(markets_df))
 
         st.subheader("Filtered Markets")
         st.dataframe(
-            markets_df[["Market", "Market Type", "Ticker", "Target", "Upper", "Direction", "Market Prob %", "Days", "Liquidity"]],
+            markets_df[["Market", "Market Type", "Ticker", "Target", "Upper", "Direction", "Market Prob %", "No Prob %", "Days", "Liquidity"]],
             use_container_width=True
         )
 
@@ -393,6 +493,8 @@ with tab1:
         st.write(f"**Momentum Score:** {explain['Momentum']}")
         st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
         st.write(f"**Signal:** {explain['Signal']}")
+        st.write(f"**Entry Side:** {explain['Entry Side']}")
+        st.write(f"**Entry Price:** {explain['Entry Price %']}%")
         st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
 
         if explain["Signal"] == "BUY YES":
@@ -402,15 +504,11 @@ with tab1:
         else:
             st.info("⚪ The model does not see enough edge to trade.")
 
-        st.success("Saved results to mcp_dashboard_results.csv")
-
         st.subheader("Save Trade to Journal")
-
-        trade_options = results["Market"].tolist()
 
         selected_save = st.selectbox(
             "Select trade to save",
-            trade_options,
+            results["Market"].tolist(),
             key="save_trade_selectbox"
         )
 
@@ -422,6 +520,11 @@ with tab1:
 
 with tab2:
     st.subheader("Trade Journal")
+
+    if st.button("Update Results", key="update_results_button"):
+        journal, updates = update_results()
+        st.success(f"Updated {updates} closed trades.")
+
     journal = load_journal()
 
     if len(journal) > 0:
@@ -435,18 +538,34 @@ with tab3:
     journal = load_journal()
 
     if len(journal) > 0:
-        total = len(journal)
+        closed = journal[journal["Status"] == "Closed"] if "Status" in journal.columns else pd.DataFrame()
+        open_trades = journal[journal["Status"] != "Closed"] if "Status" in journal.columns else journal
+
+        total_pnl = closed["PnL"].sum() if len(closed) > 0 else 0
+        bankroll = STARTING_BANKROLL + total_pnl
+
         buy_count = journal[journal["Signal"].isin(["BUY YES", "BUY NO"])].shape[0]
-        pass_count = journal[journal["Signal"] == "PASS"].shape[0]
         avg_edge = journal["Edge %"].mean()
 
+        wins = closed[closed["PnL"] > 0].shape[0] if len(closed) > 0 else 0
+        win_rate = (wins / len(closed) * 100) if len(closed) > 0 else 0
+
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Saved Trades", total)
-        c2.metric("Buy Signals", buy_count)
-        c3.metric("Pass Signals", pass_count)
-        c4.metric("Avg Edge", round(avg_edge, 2))
+        c1.metric("Bankroll", f"${round(bankroll, 2)}")
+        c2.metric("Total PnL", f"${round(total_pnl, 2)}")
+        c3.metric("Closed Trades", len(closed))
+        c4.metric("Win Rate", f"{round(win_rate, 2)}%")
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Open Trades", len(open_trades))
+        c6.metric("Buy Signals", buy_count)
+        c7.metric("Avg Edge", round(avg_edge, 2))
 
         st.subheader("Edge Distribution")
         st.bar_chart(journal["Edge %"])
+
+        if len(closed) > 0:
+            st.subheader("PnL by Trade")
+            st.bar_chart(closed["PnL"])
     else:
         st.info("No analytics available yet.")
