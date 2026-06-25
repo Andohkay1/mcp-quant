@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import requests, json, re
+import requests, json, re, os
 from scipy.stats import norm
+from datetime import datetime
 
 st.set_page_config(page_title="MCP Quant Dashboard", layout="wide")
 st.title("MCP Quant Dashboard")
@@ -13,7 +14,7 @@ MIN_LIQUIDITY = 250
 MAX_DAYS = 10
 MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
-
+JOURNAL_FILE = "mcp_journal.csv"
 
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
@@ -26,36 +27,30 @@ class MCPQuantEngine:
     def ewma_volatility(self, close):
         returns = np.log(close / close.shift(1)).dropna()
         variance = returns.var()
-
         for r in returns:
             variance = EWMA_LAMBDA * variance + (1 - EWMA_LAMBDA) * (r ** 2)
-
         return np.sqrt(variance) * np.sqrt(252)
 
     def ewma_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
-
         sigma = vol * np.sqrt(max(days, 1) / 252)
         z = np.log(target / current) / sigma
 
         if direction == "above":
             return (1 - norm.cdf(z)) * 100
-        else:
-            return norm.cdf(z) * 100
+        return norm.cdf(z) * 100
 
     def historical_probability(self, ticker, target, days, direction, lookback=252):
         close = self.get_prices(ticker, "5y").tail(lookback)
         current = close.iloc[-1]
-
         required_return = target / current - 1
         future_returns = (close.shift(-days) / close - 1).dropna()
 
         if direction == "above":
             return (future_returns >= required_return).mean() * 100
-        else:
-            return (future_returns <= required_return).mean() * 100
+        return (future_returns <= required_return).mean() * 100
 
     def momentum_score(self, ticker):
         close = self.get_prices(ticker, "1y")
@@ -70,12 +65,10 @@ class MCPQuantEngine:
         delta = close.diff()
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
-
         rs = gain.rolling(14).mean() / loss.rolling(14).mean()
         rsi = 100 - (100 / (1 + rs))
 
         score = 0
-
         score += 2 if close.iloc[-1] > ma20.iloc[-1] else -2
         score += 3 if close.iloc[-1] > ma50.iloc[-1] else -3
         score += 5 if close.iloc[-1] > ma200.iloc[-1] else -5
@@ -97,14 +90,29 @@ class MCPQuantEngine:
 
         return score
 
-    def score_market(self, market, ticker, target, days, direction, market_probability):
+    def range_probability(self, ticker, lower, upper, days):
+        close = self.get_prices(ticker, "1y")
+        current = close.iloc[-1]
+        vol = self.ewma_volatility(close)
+        sigma = vol * np.sqrt(max(days, 1) / 252)
+
+        z_low = np.log(lower / current) / sigma
+        z_high = np.log(upper / current) / sigma
+
+        return (norm.cdf(z_high) - norm.cdf(z_low)) * 100
+
+    def score_market(self, market, ticker, target, days, direction, market_probability, market_type="price", upper=None):
         close = self.get_prices(ticker, "1y")
         current = close.iloc[-1]
 
-        ewma = self.ewma_probability(ticker, target, days, direction)
-        hist = self.historical_probability(ticker, target, days, direction, 252)
-        base = (ewma + hist) / 2
+        if market_type == "range" and upper is not None:
+            ewma = self.range_probability(ticker, target, upper, days)
+            hist = ewma
+        else:
+            ewma = self.ewma_probability(ticker, target, days, direction)
+            hist = self.historical_probability(ticker, target, days, direction, 252)
 
+        base = (ewma + hist) / 2
         momentum = self.momentum_score(ticker)
         mom_adj = (momentum / 20) * MOMENTUM_WEIGHT
 
@@ -121,12 +129,22 @@ class MCPQuantEngine:
         else:
             signal = "PASS"
 
+        size = 0
+        if edge >= 5 and edge < 8:
+            size = 2
+        elif edge >= 8 and edge < 12:
+            size = 3
+        elif edge >= 12:
+            size = 5
+
         return {
             "Market": market,
             "Ticker": ticker,
             "Current Price": round(current, 4),
             "Target": target,
+            "Upper": upper,
             "Days": days,
+            "Type": market_type,
             "Direction": direction,
             "Market Prob %": round(market_probability, 2),
             "EWMA Prob %": round(ewma, 2),
@@ -136,33 +154,19 @@ class MCPQuantEngine:
             "Final Prob %": round(final, 2),
             "Edge %": round(edge, 2),
             "Signal": signal,
-            "Position Size $": (
-                2 if edge >= 5 and edge < 8
-                else 3 if edge >= 8 and edge < 12
-                else 5 if edge >= 12
-                else 0
-            )
+            "Position Size $": size
         }
 
-
 asset_map = {
-    "bitcoin": "BTC-USD",
-    "btc": "BTC-USD",
-    "ethereum": "ETH-USD",
-    "eth": "ETH-USD",
+    "bitcoin": "BTC-USD", "btc": "BTC-USD",
+    "ethereum": "ETH-USD", "eth": "ETH-USD",
     "xrp": "XRP-USD",
-    "solana": "SOL-USD",
-    "sol": "SOL-USD",
-    "tesla": "TSLA",
-    "tsla": "TSLA",
-    "nvidia": "NVDA",
-    "nvda": "NVDA",
-    "silver": "SI=F",
-    "gold": "GC=F",
-    "oil": "CL=F",
-    "wti": "CL=F"
+    "solana": "SOL-USD", "sol": "SOL-USD",
+    "tesla": "TSLA", "tsla": "TSLA",
+    "nvidia": "NVDA", "nvda": "NVDA",
+    "silver": "SI=F", "gold": "GC=F",
+    "oil": "CL=F", "wti": "CL=F"
 }
-
 
 def find_ticker(market):
     text = str(market).lower()
@@ -171,65 +175,59 @@ def find_ticker(market):
             return ticker
     return None
 
-
 def classify_market(market):
     text = str(market).lower()
 
     non_price_words = [
-        "ai model", "#1 ai", "model", "election", "nominee", "president",
+        "ai model", "#1 ai", "election", "nominee", "president",
         "fed chair", "ceo", "app store", "posts", "tariff",
         "unemployment", "gdp", "cpi", "inflation", "interest rate",
         "win", "wins", "champion", "world cup", "ufc", "nba", "nfl",
         "mlb", "tennis", "candidate"
     ]
 
-    price_words = [
-        "price", "close above", "close below", "closes above", "closes below",
-        "above $", "below $", "greater than $", "less than $",
-        "reach $", "hit $", "dip to $"
-    ]
-
     if any(w in text for w in non_price_words):
         return "event"
 
-    if "between $" in text or "between" in text:
+    if "between" in text:
         return "range"
+
+    if "close above" in text or "closes above" in text or "close below" in text or "closes below" in text:
+        return "daily_close"
+
+    price_words = [
+        "price", "above $", "below $", "greater than $", "less than $",
+        "reach $", "hit $", "dip to $"
+    ]
 
     if any(w in text for w in price_words):
         return "price"
 
     return "event"
 
-
 def infer_direction(market):
     text = str(market).lower()
-
     if "below" in text or "less than" in text or "dip" in text or "low" in text:
         return "below"
-
     return "above"
 
-
-def extract_target(market):
+def extract_numbers(market):
     text = str(market).replace(",", "")
     nums = re.findall(r"\$?(\d+(?:\.\d+)?)", text)
+    nums = [float(x) for x in nums if float(x) < 100000 and float(x) != 2026]
+    return nums
 
-    nums = [
-        float(x)
-        for x in nums
-        if float(x) < 100000 and float(x) != 2026
-    ]
+def extract_target(market):
+    nums = extract_numbers(market)
+    return nums[0] if nums else None
 
-    if not nums:
-        return None
-
-    return nums[0]
-
+def extract_upper(market):
+    nums = extract_numbers(market)
+    return nums[1] if len(nums) > 1 else None
 
 @st.cache_data(ttl=300)
 def pull_markets():
     url = "https://gamma-api.polymarket.com/markets"
-
     params = {
         "closed": "false",
         "limit": 1000,
@@ -266,11 +264,12 @@ def pull_markets():
 
     df["Ticker"] = df["Market"].apply(find_ticker)
     df["Target"] = df["Market"].apply(extract_target)
+    df["Upper"] = df["Market"].apply(extract_upper)
     df["Direction"] = df["Market"].apply(infer_direction)
     df["Market Type"] = df["Market"].apply(classify_market)
 
     df = df[
-        (df["Market Type"] == "price") &
+        (df["Market Type"].isin(["price", "range", "daily_close"])) &
         (df["Ticker"].notna()) &
         (df["Target"].notna()) &
         (df["Days"] >= 0) &
@@ -280,64 +279,118 @@ def pull_markets():
 
     return df
 
+def save_to_journal(row):
+    journal_row = row.copy()
+    journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    journal_row["Result"] = ""
+    journal_row["PnL"] = ""
 
-if st.button("Run MCP Screener"):
-    markets_df = pull_markets()
-
-    st.subheader("Markets Found")
-    st.write(len(markets_df))
-
-    st.subheader("Filtered Price Markets")
-    st.dataframe(
-        markets_df[
-            [
-                "Market",
-                "Market Type",
-                "Ticker",
-                "Target",
-                "Direction",
-                "Market Prob %",
-                "Days",
-                "Liquidity"
-            ]
-        ],
-        use_container_width=True
-    )
-
-    engine = MCPQuantEngine()
-    scored = []
-
-    for _, row in markets_df.iterrows():
-        try:
-            scored.append(
-                engine.score_market(
-                    market=row["Market"],
-                    ticker=row["Ticker"],
-                    target=row["Target"],
-                    days=int(row["Days"]),
-                    direction=row["Direction"],
-                    market_probability=row["Market Prob %"]
-                )
-            )
-        except Exception:
-            pass
-
-    results = pd.DataFrame(scored)
-
-    if len(results) > 0:
-        results = results.sort_values("Edge %", ascending=False)
-
-        st.subheader("Top Trade Candidates")
-        st.dataframe(results, use_container_width=True)
-
-        buys = results[results["Signal"].isin(["BUY YES", "BUY NO"])]
-
-        st.subheader("Actionable Trades")
-        st.dataframe(buys, use_container_width=True)
-
-        results.to_csv("mcp_dashboard_results.csv", index=False)
-
-        st.success("Saved results to mcp_dashboard_results.csv")
-
+    if os.path.exists(JOURNAL_FILE):
+        df = pd.read_csv(JOURNAL_FILE)
+        df = pd.concat([df, pd.DataFrame([journal_row])], ignore_index=True)
     else:
-        st.warning("No scored markets found.")
+        df = pd.DataFrame([journal_row])
+
+    df.to_csv(JOURNAL_FILE, index=False)
+
+def load_journal():
+    if os.path.exists(JOURNAL_FILE):
+        return pd.read_csv(JOURNAL_FILE)
+    return pd.DataFrame()
+
+tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
+
+with tab1:
+    st.subheader("Run Market Screener")
+
+    if st.button("Run MCP Screener"):
+        markets_df = pull_markets()
+        st.metric("Markets Found", len(markets_df))
+
+        st.subheader("Filtered Markets")
+        st.dataframe(
+            markets_df[["Market", "Market Type", "Ticker", "Target", "Upper", "Direction", "Market Prob %", "Days", "Liquidity"]],
+            use_container_width=True
+        )
+
+        engine = MCPQuantEngine()
+        scored = []
+
+        for _, row in markets_df.iterrows():
+            try:
+                scored.append(
+                    engine.score_market(
+                        market=row["Market"],
+                        ticker=row["Ticker"],
+                        target=row["Target"],
+                        upper=row["Upper"],
+                        days=max(int(row["Days"]), 1),
+                        direction=row["Direction"],
+                        market_probability=row["Market Prob %"],
+                        market_type=row["Market Type"]
+                    )
+                )
+            except Exception:
+                pass
+
+        results = pd.DataFrame(scored)
+
+        if len(results) > 0:
+            results = results.sort_values("Edge %", ascending=False)
+            st.session_state["results"] = results
+
+            st.subheader("Top Trade Candidates")
+            st.dataframe(results, use_container_width=True)
+
+            buys = results[results["Signal"].isin(["BUY YES", "BUY NO"])]
+
+            st.subheader("Actionable Trades")
+            st.dataframe(buys, use_container_width=True)
+
+            results.to_csv("mcp_dashboard_results.csv", index=False)
+            st.success("Saved results to mcp_dashboard_results.csv")
+        else:
+            st.warning("No scored markets found.")
+
+    if "results" in st.session_state:
+        st.subheader("Save Trade to Journal")
+
+        results = st.session_state["results"]
+        trade_options = results["Market"].tolist()
+
+        selected = st.selectbox("Select trade to save", trade_options)
+
+        if st.button("Save Selected Trade"):
+            row = results[results["Market"] == selected].iloc[0].to_dict()
+            save_to_journal(row)
+            st.success("Trade saved to journal.")
+
+with tab2:
+    st.subheader("Trade Journal")
+    journal = load_journal()
+
+    if len(journal) > 0:
+        st.dataframe(journal, use_container_width=True)
+    else:
+        st.info("No trades saved yet.")
+
+with tab3:
+    st.subheader("Analytics")
+    journal = load_journal()
+
+    if len(journal) > 0:
+        total = len(journal)
+        buy_count = journal[journal["Signal"].isin(["BUY YES", "BUY NO"])].shape[0]
+        pass_count = journal[journal["Signal"] == "PASS"].shape[0]
+        avg_edge = journal["Edge %"].mean()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Saved Trades", total)
+        c2.metric("Buy Signals", buy_count)
+        c3.metric("Pass Signals", pass_count)
+        c4.metric("Avg Edge", round(avg_edge, 2))
+
+        st.subheader("Edge Distribution")
+        st.bar_chart(journal["Edge %"])
+    else:
+        st.info("No analytics available yet.")
