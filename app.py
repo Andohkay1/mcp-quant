@@ -309,15 +309,9 @@ tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 with tab1:
     st.subheader("Run Market Screener")
 
-    if st.button("Run MCP Screener"):
+    if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
-        st.metric("Markets Found", len(markets_df))
-
-        st.subheader("Filtered Markets")
-        st.dataframe(
-            markets_df[["Market", "Market Type", "Ticker", "Target", "Upper", "Direction", "Market Prob %", "Days", "Liquidity"]],
-            use_container_width=True
-        )
+        st.session_state["markets_df"] = markets_df
 
         engine = MCPQuantEngine()
         scored = []
@@ -344,71 +338,87 @@ with tab1:
         if len(results) > 0:
             results = results.sort_values("Edge %", ascending=False)
             st.session_state["results"] = results
-
-            st.subheader("Top Trade Candidates")
-            st.dataframe(results, use_container_width=True)
-
-            buys = results[results["Signal"].isin(["BUY YES", "BUY NO"])]
-
-            st.subheader("Actionable Trades")
-            st.dataframe(buys, use_container_width=True)
-
-            st.markdown("---")
-            st.subheader("🔍 Explain Model")
-
-            selected_trade = st.selectbox(
-                "Select a trade to explain",
-                results["Market"].tolist()
-            )
-
-            explain = results[results["Market"] == selected_trade].iloc[0]
-
-            c1, c2, c3 = st.columns(3)
-
-            c1.metric("Current Price", explain["Current Price"])
-            c1.metric("Market Probability", f"{explain['Market Prob %']}%")
-
-            c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
-            c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
-
-            c3.metric("Final Probability", f"{explain['Final Prob %']}%")
-            c3.metric("Edge", f"{explain['Edge %']}%")
-
-            st.markdown("### Model Components")
-            st.write(f"**Market Type:** {explain['Type']}")
-            st.write(f"**Direction:** {explain['Direction']}")
-            st.write(f"**Target:** {explain['Target']}")
-            st.write(f"**Upper Bound:** {explain['Upper']}")
-            st.write(f"**Days to Expiry:** {explain['Days']}")
-            st.write(f"**Momentum Score:** {explain['Momentum']}")
-            st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
-            st.write(f"**Signal:** {explain['Signal']}")
-            st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
-
-            if explain["Signal"] == "BUY YES":
-                st.success("✅ The model believes the true probability is higher than the market price.")
-            elif explain["Signal"] == "BUY NO":
-                st.error("❌ The model believes the true probability is lower than the market price.")
-            else:
-                st.info("⚪ The model does not see enough edge to trade.")
-
             results.to_csv("mcp_dashboard_results.csv", index=False)
-            st.success("Saved results to mcp_dashboard_results.csv")
-        else:
-            st.warning("No scored markets found.")
+
+    if "markets_df" in st.session_state:
+        markets_df = st.session_state["markets_df"]
+
+        st.metric("Markets Found", len(markets_df))
+
+        st.subheader("Filtered Markets")
+        st.dataframe(
+            markets_df[["Market", "Market Type", "Ticker", "Target", "Upper", "Direction", "Market Prob %", "Days", "Liquidity"]],
+            use_container_width=True
+        )
 
     if "results" in st.session_state:
+        results = st.session_state["results"]
+
+        st.subheader("Top Trade Candidates")
+        st.dataframe(results, use_container_width=True)
+
+        buys = results[results["Signal"].isin(["BUY YES", "BUY NO"])]
+
+        st.subheader("Actionable Trades")
+        st.dataframe(buys, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("🔍 Explain Model")
+
+        selected_trade = st.selectbox(
+            "Select a trade to explain",
+            results["Market"].tolist(),
+            key="explain_trade_selectbox"
+        )
+
+        explain = results[results["Market"] == selected_trade].iloc[0]
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("Current Price", explain["Current Price"])
+        c1.metric("Market Probability", f"{explain['Market Prob %']}%")
+
+        c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
+        c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
+
+        c3.metric("Final Probability", f"{explain['Final Prob %']}%")
+        c3.metric("Edge", f"{explain['Edge %']}%")
+
+        st.markdown("### Model Components")
+        st.write(f"**Market Type:** {explain['Type']}")
+        st.write(f"**Direction:** {explain['Direction']}")
+        st.write(f"**Target:** {explain['Target']}")
+        st.write(f"**Upper Bound:** {explain['Upper']}")
+        st.write(f"**Days to Expiry:** {explain['Days']}")
+        st.write(f"**Momentum Score:** {explain['Momentum']}")
+        st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
+        st.write(f"**Signal:** {explain['Signal']}")
+        st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+
+        if explain["Signal"] == "BUY YES":
+            st.success("✅ The model believes the true probability is higher than the market price.")
+        elif explain["Signal"] == "BUY NO":
+            st.error("❌ The model believes the true probability is lower than the market price.")
+        else:
+            st.info("⚪ The model does not see enough edge to trade.")
+
+        st.success("Saved results to mcp_dashboard_results.csv")
+
         st.subheader("Save Trade to Journal")
 
-        results = st.session_state["results"]
         trade_options = results["Market"].tolist()
 
-        selected = st.selectbox("Select trade to save", trade_options)
+        selected_save = st.selectbox(
+            "Select trade to save",
+            trade_options,
+            key="save_trade_selectbox"
+        )
 
-        if st.button("Save Selected Trade"):
-            row = results[results["Market"] == selected].iloc[0].to_dict()
+        if st.button("Save Selected Trade", key="save_trade_button"):
+            row = results[results["Market"] == selected_save].iloc[0].to_dict()
             save_to_journal(row)
             st.success("Trade saved to journal.")
+
 
 with tab2:
     st.subheader("Trade Journal")
@@ -418,6 +428,7 @@ with tab2:
         st.dataframe(journal, use_container_width=True)
     else:
         st.info("No trades saved yet.")
+
 
 with tab3:
     st.subheader("Analytics")
