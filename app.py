@@ -138,17 +138,17 @@ class MCPQuantEngine:
        size = 0
 
         edge = row["Edge %"]
+                # Position sizing
+        size = 0
+        abs_edge = abs(edge)
 
-# Position sizing
-size = 0
-abs_edge = abs(edge)
+        if 5 <= abs_edge < 8:
+            size = 2
+        elif 8 <= abs_edge < 12:
+            size = 3
+        elif abs_edge >= 12:
+            size = 5
 
-if 5 <= abs_edge < 8:
-    size = 2
-elif 8 <= abs_edge < 12:
-    size = 3
-elif abs_edge >= 12:
-    size = 5
 
 row["Position Size $"] = size
 
