@@ -137,12 +137,12 @@ class MCPQuantEngine:
 
        size = 0
 
-if 5 <= abs(edge) < 8:
-    size = 2
-elif 8 <= abs(edge) < 12:
-    size = 3
-elif abs(edge) >= 12:
-    size = 5
+        if 5 <= abs(edge) < 8:
+            size = 2
+        elif 8 <= abs(edge) < 12:
+            size = 3
+        elif abs(edge) >= 12:
+            size = 5
 
         entry_side = "YES" if signal == "BUY YES" else "NO" if signal == "BUY NO" else ""
         entry_price = market_probability if entry_side == "YES" else row["No Prob %"] if entry_side == "NO" else 0
