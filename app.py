@@ -543,6 +543,20 @@ def update_results():
 
     df = pd.read_csv(JOURNAL_FILE)
 
+    # Force correct column types
+    if "Status" not in df.columns:
+        df["Status"] = "Open"
+
+    if "Result" not in df.columns:
+        df["Result"] = ""
+
+    if "PnL" not in df.columns:
+        df["PnL"] = 0.0
+
+    df["Status"] = df["Status"].astype("object")
+    df["Result"] = df["Result"].astype("object")
+    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0)
+
     updates = 0
 
     for i, row in df.iterrows():
@@ -560,20 +574,19 @@ def update_results():
         if is_closed and winner:
             pnl = calculate_pnl(
                 entry_side=str(row.get("Entry Side", "")),
-                winner=winner,
+                winner=str(winner),
                 entry_price_pct=float(row.get("Entry Price %", 0)),
                 position_size=float(row.get("Position Size $", 0)),
             )
 
-            df.loc[i, "Status"] = "Closed"
-            df.loc[i, "Result"] = winner
-            df.loc[i, "PnL"] = pnl
+            df.at[i, "Status"] = "Closed"
+            df.at[i, "Result"] = str(winner)
+            df.at[i, "PnL"] = float(pnl)
             updates += 1
 
     df.to_csv(JOURNAL_FILE, index=False)
 
     return df, updates
-
 
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
