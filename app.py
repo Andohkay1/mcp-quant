@@ -543,7 +543,6 @@ def update_results():
 
     df = pd.read_csv(JOURNAL_FILE)
 
-    # Force correct column types
     if "Status" not in df.columns:
         df["Status"] = "Open"
 
@@ -553,9 +552,10 @@ def update_results():
     if "PnL" not in df.columns:
         df["PnL"] = 0.0
 
-    df["Status"] = df["Status"].astype("object")
-    df["Result"] = df["Result"].astype("object")
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0)
+    # Force safe dtypes
+    df["Status"] = df["Status"].astype(str)
+    df["Result"] = df["Result"].astype(str)
+    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0).astype(float)
 
     updates = 0
 
@@ -579,15 +579,16 @@ def update_results():
                 position_size=float(row.get("Position Size $", 0)),
             )
 
-            df.at[i, "Status"] = "Closed"
-            df.at[i, "Result"] = str(winner)
-            df.at[i, "PnL"] = float(pnl)
+            df.loc[i, "Status"] = "Closed"
+            df.loc[i, "Result"] = str(winner)
+            df.loc[i, "PnL"] = float(pnl)
             updates += 1
+
+    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0).astype(float)
 
     df.to_csv(JOURNAL_FILE, index=False)
 
     return df, updates
-
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
 
