@@ -552,14 +552,28 @@ def update_results():
     if "PnL" not in df.columns:
         df["PnL"] = 0.0
 
-    # Force safe dtypes
-    df["Status"] = df["Status"].astype(str)
-    df["Result"] = df["Result"].astype(str)
+    df["Status"] = df["Status"].astype("object")
+    df["Result"] = df["Result"].astype("object")
     df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0).astype(float)
 
     updates = 0
+    now_utc = pd.Timestamp.now(tz="UTC")
 
     for i, row in df.iterrows():
+        resolution_date = pd.to_datetime(
+            row.get("Resolution Date"),
+            utc=True,
+            errors="coerce"
+        )
+
+        # Do not close before official resolution date
+        if pd.notna(resolution_date) and now_utc < resolution_date:
+            if str(row.get("Status", "")) == "Closed":
+                df.loc[i, "Status"] = "Open"
+                df.loc[i, "Result"] = ""
+                df.loc[i, "PnL"] = 0.0
+            continue
+
         if str(row.get("Status", "")) == "Closed":
             continue
 
