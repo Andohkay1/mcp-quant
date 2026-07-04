@@ -24,13 +24,7 @@ STARTING_BANKROLL = 100
 
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
-        data = yf.download(
-            ticker,
-            period=period,
-            auto_adjust=True,
-            progress=False
-        )
-
+        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
         close = data["Close"]
 
         if isinstance(close, pd.DataFrame):
@@ -153,12 +147,9 @@ class MCPQuantEngine:
             mom_adj = -mom_adj
 
         final = max(0.01, min(99.99, base + mom_adj))
-       yes_edge = final - market_probability
-no_prob_model = 100 - final
-no_prob_market = row["No Prob %"]
-no_edge = no_prob_model - no_prob_market
 
-               yes_price = market_probability / 100
+        # Expected value logic
+        yes_price = market_probability / 100
         no_price = row["No Prob %"] / 100
 
         model_yes = final / 100
@@ -170,15 +161,15 @@ no_edge = no_prob_model - no_prob_market
         yes_ev_pct = yes_ev * 100
         no_ev_pct = no_ev * 100
 
-        if yes_ev_pct >= EDGE_THRESHOLD and model_yes > 0.50:
+        if yes_ev_pct >= EDGE_THRESHOLD and model_yes >= 0.50:
             signal = "BUY YES"
             edge = yes_ev_pct
-        elif no_ev_pct >= EDGE_THRESHOLD and model_no > 0.50:
+        elif no_ev_pct >= EDGE_THRESHOLD and model_no >= 0.50:
             signal = "BUY NO"
             edge = no_ev_pct
         else:
             signal = "PASS"
-            edge = yes_ev_pct
+            edge = max(yes_ev_pct, no_ev_pct)
 
         size = 0
         abs_edge = abs(edge)
@@ -190,13 +181,17 @@ no_edge = no_prob_model - no_prob_market
         elif abs_edge >= 12:
             size = 5
 
-        entry_side = "YES" if signal == "BUY YES" else "NO" if signal == "BUY NO" else ""
+        if signal == "PASS":
+            size = 0
 
-        if entry_side == "YES":
+        if signal == "BUY YES":
+            entry_side = "YES"
             entry_price = market_probability
-        elif entry_side == "NO":
+        elif signal == "BUY NO":
+            entry_side = "NO"
             entry_price = row["No Prob %"]
         else:
+            entry_side = ""
             entry_price = 0
 
         return {
@@ -218,6 +213,8 @@ no_edge = no_prob_model - no_prob_market
             "Momentum": momentum,
             "Momentum Adj %": round(mom_adj, 2),
             "Final Prob %": round(final, 2),
+            "YES EV %": round(yes_ev_pct, 2),
+            "NO EV %": round(no_ev_pct, 2),
             "Edge %": round(edge, 2),
             "Signal": signal,
             "Entry Side": entry_side,
@@ -537,7 +534,7 @@ def save_to_journal(row):
     journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     journal_row["Status"] = "Open"
     journal_row["Result"] = ""
-    journal_row["PnL"] = 0
+    journal_row["PnL"] = 0.0
 
     if os.path.exists(JOURNAL_FILE):
         df = pd.read_csv(JOURNAL_FILE)
@@ -584,7 +581,6 @@ def update_results():
             errors="coerce"
         )
 
-        # Do not close before official resolution date
         if pd.notna(resolution_date) and now_utc < resolution_date:
             if str(row.get("Status", "")) == "Closed":
                 df.loc[i, "Status"] = "Open"
@@ -617,10 +613,11 @@ def update_results():
             updates += 1
 
     df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0).astype(float)
-
     df.to_csv(JOURNAL_FILE, index=False)
 
     return df, updates
+
+
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
 
@@ -747,21 +744,20 @@ with tab1:
         st.write(f"**Days to Expiry:** {explain['Days']}")
         st.write(f"**Momentum Score:** {explain['Momentum']}")
         st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
+        st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
+        st.write(f"**YES EV:** {explain['YES EV %']}%")
+        st.write(f"**NO EV:** {explain['NO EV %']}%")
         st.write(f"**Signal:** {explain['Signal']}")
         st.write(f"**Entry Side:** {explain['Entry Side']}")
         st.write(f"**Entry Price:** {explain['Entry Price %']}%")
         st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
 
         if explain["Signal"] == "BUY YES":
-            st.success(
-                "✅ The model believes the true probability is higher than the market price."
-            )
+            st.success("✅ Positive YES expected value and model YES probability is above 50%.")
         elif explain["Signal"] == "BUY NO":
-            st.error(
-                "❌ The model believes the true probability is lower than the market price."
-            )
+            st.error("❌ Positive NO expected value and model NO probability is above 50%.")
         else:
-            st.info("⚪ The model does not see enough edge to trade.")
+            st.info("⚪ The model does not see enough expected value to trade.")
 
         st.subheader("Save Trade to Journal")
 
@@ -773,9 +769,7 @@ with tab1:
 
         if st.button("Save Selected Trade", key="save_trade_button"):
             row = results[results["Market"] == selected_save].iloc[0].to_dict()
-
             save_to_journal(row)
-
             st.success("Trade saved to journal.")
 
 
@@ -784,7 +778,6 @@ with tab2:
 
     if st.button("Update Results", key="update_results_button"):
         journal, updates = update_results()
-
         st.success(f"Updated {updates} closed trades.")
 
     journal = load_journal()
