@@ -158,23 +158,27 @@ no_prob_model = 100 - final
 no_prob_market = row["No Prob %"]
 no_edge = no_prob_model - no_prob_market
 
-        yes_edge = final - market_probability
+               yes_price = market_probability / 100
+        no_price = row["No Prob %"] / 100
 
-        no_prob_model = 100 - final
-        no_prob_market = row["No Prob %"]
-        no_edge = no_prob_model - no_prob_market
+        model_yes = final / 100
+        model_no = 1 - model_yes
 
-        if yes_edge >= EDGE_THRESHOLD and final > 50:
+        yes_ev = (model_yes * (1 - yes_price)) - ((1 - model_yes) * yes_price)
+        no_ev = (model_no * (1 - no_price)) - ((1 - model_no) * no_price)
+
+        yes_ev_pct = yes_ev * 100
+        no_ev_pct = no_ev * 100
+
+        if yes_ev_pct >= EDGE_THRESHOLD and model_yes > 0.50:
             signal = "BUY YES"
-            edge = yes_edge
-
-        elif no_edge >= EDGE_THRESHOLD and no_prob_model > 50:
+            edge = yes_ev_pct
+        elif no_ev_pct >= EDGE_THRESHOLD and model_no > 0.50:
             signal = "BUY NO"
-            edge = no_edge
-
+            edge = no_ev_pct
         else:
             signal = "PASS"
-            edge = yes_edge
+            edge = yes_ev_pct
 
         size = 0
         abs_edge = abs(edge)
