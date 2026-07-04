@@ -119,110 +119,108 @@ class MCPQuantEngine:
         return (norm.cdf(z_high) - norm.cdf(z_low)) * 100
 
     def score_market(self, row):
-        market = row["Market"]
-        ticker = row["Ticker"]
-        target = row["Target"]
-        upper = row["Upper"]
-        days = max(int(row["Days"]), 1)
-        direction = row["Direction"]
-        market_probability = row["Market Prob %"]
-        market_type = row["Market Type"]
+    market = row["Market"]
+    ticker = row["Ticker"]
+    target = row["Target"]
+    upper = row["Upper"]
+    days = max(int(row["Days"]), 1)
+    direction = row["Direction"]
+    market_probability = row["Market Prob %"]
+    market_type = row["Market Type"]
 
-        close = self.get_prices(ticker, "1y")
-        current = close.iloc[-1]
+    close = self.get_prices(ticker, "1y")
+    current = close.iloc[-1]
 
-        if market_type == "range" and pd.notna(upper):
-            ewma = self.range_probability(ticker, target, upper, days)
-            hist = ewma
-        else:
-            ewma = self.ewma_probability(ticker, target, days, direction)
-            hist = self.historical_probability(ticker, target, days, direction, 252)
+    if market_type == "range" and pd.notna(upper):
+        ewma = self.range_probability(ticker, target, upper, days)
+        hist = ewma
+    else:
+        ewma = self.ewma_probability(ticker, target, days, direction)
+        hist = self.historical_probability(ticker, target, days, direction, 252)
 
-        base = (ewma + hist) / 2
+    base = (ewma + hist) / 2
 
-        momentum = self.momentum_score(ticker)
-        mom_adj = (momentum / 20) * MOMENTUM_WEIGHT
+    momentum = self.momentum_score(ticker)
+    mom_adj = (momentum / 20) * MOMENTUM_WEIGHT
 
-        if direction == "below":
-            mom_adj = -mom_adj
+    if direction == "below":
+        mom_adj = -mom_adj
 
-        final = max(0.01, min(99.99, base + mom_adj))
+    final = max(0.01, min(99.99, base + mom_adj))
 
-        # Expected value logic
-        yes_price = market_probability / 100
-        no_price = row["No Prob %"] / 100
+    # Correct YES/NO edge logic
+    model_yes = final
+    model_no = 100 - final
 
-        model_yes = final / 100
-        model_no = 1 - model_yes
+    market_yes = market_probability
+    market_no = row["No Prob %"]
 
-        yes_ev = (model_yes * (1 - yes_price)) - ((1 - model_yes) * yes_price)
-        no_ev = (model_no * (1 - no_price)) - ((1 - model_no) * no_price)
+    yes_edge = model_yes - market_yes
+    no_edge = model_no - market_no
 
-        yes_ev_pct = yes_ev * 100
-        no_ev_pct = no_ev * 100
+    BUY_THRESHOLD = 6
 
-        if yes_ev_pct >= EDGE_THRESHOLD and model_yes >= 0.50:
-            signal = "BUY YES"
-            edge = yes_ev_pct
-        elif no_ev_pct >= EDGE_THRESHOLD and model_no >= 0.50:
-            signal = "BUY NO"
-            edge = no_ev_pct
-        else:
-            signal = "PASS"
-            edge = max(yes_ev_pct, no_ev_pct)
+    if yes_edge > BUY_THRESHOLD:
+        signal = "BUY YES"
+        edge = yes_edge
+    elif no_edge > BUY_THRESHOLD:
+        signal = "BUY NO"
+        edge = no_edge
+    else:
+        signal = "PASS"
+        edge = max(yes_edge, no_edge)
 
-        size = 0
-        abs_edge = abs(edge)
+    # Position sizing
+    size = 0
+    abs_edge = abs(edge)
 
-        if 5 <= abs_edge < 8:
+    if signal != "PASS":
+        if 6 < abs_edge < 8:
             size = 2
         elif 8 <= abs_edge < 12:
             size = 3
         elif abs_edge >= 12:
             size = 5
 
-        if signal == "PASS":
-            size = 0
+    # Entry side and price
+    if signal == "BUY YES":
+        entry_side = "YES"
+        entry_price = market_yes
+    elif signal == "BUY NO":
+        entry_side = "NO"
+        entry_price = market_no
+    else:
+        entry_side = ""
+        entry_price = 0
 
-        if signal == "BUY YES":
-            entry_side = "YES"
-            entry_price = market_probability
-        elif signal == "BUY NO":
-            entry_side = "NO"
-            entry_price = row["No Prob %"]
-        else:
-            entry_side = ""
-            entry_price = 0
-
-        return {
-            "Market ID": row["Market ID"],
-            "Market": market,
-            "Ticker": ticker,
-            "Current Price": round(current, 4),
-            "Target": target,
-            "Upper": upper,
-            "Resolution Date": row["Resolution Date"],
-            "Days": days,
-            "Type": market_type,
-            "Direction": direction,
-            "Market Prob %": round(market_probability, 2),
-            "No Prob %": round(row["No Prob %"], 2),
-            "EWMA Prob %": round(ewma, 2),
-            "Historical Prob %": round(hist, 2),
-            "Base Prob %": round(base, 2),
-            "Momentum": momentum,
-            "Momentum Adj %": round(mom_adj, 2),
-            "Final Prob %": round(final, 2),
-            "YES EV %": round(yes_ev_pct, 2),
-            "NO EV %": round(no_ev_pct, 2),
-            "Edge %": round(edge, 2),
-            "Signal": signal,
-            "Entry Side": entry_side,
-            "Entry Price %": round(entry_price, 2),
-            "Position Size $": size,
-            "clobTokenIds": row["clobTokenIds"],
-        }
-
+    return {
+        "Market ID": row["Market ID"],
+        "Market": market,
+        "Ticker": ticker,
+        "Current Price": round(current, 4),
+        "Target": target,
+        "Upper": upper,
+        "Resolution Date": row["Resolution Date"],
+        "Days": days,
+        "Type": market_type,
+        "Direction": direction,
+        "Market Prob %": round(market_yes, 2),
+        "No Prob %": round(market_no, 2),
+        "EWMA Prob %": round(ewma, 2),
+        "Historical Prob %": round(hist, 2),
+        "Base Prob %": round(base, 2),
+        "Momentum": momentum,
+        "Momentum Adj %": round(mom_adj, 2),
+        "Final Prob %": round(final, 2),
+        "YES Edge %": round(yes_edge, 2),
+        "NO Edge %": round(no_edge, 2),
+        "Edge %": round(edge, 2),
+        "Signal": signal,
+        "Entry Side": entry_side,
+        "Entry Price %": round(entry_price, 2),
+        "Position Size $": size,
+        "clobTokenIds": row["clobTokenIds"],
+    }
 
 asset_map = {
     "bitcoin": "BTC-USD",
