@@ -158,15 +158,23 @@ no_prob_model = 100 - final
 no_prob_market = row["No Prob %"]
 no_edge = no_prob_model - no_prob_market
 
-if yes_edge >= EDGE_THRESHOLD and final > 50:
-    signal = "BUY YES"
-    edge = yes_edge
-elif no_edge >= EDGE_THRESHOLD and no_prob_model > 50:
-    signal = "BUY NO"
-    edge = no_edge
-else:
-    signal = "PASS"
-    edge = yes_edge
+        yes_edge = final - market_probability
+
+        no_prob_model = 100 - final
+        no_prob_market = row["No Prob %"]
+        no_edge = no_prob_model - no_prob_market
+
+        if yes_edge >= EDGE_THRESHOLD and final > 50:
+            signal = "BUY YES"
+            edge = yes_edge
+
+        elif no_edge >= EDGE_THRESHOLD and no_prob_model > 50:
+            signal = "BUY NO"
+            edge = no_edge
+
+        else:
+            signal = "PASS"
+            edge = yes_edge
 
         size = 0
         abs_edge = abs(edge)
