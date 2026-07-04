@@ -153,14 +153,20 @@ class MCPQuantEngine:
             mom_adj = -mom_adj
 
         final = max(0.01, min(99.99, base + mom_adj))
-        edge = final - market_probability
+       yes_edge = final - market_probability
+no_prob_model = 100 - final
+no_prob_market = row["No Prob %"]
+no_edge = no_prob_model - no_prob_market
 
-        if edge >= EDGE_THRESHOLD:
-            signal = "BUY YES"
-        elif edge <= -EDGE_THRESHOLD:
-            signal = "BUY NO"
-        else:
-            signal = "PASS"
+if yes_edge >= EDGE_THRESHOLD and final > 50:
+    signal = "BUY YES"
+    edge = yes_edge
+elif no_edge >= EDGE_THRESHOLD and no_prob_model > 50:
+    signal = "BUY NO"
+    edge = no_edge
+else:
+    signal = "PASS"
+    edge = yes_edge
 
         size = 0
         abs_edge = abs(edge)
