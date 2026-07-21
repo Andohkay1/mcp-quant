@@ -4,3 +4,5 @@ numpy
 scipy
 requests
 yfinance
+gspread
+google-auth
