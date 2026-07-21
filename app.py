@@ -5,10 +5,12 @@ import yfinance as yf
 import requests
 import json
 import re
-import os
 import xml.etree.ElementTree as ET
 from scipy.stats import norm
 from datetime import datetime
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="MCP Quant Dashboard", layout="wide")
 st.title("MCP Quant Dashboard")
@@ -18,7 +20,8 @@ MIN_LIQUIDITY = 250
 MAX_DAYS = 10
 MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
-JOURNAL_FILE = "mcp_journal.csv"
+SPREADSHEET_NAME = "Polymarket Journal"
+WORKSHEET_NAME = "Trades"
 STARTING_BANKROLL = 100
 BUY_THRESHOLD = 6
 
@@ -523,7 +526,153 @@ def calculate_pnl(entry_side, winner, entry_price_pct, position_size):
     return round(-position_size, 2)
 
 
+JOURNAL_COLUMNS = [
+    "Market ID",
+    "Market",
+    "Ticker",
+    "Current Price",
+    "Target",
+    "Upper",
+    "Resolution Date",
+    "Days",
+    "Type",
+    "Direction",
+    "Market Prob %",
+    "No Prob %",
+    "EWMA Prob %",
+    "Historical Prob %",
+    "Base Prob %",
+    "Momentum",
+    "Momentum Adj %",
+    "Final Prob %",
+    "YES Edge %",
+    "NO Edge %",
+    "Edge %",
+    "Signal",
+    "Entry Side",
+    "Entry Price %",
+    "Position Size $",
+    "clobTokenIds",
+    "Date Saved",
+    "Status",
+    "Result",
+    "PnL",
+]
+
+NUMERIC_JOURNAL_COLUMNS = [
+    "Current Price",
+    "Target",
+    "Upper",
+    "Days",
+    "Market Prob %",
+    "No Prob %",
+    "EWMA Prob %",
+    "Historical Prob %",
+    "Base Prob %",
+    "Momentum",
+    "Momentum Adj %",
+    "Final Prob %",
+    "YES Edge %",
+    "NO Edge %",
+    "Edge %",
+    "Entry Price %",
+    "Position Size $",
+    "PnL",
+]
+
+
+def _clean_sheet_value(value):
+    """Convert Python and pandas values to Google Sheets-safe values."""
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+
+    if isinstance(value, (list, dict, tuple)):
+        return json.dumps(value)
+
+    if isinstance(value, np.generic):
+        return value.item()
+
+    return value
+
+
+@st.cache_resource
+def get_journal_worksheet():
+    """Connect to the permanent Google Sheets trading journal."""
+    required_sections = {"google_service_account", "google_sheets"}
+    missing_sections = required_sections.difference(st.secrets.keys())
+
+    if missing_sections:
+        missing = ", ".join(sorted(missing_sections))
+        raise RuntimeError(
+            f"Missing Streamlit Secrets section(s): {missing}. "
+            "Add the Google service-account and sheet settings first."
+        )
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials_info = dict(st.secrets["google_service_account"])
+    credentials = Credentials.from_service_account_info(
+        credentials_info,
+        scopes=scopes,
+    )
+    client = gspread.authorize(credentials)
+
+    spreadsheet_name = st.secrets["google_sheets"].get(
+        "spreadsheet_name",
+        SPREADSHEET_NAME,
+    )
+    worksheet_name = st.secrets["google_sheets"].get(
+        "worksheet_name",
+        WORKSHEET_NAME,
+    )
+
+    spreadsheet = client.open(spreadsheet_name)
+
+    try:
+        worksheet = spreadsheet.worksheet(worksheet_name)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=worksheet_name,
+            rows=1000,
+            cols=len(JOURNAL_COLUMNS),
+        )
+
+    current_headers = worksheet.row_values(1)
+
+    if not current_headers:
+        worksheet.append_row(JOURNAL_COLUMNS, value_input_option="RAW")
+    elif current_headers != JOURNAL_COLUMNS:
+        # Preserve existing data while making sure all required columns exist.
+        merged_headers = current_headers.copy()
+        for column in JOURNAL_COLUMNS:
+            if column not in merged_headers:
+                merged_headers.append(column)
+
+        worksheet.resize(cols=max(len(merged_headers), worksheet.col_count))
+        worksheet.update(
+            range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(merged_headers))}",
+            values=[merged_headers],
+            value_input_option="RAW",
+        )
+
+    return worksheet
+
+
 def save_to_journal(row):
+    """Append a selected trade to Google Sheets automatically."""
+    worksheet = get_journal_worksheet()
     journal_row = row.copy()
 
     journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -531,27 +680,85 @@ def save_to_journal(row):
     journal_row["Result"] = ""
     journal_row["PnL"] = 0.0
 
-    if os.path.exists(JOURNAL_FILE):
-        df = pd.read_csv(JOURNAL_FILE)
-        df = pd.concat([df, pd.DataFrame([journal_row])], ignore_index=True)
-    else:
-        df = pd.DataFrame([journal_row])
-
-    df.to_csv(JOURNAL_FILE, index=False)
+    headers = worksheet.row_values(1)
+    values = [_clean_sheet_value(journal_row.get(column, "")) for column in headers]
+    worksheet.append_row(values, value_input_option="USER_ENTERED")
 
 
+@st.cache_data(ttl=30)
 def load_journal():
-    if os.path.exists(JOURNAL_FILE):
-        return pd.read_csv(JOURNAL_FILE)
+    """Load the permanent journal from Google Sheets."""
+    try:
+        worksheet = get_journal_worksheet()
+        records = worksheet.get_all_records(
+            expected_headers=worksheet.row_values(1),
+            default_blank="",
+        )
+    except Exception as error:
+        st.error(f"Could not load the trading journal: {error}")
+        return pd.DataFrame(columns=JOURNAL_COLUMNS)
 
-    return pd.DataFrame()
+    if not records:
+        return pd.DataFrame(columns=JOURNAL_COLUMNS)
+
+    df = pd.DataFrame(records)
+
+    for column in JOURNAL_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    for column in NUMERIC_JOURNAL_COLUMNS:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    if "PnL" in df.columns:
+        df["PnL"] = df["PnL"].fillna(0.0)
+
+    return df
+
+
+def _write_journal_dataframe(df):
+    """Replace the worksheet contents after result updates."""
+    worksheet = get_journal_worksheet()
+
+    for column in JOURNAL_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    # Keep required columns first and retain any older extra columns afterward.
+    ordered_columns = JOURNAL_COLUMNS + [
+        column for column in df.columns if column not in JOURNAL_COLUMNS
+    ]
+    df = df[ordered_columns]
+
+    values = [ordered_columns]
+    values.extend(
+        [
+            [_clean_sheet_value(value) for value in row]
+            for row in df.itertuples(index=False, name=None)
+        ]
+    )
+
+    worksheet.clear()
+    worksheet.resize(
+        rows=max(len(values) + 100, 1000),
+        cols=max(len(ordered_columns), worksheet.col_count),
+    )
+    end_cell = gspread.utils.rowcol_to_a1(len(values), len(ordered_columns))
+    worksheet.update(
+        range_name=f"A1:{end_cell}",
+        values=values,
+        value_input_option="USER_ENTERED",
+    )
+    load_journal.clear()
 
 
 def update_results():
-    if not os.path.exists(JOURNAL_FILE):
-        return pd.DataFrame(), 0
+    """Check open Polymarket trades and save settled results to Google Sheets."""
+    df = load_journal().copy()
 
-    df = pd.read_csv(JOURNAL_FILE)
+    if df.empty:
+        return df, 0
 
     if "Status" not in df.columns:
         df["Status"] = "Open"
@@ -564,7 +771,7 @@ def update_results():
 
     df["Status"] = df["Status"].astype("object")
     df["Result"] = df["Result"].astype("object")
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0).astype(float)
+    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0)
 
     updates = 0
     now_utc = pd.Timestamp.now(tz="UTC")
@@ -573,7 +780,7 @@ def update_results():
         resolution_date = pd.to_datetime(
             row.get("Resolution Date"),
             utc=True,
-            errors="coerce"
+            errors="coerce",
         )
 
         if pd.notna(resolution_date) and now_utc < resolution_date:
@@ -588,18 +795,18 @@ def update_results():
 
         market_id = row.get("Market ID")
 
-        if pd.isna(market_id):
+        if pd.isna(market_id) or str(market_id).strip() == "":
             continue
 
-        market = fetch_market_by_id(market_id)
+        market = fetch_market_by_id(str(market_id).strip())
         winner, is_closed = infer_winner_from_market(market)
 
         if is_closed and winner:
             pnl = calculate_pnl(
                 entry_side=str(row.get("Entry Side", "")),
                 winner=str(winner),
-                entry_price_pct=float(row.get("Entry Price %", 0)),
-                position_size=float(row.get("Position Size $", 0)),
+                entry_price_pct=float(row.get("Entry Price %", 0) or 0),
+                position_size=float(row.get("Position Size $", 0) or 0),
             )
 
             df.loc[i, "Status"] = "Closed"
@@ -607,11 +814,10 @@ def update_results():
             df.loc[i, "PnL"] = float(pnl)
             updates += 1
 
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0).astype(float)
-    df.to_csv(JOURNAL_FILE, index=False)
+    if updates > 0:
+        _write_journal_dataframe(df)
 
     return df, updates
-
 
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
@@ -764,16 +970,25 @@ with tab1:
 
         if st.button("Save Selected Trade", key="save_trade_button"):
             row = results[results["Market"] == selected_save].iloc[0].to_dict()
-            save_to_journal(row)
-            st.success("Trade saved to journal.")
+
+            try:
+                save_to_journal(row)
+                load_journal.clear()
+                st.success("Trade saved permanently to Google Sheets.")
+            except Exception as error:
+                st.error(f"Trade could not be saved: {error}")
 
 
 with tab2:
     st.subheader("Trade Journal")
 
     if st.button("Update Results", key="update_results_button"):
-        journal, updates = update_results()
-        st.success(f"Updated {updates} closed trades.")
+        try:
+            journal, updates = update_results()
+            load_journal.clear()
+            st.success(f"Updated {updates} closed trades.")
+        except Exception as error:
+            st.error(f"Results could not be updated: {error}")
 
     journal = load_journal()
 
