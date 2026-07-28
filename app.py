@@ -756,6 +756,30 @@ def _write_journal_dataframe(df):
 def update_results():
     """Check open Polymarket trades and save settled results to Google Sheets."""
     df = load_journal().copy()
+    numeric_cols = [
+    "Current Price",
+    "Target",
+    "Upper",
+    "Days",
+    "Market Prob %",
+    "No Prob %",
+    "EWMA Prob %",
+    "Historical Prob %",
+    "Base Prob %",
+    "Momentum",
+    "Momentum Adj %",
+    "Final Prob %",
+    "YES Edge %",
+    "NO Edge %",
+    "Edge %",
+    "Entry Price %",
+    "Position Size $",
+    "PnL",
+]
+
+for col in numeric_cols:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
 
     if df.empty:
         return df, 0
