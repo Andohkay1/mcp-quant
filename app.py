@@ -335,201 +335,237 @@ class MCPQuantEngine:
         }
 
 
-asset_map = {
-    "bitcoin": "BTC-USD",
-    "btc": "BTC-USD",
-    "ethereum": "ETH-USD",
-    "eth": "ETH-USD",
-    "xrp": "XRP-USD",
-    "solana": "SOL-USD",
-    "sol": "SOL-USD",
-    "tesla": "TSLA",
-    "tsla": "TSLA",
-    "nvidia": "NVDA",
-    "nvda": "NVDA",
-    "silver": "SI=F",
-    "gold": "GC=F",
-    "oil": "CL=F",
-    "wti": "CL=F",
+# Reliable aliases are checked first. Unknown assets are resolved dynamically
+# through Yahoo Finance only after the market has passed the binary-price filter.
+ASSET_ALIASES = {
+    # Crypto
+    "bitcoin": "BTC-USD", "btc": "BTC-USD",
+    "ethereum": "ETH-USD", "ether": "ETH-USD", "eth": "ETH-USD",
+    "solana": "SOL-USD", "sol": "SOL-USD", "xrp": "XRP-USD",
+    "dogecoin": "DOGE-USD", "doge": "DOGE-USD",
+    "cardano": "ADA-USD", "ada": "ADA-USD",
+    "avalanche": "AVAX-USD", "avax": "AVAX-USD",
+    "chainlink": "LINK-USD", "link": "LINK-USD",
+    "sui": "SUI20947-USD", "bnb": "BNB-USD",
+    # Major equities
+    "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA",
+    "microsoft": "MSFT", "amazon": "AMZN", "alphabet": "GOOGL",
+    "google": "GOOGL", "meta": "META", "netflix": "NFLX",
+    "amd": "AMD", "coinbase": "COIN", "palantir": "PLTR",
+    "spotify": "SPOT", "uber": "UBER", "berkshire hathaway": "BRK-B",
+    # Indices
+    "s&p 500": "^GSPC", "s&p500": "^GSPC", "sp 500": "^GSPC",
+    "nasdaq 100": "^NDX", "nasdaq": "^IXIC", "dow jones": "^DJI",
+    "russell 2000": "^RUT",
+    # Commodities
+    "gold": "GC=F", "silver": "SI=F", "wti": "CL=F",
+    "crude oil": "CL=F", "oil": "CL=F", "brent": "BZ=F",
+    "natural gas": "NG=F", "copper": "HG=F",
+    # FX
+    "eur/usd": "EURUSD=X", "euro": "EURUSD=X",
+    "gbp/usd": "GBPUSD=X", "pound": "GBPUSD=X",
+    "usd/jpy": "JPY=X", "yen": "JPY=X",
 }
 
+PRICE_MARKET_PATTERNS = [
+    r"\b(?:reach|hit|touch|dip to|fall to|rise to)\b.*?\$?\d",
+    r"\b(?:above|below|over|under|greater than|less than)\b.*?\$?\d",
+    r"\b(?:close|closes|finish|finishes|settle|settles)\b.*?\b(?:above|below|over|under)\b",
+    r"\bbetween\b.*?\d.*?\band\b.*?\d",
+]
 
-def find_ticker(market):
-    text = str(market).lower()
-
-    for key, ticker in asset_map.items():
-        if key in text:
-            return ticker
-
-    return None
+NON_PRICE_EVENT_WORDS = [
+    "earnings", "revenue", "eps", "market cap", "acquire", "acquisition",
+    "merger", "ipo", "etf approval", "approve", "regulation", "lawsuit",
+    "ceo", "president", "election", "nominee", "fed chair", "interest rate",
+    "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
+    "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
+]
 
 
 def classify_market(market):
-    text = str(market).lower()
+    """Classify only binary financial price markets supported by the model."""
+    text = str(market or "").lower().strip()
 
-    non_price_words = [
-        "ai model",
-        "#1 ai",
-        "election",
-        "nominee",
-        "president",
-        "fed chair",
-        "ceo",
-        "app store",
-        "posts",
-        "tariff",
-        "unemployment",
-        "gdp",
-        "cpi",
-        "inflation",
-        "interest rate",
-        "win",
-        "wins",
-        "champion",
-        "world cup",
-        "ufc",
-        "nba",
-        "nfl",
-        "mlb",
-        "tennis",
-        "candidate",
-    ]
-
-    if any(w in text for w in non_price_words):
+    if any(word in text for word in NON_PRICE_EVENT_WORDS):
         return "event"
-
-    if "between" in text:
+    if "between" in text and len(extract_numbers(text)) >= 2:
         return "range"
-
-    if (
-        "close above" in text
-        or "closes above" in text
-        or "close below" in text
-        or "closes below" in text
+    if re.search(r"\b(?:close|closes|finish|finishes|settle|settles)\b", text) and re.search(
+        r"\b(?:above|below|over|under)\b", text
     ):
         return "daily_close"
-
-    price_words = [
-        "price",
-        "above $",
-        "below $",
-        "greater than $",
-        "less than $",
-        "reach $",
-        "hit $",
-        "dip to $",
-    ]
-
-    if any(w in text for w in price_words):
+    if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
         return "price"
-
     return "event"
 
 
 def infer_direction(market):
-    text = str(market).lower()
-
-    if "below" in text or "less than" in text or "dip" in text or "low" in text:
+    text = str(market or "").lower()
+    if re.search(r"\b(?:below|under|less than|dip|fall to|low)\b", text):
         return "below"
-
     return "above"
 
 
 def extract_numbers(market):
-    text = str(market).replace(",", "")
-    nums = re.findall(r"\$?(\d+(?:\.\d+)?)", text)
-
-    return [
-        float(x)
-        for x in nums
-        if float(x) < 100000 and float(x) != 2026
-    ]
+    text = str(market or "").replace(",", "")
+    # Prefer explicit prices and large index levels; remove dates and percentages.
+    raw = re.findall(r"(?<![%\w])\$?(\d+(?:\.\d+)?)", text)
+    values = []
+    for item in raw:
+        value = float(item)
+        if 1900 <= value <= 2100:  # likely a year
+            continue
+        values.append(value)
+    return values
 
 
 def extract_target(market):
     nums = extract_numbers(market)
-
-    if nums:
-        return nums[0]
-
-    return None
+    return nums[0] if nums else None
 
 
 def extract_upper(market):
     nums = extract_numbers(market)
+    return nums[1] if len(nums) > 1 else None
 
-    if len(nums) > 1:
-        return nums[1]
 
+def extract_asset_phrase(market):
+    """Extract the likely underlying name from a binary price question."""
+    text = str(market or "").strip()
+    text = re.sub(r"^(will|can|could|does|is)\s+", "", text, flags=re.I)
+    split_patterns = [
+        r"\s+(?:reach|hit|touch|dip to|fall to|rise to)\s+",
+        r"\s+(?:close|closes|finish|finishes|settle|settles)\s+",
+        r"\s+(?:be|trade)\s+(?:above|below|over|under|between)\s+",
+        r"\s+(?:above|below|over|under|greater than|less than)\s+",
+    ]
+    phrase = text
+    for pattern in split_patterns:
+        parts = re.split(pattern, phrase, maxsplit=1, flags=re.I)
+        if len(parts) > 1:
+            phrase = parts[0]
+            break
+    phrase = re.sub(r"\b(price|stock|shares|token|coin|index|futures?)\b", "", phrase, flags=re.I)
+    phrase = re.sub(r"[^A-Za-z0-9&./\- ]", " ", phrase)
+    return re.sub(r"\s+", " ", phrase).strip(" -?")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def yahoo_symbol_search(query):
+    """Resolve a name to a Yahoo symbol. Returns None when confidence is weak."""
+    query = str(query or "").strip()
+    if not query:
+        return None
+    try:
+        response = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q": query, "quotesCount": 8, "newsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        quotes = response.json().get("quotes", [])
+        allowed = {"EQUITY", "ETF", "INDEX", "CRYPTOCURRENCY", "FUTURE", "CURRENCY"}
+        for quote in quotes:
+            symbol = quote.get("symbol")
+            quote_type = str(quote.get("quoteType", "")).upper()
+            if symbol and quote_type in allowed:
+                return symbol
+    except Exception:
+        return None
     return None
+
+
+def find_ticker(market):
+    text = str(market or "").lower()
+    # Longest aliases first to avoid matching "oil" before "crude oil".
+    for key in sorted(ASSET_ALIASES, key=len, reverse=True):
+        if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text):
+            return ASSET_ALIASES[key]
+
+    # Direct ticker notation such as $AAPL or (AAPL).
+    direct = re.search(r"\$([A-Z]{1,6})\b|\(([A-Z]{1,6})\)", str(market or ""))
+    if direct:
+        return direct.group(1) or direct.group(2)
+
+    return yahoo_symbol_search(extract_asset_phrase(market))
 
 
 @st.cache_data(ttl=300)
 def pull_markets():
+    """Scan all fetched Polymarket markets and keep model-compatible binary price markets."""
     url = "https://gamma-api.polymarket.com/markets"
-
     params = {
         "closed": "false",
         "limit": 1000,
         "order": "volume",
         "ascending": "false",
     }
-
-    markets_raw = requests.get(url, params=params).json()
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    markets_raw = response.json()
 
     rows = []
-
     for m in markets_raw:
         try:
             outcome_prices = json.loads(m.get("outcomePrices", "[]"))
         except Exception:
             outcome_prices = []
 
-        yes_price = float(outcome_prices[0]) * 100 if len(outcome_prices) > 0 else None
-        no_price = float(outcome_prices[1]) * 100 if len(outcome_prices) > 1 else None
+        # The current model and executor require a binary YES/NO market.
+        if len(outcome_prices) != 2:
+            continue
 
-        rows.append(
-            {
-                "Market ID": m.get("id"),
-                "Market": m.get("question"),
-                "Resolution Date": m.get("endDate"),
-                "Market Prob %": yes_price,
-                "No Prob %": no_price,
-                "Volume": m.get("volumeNum"),
-                "Liquidity": m.get("liquidityNum"),
-                "clobTokenIds": m.get("clobTokenIds"),
-            }
-        )
+        rows.append({
+            "Market ID": m.get("id"),
+            "Market": m.get("question"),
+            "Resolution Date": m.get("endDate"),
+            "Market Prob %": float(outcome_prices[0]) * 100,
+            "No Prob %": float(outcome_prices[1]) * 100,
+            "Volume": pd.to_numeric(m.get("volumeNum"), errors="coerce"),
+            "Liquidity": pd.to_numeric(m.get("liquidityNum"), errors="coerce"),
+            "clobTokenIds": m.get("clobTokenIds"),
+        })
 
     df = pd.DataFrame(rows)
+    if df.empty:
+        return df
 
-    df["Resolution Date"] = pd.to_datetime(
-        df["Resolution Date"],
-        errors="coerce",
-        utc=True,
-    )
-
-    df["Days"] = (
-        df["Resolution Date"] - pd.Timestamp.now(tz="UTC")
-    ).dt.days
-
-    df["Ticker"] = df["Market"].apply(find_ticker)
-    df["Target"] = df["Market"].apply(extract_target)
-    df["Upper"] = df["Market"].apply(extract_upper)
-    df["Direction"] = df["Market"].apply(infer_direction)
+    df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
+    df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.days
     df["Market Type"] = df["Market"].apply(classify_market)
 
-    df = df[
-        (df["Market Type"].isin(["price", "range", "daily_close"]))
-        & (df["Ticker"].notna())
-        & (df["Target"].notna())
-        & (df["Days"] >= 0)
-        & (df["Days"] <= MAX_DAYS)
-        & (df["Liquidity"] >= MIN_LIQUIDITY)
-    ].copy()
+    financial_candidates = df[df["Market Type"].isin(["price", "range", "daily_close"])].copy()
+    financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
+    financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
+    financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
+    financial_candidates["Upper"] = financial_candidates["Market"].apply(extract_upper)
+    financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
 
-    return df
+    def rejection_reason(row):
+        if pd.isna(row["Resolution Date"]): return "Missing resolution date"
+        if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip(): return "Asset could not be resolved"
+        if pd.isna(row["Target"]): return "Target price could not be parsed"
+        if row["Market Type"] == "range" and pd.isna(row["Upper"]): return "Upper range could not be parsed"
+        if row["Days"] < 0: return "Market already expired"
+        if row["Days"] > MAX_DAYS: return f"More than {MAX_DAYS} days to expiry"
+        if pd.isna(row["Liquidity"]) or row["Liquidity"] < MIN_LIQUIDITY: return "Insufficient liquidity"
+        return "Eligible"
 
+    financial_candidates["Screen Result"] = financial_candidates.apply(rejection_reason, axis=1)
+    eligible = financial_candidates[financial_candidates["Screen Result"] == "Eligible"].copy()
+
+    eligible.attrs["scan_stats"] = {
+        "all_binary_markets": len(df),
+        "binary_price_markets": len(financial_candidates),
+        "eligible_markets": len(eligible),
+        "rejected_markets": len(financial_candidates) - len(eligible),
+    }
+    eligible.attrs["rejections"] = financial_candidates[
+        financial_candidates["Screen Result"] != "Eligible"
+    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
+    return eligible
 
 def get_news(ticker, limit=5):
     query = ticker.replace("-", " ")
@@ -1070,6 +1106,8 @@ with tab1:
     if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
         st.session_state["markets_df"] = markets_df
+        st.session_state["scan_stats"] = markets_df.attrs.get("scan_stats", {})
+        st.session_state["rejections"] = markets_df.attrs.get("rejections", pd.DataFrame())
 
         engine = MCPQuantEngine()
         scored = []
@@ -1090,7 +1128,12 @@ with tab1:
     if "markets_df" in st.session_state:
         markets_df = st.session_state["markets_df"]
 
-        st.metric("Markets Found", len(markets_df))
+        stats = st.session_state.get("scan_stats", {})
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Binary Markets Scanned", stats.get("all_binary_markets", len(markets_df)))
+        m2.metric("Binary Price Markets", stats.get("binary_price_markets", len(markets_df)))
+        m3.metric("Model Eligible", stats.get("eligible_markets", len(markets_df)))
+        m4.metric("Rejected", stats.get("rejected_markets", 0))
 
         st.subheader("Filtered Markets")
 
@@ -1111,6 +1154,11 @@ with tab1:
             ],
             use_container_width=True,
         )
+
+        rejected = st.session_state.get("rejections", pd.DataFrame())
+        if isinstance(rejected, pd.DataFrame) and not rejected.empty:
+            with st.expander("See rejected binary price markets and reasons"):
+                st.dataframe(rejected, use_container_width=True)
 
     if "results" in st.session_state:
         results = st.session_state["results"]
