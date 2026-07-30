@@ -26,6 +26,119 @@ STARTING_BANKROLL = 100
 BUY_THRESHOLD = 6
 
 
+class MCPTradingClient:
+    """Small execution client for the Moreton Capital Partners Trading Desk API."""
+
+    def __init__(self):
+        if "mcp_trading" not in st.secrets:
+            raise RuntimeError("Missing [mcp_trading] in Streamlit Secrets.")
+
+        cfg = st.secrets["mcp_trading"]
+        self.base_url = str(cfg.get("base_url", "")).rstrip("/")
+        self.email = str(cfg.get("email", ""))
+        self.password = str(cfg.get("password", ""))
+        self.live_enabled = bool(cfg.get("live_trading_enabled", False))
+        self.max_order_amount = float(cfg.get("max_order_amount", 1.0))
+        self.timeout = 20
+
+        if not self.base_url or not self.email or not self.password:
+            raise RuntimeError("MCP base_url, email, and password are required in Streamlit Secrets.")
+
+    def _request(self, method, path, *, token=None, params=None, json_body=None):
+        headers = {"Accept": "application/json"}
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        response = requests.request(
+            method,
+            f"{self.base_url}{path}",
+            headers=headers,
+            params=params,
+            json=json_body,
+            timeout=self.timeout,
+        )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"detail": response.text or "Non-JSON response"}
+
+        if not response.ok:
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+            raise RuntimeError(f"MCP API {response.status_code}: {detail}")
+
+        return payload
+
+    def login(self):
+        payload = self._request(
+            "POST",
+            "/v1/auth/login",
+            json_body={"email": self.email, "password": self.password},
+        )
+        token = payload.get("access_token")
+        if not token:
+            raise RuntimeError("MCP login succeeded but no access_token was returned.")
+        return token
+
+    def balance(self, token):
+        return self._request("GET", "/v1/balance", token=token)
+
+    def price_estimate(self, token, token_id, side, amount):
+        return self._request(
+            "GET",
+            f"/v1/markets/price-estimate/{token_id}",
+            token=token,
+            params={"side": side, "amount": str(amount), "order_type": "FOK"},
+        )
+
+    def place_market_order(self, token, token_id, side, amount):
+        if not self.live_enabled:
+            raise RuntimeError(
+                "Live trading is disabled. Set live_trading_enabled = true in [mcp_trading] only when ready."
+            )
+        return self._request(
+            "POST",
+            "/v1/orders/market",
+            token=token,
+            json_body={
+                "token_id": str(token_id),
+                "side": side,
+                "amount": str(amount),
+                "order_type": "FOK",
+            },
+        )
+
+
+def parse_outcome_token_ids(raw_value):
+    """Return outcome token IDs in Polymarket outcome order: YES first, NO second."""
+    if isinstance(raw_value, list):
+        values = raw_value
+    elif isinstance(raw_value, str):
+        try:
+            values = json.loads(raw_value)
+        except json.JSONDecodeError:
+            values = [x.strip() for x in raw_value.strip("[]").split(",") if x.strip()]
+    else:
+        values = []
+
+    return [str(value).strip().strip('"').strip("'") for value in values]
+
+
+def token_for_signal(row):
+    token_ids = parse_outcome_token_ids(row.get("clobTokenIds"))
+    if len(token_ids) < 2:
+        raise RuntimeError("This market does not contain both YES and NO outcome token IDs.")
+
+    signal = str(row.get("Signal", ""))
+    if signal == "BUY YES":
+        return token_ids[0], "YES"
+    if signal == "BUY NO":
+        return token_ids[1], "NO"
+    raise RuntimeError("The selected market is not an actionable BUY signal.")
+
+
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
         data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
@@ -553,6 +666,13 @@ JOURNAL_COLUMNS = [
     "Entry Price %",
     "Position Size $",
     "clobTokenIds",
+    "Execution Token ID",
+    "Execution Outcome",
+    "Estimated Fill Price",
+    "Executed Amount pUSD",
+    "MCP Order ID",
+    "Execution Status",
+    "Execution Response",
     "Date Saved",
     "Status",
     "Result",
@@ -577,6 +697,8 @@ NUMERIC_JOURNAL_COLUMNS = [
     "Edge %",
     "Entry Price %",
     "Position Size $",
+    "Estimated Fill Price",
+    "Executed Amount pUSD",
     "PnL",
 ]
 
@@ -685,6 +807,7 @@ def save_to_journal(row):
     worksheet.append_row(values, value_input_option="USER_ENTERED")
 
 
+@st.cache_data(ttl=30)
 def load_journal():
     """Load the permanent journal from Google Sheets."""
     try:
@@ -716,45 +839,45 @@ def load_journal():
     return df
 
 
-def _update_journal_result_cells(df, changed_rows):
-    """Update only Status, Result, and PnL cells without clearing the sheet."""
-    if not changed_rows:
-        return
-
+def _write_journal_dataframe(df):
+    """Replace the worksheet contents after result updates."""
     worksheet = get_journal_worksheet()
-    headers = worksheet.row_values(1)
-    header_positions = {name: idx + 1 for idx, name in enumerate(headers)}
 
-    required = ["Status", "Result", "PnL"]
-    missing = [column for column in required if column not in header_positions]
-    if missing:
-        raise RuntimeError(
-            f"Missing required journal column(s): {', '.join(missing)}"
-        )
+    for column in JOURNAL_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
 
-    for dataframe_index in changed_rows:
-        sheet_row = int(dataframe_index) + 2  # Header occupies row 1.
+    # Keep required columns first and retain any older extra columns afterward.
+    ordered_columns = JOURNAL_COLUMNS + [
+        column for column in df.columns if column not in JOURNAL_COLUMNS
+    ]
+    df = df[ordered_columns]
 
-        for column in required:
-            cell = gspread.utils.rowcol_to_a1(
-                sheet_row,
-                header_positions[column],
-            )
-            worksheet.update(
-                range_name=cell,
-                values=[[_clean_sheet_value(df.loc[dataframe_index, column])]],
-                value_input_option="USER_ENTERED",
-            )
+    values = [ordered_columns]
+    values.extend(
+        [
+            [_clean_sheet_value(value) for value in row]
+            for row in df.itertuples(index=False, name=None)
+        ]
+    )
+
+    worksheet.clear()
+    worksheet.resize(
+        rows=max(len(values) + 100, 1000),
+        cols=max(len(ordered_columns), worksheet.col_count),
+    )
+    end_cell = gspread.utils.rowcol_to_a1(len(values), len(ordered_columns))
+    worksheet.update(
+        range_name=f"A1:{end_cell}",
+        values=values,
+        value_input_option="USER_ENTERED",
+    )
+    load_journal.clear()
 
 
 def update_results():
     """Check open Polymarket trades and save settled results to Google Sheets."""
     df = load_journal().copy()
-
-    # Force numeric journal fields to float so decimal PnL values can be stored.
-    for column in NUMERIC_JOURNAL_COLUMNS:
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors="coerce").astype(float)
 
     if df.empty:
         return df, 0
@@ -770,10 +893,9 @@ def update_results():
 
     df["Status"] = df["Status"].astype("object")
     df["Result"] = df["Result"].astype("object")
-    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0).astype(float)
+    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0)
 
     updates = 0
-    changed_rows = set()
     now_utc = pd.Timestamp.now(tz="UTC")
 
     for i, row in df.iterrows():
@@ -788,7 +910,6 @@ def update_results():
                 df.loc[i, "Status"] = "Open"
                 df.loc[i, "Result"] = ""
                 df.loc[i, "PnL"] = 0.0
-                changed_rows.add(i)
             continue
 
         if str(row.get("Status", "")) == "Closed":
@@ -813,11 +934,10 @@ def update_results():
             df.loc[i, "Status"] = "Closed"
             df.loc[i, "Result"] = str(winner)
             df.loc[i, "PnL"] = float(pnl)
-            changed_rows.add(i)
             updates += 1
 
-    if changed_rows:
-        _update_journal_result_cells(df, sorted(changed_rows))
+    if updates > 0:
+        _write_journal_dataframe(df)
 
     return df, updates
 
@@ -962,6 +1082,111 @@ with tab1:
         else:
             st.info("⚪ The model does not see enough edge to trade.")
 
+        st.markdown("---")
+        st.subheader("Execute Model Trade through MCP")
+        st.caption(
+            "Only actionable model signals can be executed. The app logs in, selects the matching YES/NO token, "
+            "gets a fresh FOK price estimate, and requires confirmation before sending a live order."
+        )
+
+        if len(buys) > 0:
+            selected_execute = st.selectbox(
+                "Select model trade to execute",
+                buys["Market"].tolist(),
+                key="execute_trade_selectbox",
+            )
+            execute_row = buys[buys["Market"] == selected_execute].iloc[0].to_dict()
+
+            try:
+                preview_token_id, preview_outcome = token_for_signal(execute_row)
+                model_amount = float(execute_row.get("Position Size $", 0) or 0)
+
+                client = MCPTradingClient()
+                capped_amount = min(model_amount, client.max_order_amount)
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Model Signal", execute_row["Signal"])
+                c2.metric("Outcome Token", preview_outcome)
+                c3.metric("Model Size", f"${model_amount:.2f}")
+                c4.metric("Live Amount", f"${capped_amount:.2f}")
+
+                if capped_amount < model_amount:
+                    st.warning(
+                        f"The model suggested ${model_amount:.2f}, but the live safety cap limits this order to "
+                        f"${capped_amount:.2f}. Change max_order_amount in Streamlit Secrets when appropriate."
+                    )
+
+                if capped_amount < 1:
+                    st.error("The live amount must be at least 1 pUSD for the CLOB minimum notional.")
+                else:
+                    if st.button("Get Fresh MCP Price Estimate", key="mcp_estimate_button"):
+                        token = client.login()
+                        estimate = client.price_estimate(
+                            token, preview_token_id, "buy", capped_amount
+                        )
+                        st.session_state["mcp_trade_preview"] = {
+                            "market": selected_execute,
+                            "row": execute_row,
+                            "token_id": preview_token_id,
+                            "outcome": preview_outcome,
+                            "amount": capped_amount,
+                            "estimate": estimate,
+                        }
+
+                    preview = st.session_state.get("mcp_trade_preview")
+                    if preview and preview.get("market") == selected_execute:
+                        estimate_price = float(preview["estimate"].get("price", 0) or 0)
+                        st.success(f"Fresh estimated execution price: ${estimate_price:.4f} per share")
+                        st.json(preview["estimate"])
+
+                        confirm = st.checkbox(
+                            f"I confirm this live BUY {preview_outcome} order for ${capped_amount:.2f} pUSD.",
+                            key="confirm_live_mcp_trade",
+                        )
+
+                        if st.button(
+                            "Execute Confirmed Live Trade",
+                            disabled=not confirm,
+                            key="execute_live_mcp_trade_button",
+                        ):
+                            # Re-login and re-estimate immediately before execution so stale session data is not used.
+                            token = client.login()
+                            fresh_estimate = client.price_estimate(
+                                token, preview_token_id, "buy", capped_amount
+                            )
+                            order_response = client.place_market_order(
+                                token, preview_token_id, "buy", capped_amount
+                            )
+
+                            executed_row = execute_row.copy()
+                            executed_row["Execution Token ID"] = preview_token_id
+                            executed_row["Execution Outcome"] = preview_outcome
+                            executed_row["Estimated Fill Price"] = fresh_estimate.get("price", "")
+                            executed_row["Executed Amount pUSD"] = capped_amount
+                            executed_row["MCP Order ID"] = (
+                                order_response.get("order_id")
+                                or order_response.get("id")
+                                or order_response.get("clob_order_id")
+                                or ""
+                            )
+                            executed_row["Execution Status"] = "Submitted"
+                            executed_row["Execution Response"] = order_response
+                            executed_row["Entry Price %"] = (
+                                float(fresh_estimate.get("price", 0) or 0) * 100
+                            )
+                            executed_row["Position Size $"] = capped_amount
+
+                            save_to_journal(executed_row)
+                            load_journal.clear()
+                            st.session_state.pop("mcp_trade_preview", None)
+                            st.success("Model trade executed through MCP and saved to Google Sheets.")
+                            st.json(order_response)
+            except Exception as error:
+                st.error(f"MCP execution setup error: {error}")
+        else:
+            st.info("No actionable model signals are available for execution.")
+
+        st.markdown("---")
         st.subheader("Save Trade to Journal")
 
         selected_save = st.selectbox(
@@ -975,6 +1200,7 @@ with tab1:
 
             try:
                 save_to_journal(row)
+                load_journal.clear()
                 st.success("Trade saved permanently to Google Sheets.")
             except Exception as error:
                 st.error(f"Trade could not be saved: {error}")
@@ -986,6 +1212,7 @@ with tab2:
     if st.button("Update Results", key="update_results_button"):
         try:
             journal, updates = update_results()
+            load_journal.clear()
             st.success(f"Updated {updates} closed trades.")
         except Exception as error:
             st.error(f"Results could not be updated: {error}")
