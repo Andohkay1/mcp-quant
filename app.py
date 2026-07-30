@@ -26,6 +26,142 @@ STARTING_BANKROLL = 100
 BUY_THRESHOLD = 6
 
 
+# MCP competition tracking settings
+COMPETITION_DAYS = 60
+REQUIRED_COMPLETED_TRADES = 80
+MARK_TO_MARKET_FLOOR = 70.0
+
+
+def _safe_float(value, default=0.0):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _asset_class_from_ticker(ticker):
+    ticker = str(ticker or "").upper().strip()
+    if ticker.endswith("-USD"):
+        return "Crypto"
+    if ticker.endswith("=F"):
+        return "Commodity"
+    if ticker.startswith("^"):
+        return "Index"
+    if ticker.endswith("=X"):
+        return "FX"
+    return "Stock / ETF"
+
+
+def _trade_return(row):
+    size = _safe_float(row.get("Executed Amount pUSD"), 0.0)
+    if size <= 0:
+        size = _safe_float(row.get("Position Size $"), 0.0)
+    pnl = _safe_float(row.get("PnL"), 0.0)
+    return pnl / size if size > 0 else np.nan
+
+
+def _max_drawdown_from_pnl(closed):
+    if closed.empty:
+        return 0.0, pd.Series(dtype=float)
+    pnl = pd.to_numeric(closed["PnL"], errors="coerce").fillna(0.0)
+    equity = STARTING_BANKROLL + pnl.cumsum()
+    running_peak = equity.cummax()
+    drawdown = (equity - running_peak) / running_peak.replace(0, np.nan)
+    return abs(float(drawdown.min())) if len(drawdown) else 0.0, equity
+
+
+def calculate_competition_metrics(journal):
+    """Calculate competition metrics from the permanent journal.
+
+    Sharpe and Sortino use resolved trade-level returns. Calmar uses realized
+    cumulative return divided by realized maximum drawdown. Open-position
+    mark-to-market is not included because the journal does not contain live
+    position values.
+    """
+    if journal is None or journal.empty:
+        return {
+            "executed": pd.DataFrame(), "closed": pd.DataFrame(), "open": pd.DataFrame(),
+            "trade_count": 0, "closed_count": 0, "open_count": 0,
+            "total_pnl": 0.0, "realized_bankroll": STARTING_BANKROLL,
+            "win_rate": np.nan, "sharpe": np.nan, "sortino": np.nan,
+            "calmar": np.nan, "max_drawdown": 0.0, "equity": pd.Series(dtype=float),
+            "days_elapsed": 0, "days_remaining": COMPETITION_DAYS,
+            "required_weekly_pace": REQUIRED_COMPLETED_TRADES / (COMPETITION_DAYS / 7),
+        }
+
+    df = journal.copy()
+    order_ids = df.get("MCP Order ID", pd.Series(index=df.index, dtype=object)).astype(str).str.strip()
+    statuses = df.get("Execution Status", pd.Series(index=df.index, dtype=object)).astype(str).str.lower()
+    executed_mask = order_ids.ne("") & ~statuses.str.contains("error|failed|rejected|cancel", regex=True, na=False)
+    executed = df.loc[executed_mask].copy()
+    if "MCP Order ID" in executed.columns:
+        executed = executed.drop_duplicates(subset=["MCP Order ID"], keep="last")
+
+    closed = executed[executed.get("Status", "").astype(str).str.lower().eq("closed")].copy()
+    open_trades = executed[~executed.index.isin(closed.index)].copy()
+    closed["Trade Return"] = closed.apply(_trade_return, axis=1) if not closed.empty else pd.Series(dtype=float)
+    returns = pd.to_numeric(closed.get("Trade Return"), errors="coerce").dropna()
+
+    total_pnl = pd.to_numeric(closed.get("PnL"), errors="coerce").fillna(0.0).sum() if not closed.empty else 0.0
+    wins = int((pd.to_numeric(closed.get("PnL"), errors="coerce").fillna(0.0) > 0).sum()) if not closed.empty else 0
+    win_rate = wins / len(closed) if len(closed) else np.nan
+
+    sharpe = np.nan
+    sortino = np.nan
+    if len(returns) >= 2 and returns.std(ddof=1) > 0:
+        sharpe = float(returns.mean() / returns.std(ddof=1) * np.sqrt(len(returns)))
+    downside = returns[returns < 0]
+    if len(returns) >= 2 and len(downside) >= 2 and downside.std(ddof=1) > 0:
+        sortino = float(returns.mean() / downside.std(ddof=1) * np.sqrt(len(returns)))
+
+    max_drawdown, equity = _max_drawdown_from_pnl(closed)
+    realized_return = total_pnl / STARTING_BANKROLL
+    calmar = realized_return / max_drawdown if max_drawdown > 0 else np.nan
+
+    saved_dates = pd.to_datetime(executed.get("Date Saved"), errors="coerce") if not executed.empty else pd.Series(dtype="datetime64[ns]")
+    first_date = saved_dates.dropna().min() if not saved_dates.dropna().empty else pd.NaT
+    today = pd.Timestamp.now().normalize()
+    days_elapsed = max(1, int((today - first_date.normalize()).days) + 1) if pd.notna(first_date) else 0
+    days_remaining = max(COMPETITION_DAYS - days_elapsed, 0)
+    trades_remaining = max(REQUIRED_COMPLETED_TRADES - len(executed), 0)
+    weeks_remaining = max(days_remaining / 7, 1 / 7)
+
+    return {
+        "executed": executed, "closed": closed, "open": open_trades,
+        "trade_count": len(executed), "closed_count": len(closed), "open_count": len(open_trades),
+        "total_pnl": float(total_pnl), "realized_bankroll": STARTING_BANKROLL + float(total_pnl),
+        "win_rate": win_rate, "sharpe": sharpe, "sortino": sortino,
+        "calmar": calmar, "max_drawdown": max_drawdown, "equity": equity,
+        "days_elapsed": days_elapsed, "days_remaining": days_remaining,
+        "trades_remaining": trades_remaining,
+        "required_weekly_pace": trades_remaining / weeks_remaining if trades_remaining else 0.0,
+    }
+
+
+def _metric_text(value, percent=False):
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return f"{value * 100:.1f}%" if percent else f"{value:.2f}"
+
+
+def _band_table(df, value_column, bins, labels):
+    if df.empty or value_column not in df.columns:
+        return pd.DataFrame()
+    work = df.copy()
+    work[value_column] = pd.to_numeric(work[value_column], errors="coerce")
+    work["Band"] = pd.cut(work[value_column], bins=bins, labels=labels, include_lowest=True, right=False)
+    work["Win"] = pd.to_numeric(work["PnL"], errors="coerce").fillna(0) > 0
+    grouped = work.dropna(subset=["Band"]).groupby("Band", observed=False).agg(
+        Trades=("Win", "size"),
+        Win_Rate=("Win", "mean"),
+        Average_PnL=("PnL", "mean"),
+    ).reset_index()
+    grouped["Win Rate"] = (grouped.pop("Win_Rate") * 100).round(1)
+    grouped["Average PnL"] = pd.to_numeric(grouped.pop("Average_PnL"), errors="coerce").round(3)
+    return grouped
+
+
 class MCPTradingClient:
     """Small execution client for the Moreton Capital Partners Trading Desk API."""
 
@@ -1097,7 +1233,7 @@ def update_results():
 
     return df, updates
 
-tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
+tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Journal", "Competition Tracker", "Research Analytics"])
 
 
 with tab1:
@@ -1424,45 +1560,134 @@ with tab2:
 
 
 with tab3:
-    st.subheader("Analytics")
+    st.subheader("MCP Competition Performance Tracker")
+    st.caption(
+        "Counts unique MCP orders. Sharpe, Sortino and Calmar are based on resolved trade results in the journal. "
+        "Open-position mark-to-market is not included in these calculated ratios."
+    )
 
     journal = load_journal()
+    metrics = calculate_competition_metrics(journal)
 
-    if len(journal) > 0:
-        if "Status" in journal.columns:
-            closed = journal[journal["Status"] == "Closed"]
-            open_trades = journal[journal["Status"] != "Closed"]
+    live_cash = np.nan
+    try:
+        client = MCPTradingClient()
+        token = client.login()
+        live_cash = _safe_float(client.balance(token).get("balance"), np.nan)
+    except Exception as error:
+        st.warning(f"Live MCP cash balance could not be loaded: {error}")
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Completed Trades", f"{metrics['trade_count']} / {REQUIRED_COMPLETED_TRADES}")
+    p2.metric("Days", f"{metrics['days_elapsed']} / {COMPETITION_DAYS}")
+    p3.metric("Trades Remaining", metrics.get("trades_remaining", REQUIRED_COMPLETED_TRADES))
+    p4.metric("Required Weekly Pace", f"{metrics['required_weekly_pace']:.1f}")
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("MCP Cash Balance", "N/A" if not np.isfinite(live_cash) else f"${live_cash:.2f}")
+    b2.metric("Realized Bankroll", f"${metrics['realized_bankroll']:.2f}")
+    b3.metric("Realized P&L", f"${metrics['total_pnl']:.2f}")
+    floor_buffer = live_cash - MARK_TO_MARKET_FLOOR if np.isfinite(live_cash) else np.nan
+    b4.metric("Cash Buffer Above $70", "N/A" if not np.isfinite(floor_buffer) else f"${floor_buffer:.2f}")
+
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Win Rate", _metric_text(metrics['win_rate'], percent=True))
+    r2.metric("Sharpe", _metric_text(metrics['sharpe']))
+    r3.metric("Sortino", _metric_text(metrics['sortino']))
+    r4.metric("Calmar", _metric_text(metrics['calmar']))
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Realized Max Drawdown", _metric_text(metrics['max_drawdown'], percent=True))
+    d2.metric("Resolved Trades", metrics['closed_count'])
+    d3.metric("Open Executed Trades", metrics['open_count'])
+
+    if np.isfinite(live_cash):
+        if live_cash <= MARK_TO_MARKET_FLOOR:
+            st.error("The MCP cash balance is at or below the $70 risk floor. Stop new orders and review exposure.")
+        elif live_cash < 80:
+            st.warning("The cash balance is within $10 of the $70 floor. Keep sizing conservative.")
         else:
-            closed = pd.DataFrame()
-            open_trades = journal
+            st.success("The current cash balance remains above the competition floor.")
 
-        total_pnl = closed["PnL"].sum() if len(closed) > 0 else 0
-        bankroll = STARTING_BANKROLL + total_pnl
+    progress = min(metrics['trade_count'] / REQUIRED_COMPLETED_TRADES, 1.0)
+    st.progress(progress, text=f"Trade requirement progress: {metrics['trade_count']} of {REQUIRED_COMPLETED_TRADES}")
 
-        buy_count = journal[journal["Signal"].isin(["BUY YES", "BUY NO"])].shape[0]
-        avg_edge = journal["Edge %"].mean()
+    if len(metrics['equity']) > 0:
+        equity_chart = pd.DataFrame({"Realized Equity": metrics['equity'].values})
+        equity_chart.index = range(1, len(equity_chart) + 1)
+        equity_chart.index.name = "Resolved Trade"
+        st.subheader("Realized Equity Curve")
+        st.line_chart(equity_chart)
 
-        wins = closed[closed["PnL"] > 0].shape[0] if len(closed) > 0 else 0
-        win_rate = (wins / len(closed) * 100) if len(closed) > 0 else 0
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric("Bankroll", f"${round(bankroll, 2)}")
-        c2.metric("Total PnL", f"${round(total_pnl, 2)}")
-        c3.metric("Closed Trades", len(closed))
-        c4.metric("Win Rate", f"{round(win_rate, 2)}%")
-
-        c5, c6, c7 = st.columns(3)
-
-        c5.metric("Open Trades", len(open_trades))
-        c6.metric("Buy Signals", buy_count)
-        c7.metric("Avg Edge", round(avg_edge, 2))
-
-        st.subheader("Edge Distribution")
-        st.bar_chart(journal["Edge %"])
-
-        if len(closed) > 0:
-            st.subheader("PnL by Trade")
-            st.bar_chart(closed["PnL"])
+    executed = metrics['executed']
+    if not executed.empty:
+        display_cols = [c for c in [
+            "Date Saved", "Market", "Ticker", "Signal", "Edge %", "Final Prob %",
+            "Executed Amount pUSD", "Execution Status", "Status", "Result", "PnL", "MCP Order ID"
+        ] if c in executed.columns]
+        st.subheader("Competition Trade Ledger")
+        st.dataframe(executed[display_cols], use_container_width=True)
     else:
-        st.info("No analytics available yet.")
+        st.info("No unique MCP executions have been recorded yet.")
+
+
+with tab4:
+    st.subheader("Research Analytics")
+    st.caption("Use these tables after enough trades resolve. Very small samples can be misleading.")
+
+    journal = load_journal()
+    metrics = calculate_competition_metrics(journal)
+    closed = metrics['closed'].copy()
+
+    if not closed.empty:
+        closed["Asset Class"] = closed.get("Ticker", "").apply(_asset_class_from_ticker)
+        closed["Win"] = pd.to_numeric(closed["PnL"], errors="coerce").fillna(0) > 0
+        closed["Trade Return"] = closed.apply(_trade_return, axis=1)
+
+        st.subheader("Probability Calibration")
+        calibration = _band_table(
+            closed, "Final Prob %",
+            bins=[0, 60, 70, 80, 90, 95, 101],
+            labels=["<60", "60–69", "70–79", "80–89", "90–94", "95–100"],
+        )
+        if not calibration.empty:
+            st.dataframe(calibration, use_container_width=True)
+
+        st.subheader("Edge Validation")
+        edge_table = _band_table(
+            closed, "Edge %",
+            bins=[0, 5, 10, 15, 20, 1000],
+            labels=["<5", "5–9.9", "10–14.9", "15–19.9", "20+"],
+        )
+        if not edge_table.empty:
+            st.dataframe(edge_table, use_container_width=True)
+
+        st.subheader("Performance by Asset Class")
+        by_asset = closed.groupby("Asset Class").agg(
+            Trades=("Win", "size"),
+            Win_Rate=("Win", "mean"),
+            Total_PnL=("PnL", "sum"),
+            Average_Return=("Trade Return", "mean"),
+        ).reset_index()
+        by_asset["Win Rate"] = (by_asset.pop("Win_Rate") * 100).round(1)
+        by_asset["Total PnL"] = by_asset.pop("Total_PnL").round(3)
+        by_asset["Average Return %"] = (by_asset.pop("Average_Return") * 100).round(1)
+        st.dataframe(by_asset, use_container_width=True)
+
+        type_col = "Type" if "Type" in closed.columns else "Market Type"
+        if type_col in closed.columns:
+            st.subheader("Performance by Market Type")
+            by_type = closed.groupby(type_col).agg(
+                Trades=("Win", "size"),
+                Win_Rate=("Win", "mean"),
+                Total_PnL=("PnL", "sum"),
+            ).reset_index()
+            by_type["Win Rate"] = (by_type.pop("Win_Rate") * 100).round(1)
+            by_type["Total PnL"] = by_type.pop("Total_PnL").round(3)
+            st.dataframe(by_type, use_container_width=True)
+
+        st.subheader("Position Sizing Review")
+        sizing_cols = [c for c in ["Market", "Edge %", "Final Prob %", "Executed Amount pUSD", "PnL", "Trade Return"] if c in closed.columns]
+        st.dataframe(closed[sizing_cols], use_container_width=True)
+    else:
+        st.info("Research analytics will appear after executed trades resolve and the results are updated.")
