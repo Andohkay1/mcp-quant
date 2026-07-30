@@ -873,6 +873,60 @@ def save_to_journal(row, update_existing=False):
     return "created", worksheet.row_count
 
 
+def verify_execution_fields(sheet_row_number, expected):
+    """Write and verify MCP execution fields in a specific Google Sheets row."""
+    worksheet = get_journal_worksheet()
+    headers = worksheet.row_values(1)
+
+    required = [
+        "Execution Token ID",
+        "Execution Outcome",
+        "Estimated Fill Price",
+        "Executed Amount pUSD",
+        "MCP Order ID",
+        "CLOB Order ID",
+        "Execution Status",
+        "Execution Response",
+    ]
+
+    missing = [column for column in required if column not in headers]
+    if missing:
+        raise RuntimeError(
+            "Google Sheets is missing execution column(s): " + ", ".join(missing)
+        )
+
+    # Update each execution field by its actual header location. This remains
+    # reliable even when older sheets have the new columns appended at the end.
+    updates = []
+    for column in required:
+        col_number = headers.index(column) + 1
+        cell = gspread.utils.rowcol_to_a1(sheet_row_number, col_number)
+        updates.append({
+            "range": cell,
+            "values": [[_clean_sheet_value(expected.get(column, ""))]],
+        })
+
+    worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+    # Read the row back so the app does not claim success when IDs were not saved.
+    saved_values = worksheet.row_values(sheet_row_number)
+    saved = {
+        header: saved_values[index] if index < len(saved_values) else ""
+        for index, header in enumerate(headers)
+    }
+
+    for column in ("MCP Order ID", "CLOB Order ID", "Execution Status"):
+        expected_value = str(_clean_sheet_value(expected.get(column, ""))).strip()
+        saved_value = str(saved.get(column, "")).strip()
+        if expected_value and saved_value != expected_value:
+            raise RuntimeError(
+                f"The trade executed, but Google Sheets did not retain {column}. "
+                "Check the sheet permissions and column headers."
+            )
+
+    return saved
+
+
 @st.cache_data(ttl=30)
 def load_journal():
     """Load the permanent journal from Google Sheets."""
@@ -1246,9 +1300,22 @@ with tab1:
                             )
                             executed_row["Position Size $"] = capped_amount
 
-                            journal_action, _ = save_to_journal(
+                            journal_action, journal_row_number = save_to_journal(
                                 executed_row,
                                 update_existing=True,
+                            )
+                            verify_execution_fields(
+                                journal_row_number,
+                                {
+                                    "Execution Token ID": preview_token_id,
+                                    "Execution Outcome": preview_outcome,
+                                    "Estimated Fill Price": fresh_estimate.get("price", ""),
+                                    "Executed Amount pUSD": capped_amount,
+                                    "MCP Order ID": executed_row["MCP Order ID"],
+                                    "CLOB Order ID": executed_row["CLOB Order ID"],
+                                    "Execution Status": executed_row["Execution Status"],
+                                    "Execution Response": order_response,
+                                },
                             )
                             load_journal.clear()
                             st.session_state.pop("mcp_trade_preview", None)
