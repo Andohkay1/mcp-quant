@@ -671,6 +671,7 @@ JOURNAL_COLUMNS = [
     "Estimated Fill Price",
     "Executed Amount pUSD",
     "MCP Order ID",
+    "CLOB Order ID",
     "Execution Status",
     "Execution Response",
     "Date Saved",
@@ -792,19 +793,84 @@ def get_journal_worksheet():
     return worksheet
 
 
-def save_to_journal(row):
-    """Append a selected trade to Google Sheets automatically."""
+def save_to_journal(row, update_existing=False):
+    """Save a trade, updating its existing journal row when requested."""
     worksheet = get_journal_worksheet()
     journal_row = row.copy()
+    headers = worksheet.row_values(1)
+
+    existing_row_number = None
+    existing_record = {}
+
+    if update_existing:
+        market_id = str(journal_row.get("Market ID", "")).strip()
+        market_name = str(journal_row.get("Market", "")).strip()
+        all_values = worksheet.get_all_values()
+
+        # Search from the bottom so the most recent matching journal entry is updated.
+        # Prefer an entry that has not already been executed.
+        fallback = None
+        for sheet_row_number in range(len(all_values), 1, -1):
+            values = all_values[sheet_row_number - 1]
+            record = {
+                header: values[index] if index < len(values) else ""
+                for index, header in enumerate(headers)
+            }
+            same_trade = (
+                market_id and str(record.get("Market ID", "")).strip() == market_id
+            ) or (
+                not market_id
+                and market_name
+                and str(record.get("Market", "")).strip() == market_name
+            )
+            if not same_trade:
+                continue
+
+            if fallback is None:
+                fallback = (sheet_row_number, record)
+
+            if not str(record.get("MCP Order ID", "")).strip():
+                existing_row_number, existing_record = sheet_row_number, record
+                break
+
+        if existing_row_number is None and fallback is not None:
+            existing_row_number, existing_record = fallback
+
+    if existing_row_number is not None:
+        # Preserve journal-management fields and the original save date unless explicitly supplied.
+        for field in ("Date Saved", "Status", "Result", "PnL"):
+            if journal_row.get(field, "") in ("", None):
+                journal_row[field] = existing_record.get(field, "")
+
+        if not journal_row.get("Date Saved"):
+            journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not journal_row.get("Status"):
+            journal_row["Status"] = "Open"
+        if journal_row.get("Result") is None:
+            journal_row["Result"] = ""
+        if journal_row.get("PnL") in ("", None):
+            journal_row["PnL"] = 0.0
+
+        # Keep any existing values for columns not present in the incoming model row.
+        merged = existing_record.copy()
+        merged.update({key: value for key, value in journal_row.items() if value is not None})
+        values = [_clean_sheet_value(merged.get(column, "")) for column in headers]
+        end_cell = gspread.utils.rowcol_to_a1(existing_row_number, len(headers))
+        worksheet.update(
+            range_name=f"A{existing_row_number}:{end_cell}",
+            values=[values],
+            value_input_option="USER_ENTERED",
+        )
+        return "updated", existing_row_number
 
     journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    journal_row["Status"] = "Open"
-    journal_row["Result"] = ""
-    journal_row["PnL"] = 0.0
+    journal_row["Status"] = journal_row.get("Status") or "Open"
+    journal_row["Result"] = journal_row.get("Result", "")
+    journal_row["PnL"] = journal_row.get("PnL", 0.0)
 
-    headers = worksheet.row_values(1)
     values = [_clean_sheet_value(journal_row.get(column, "")) for column in headers]
     worksheet.append_row(values, value_input_option="USER_ENTERED")
+    return "created", worksheet.row_count
 
 
 @st.cache_data(ttl=30)
@@ -1166,20 +1232,34 @@ with tab1:
                             executed_row["MCP Order ID"] = (
                                 order_response.get("order_id")
                                 or order_response.get("id")
-                                or order_response.get("clob_order_id")
                                 or ""
                             )
-                            executed_row["Execution Status"] = "Submitted"
+                            executed_row["CLOB Order ID"] = order_response.get("clob_order_id", "")
+                            executed_row["Execution Status"] = (
+                                order_response.get("clob_status")
+                                or order_response.get("status")
+                                or "Submitted"
+                            )
                             executed_row["Execution Response"] = order_response
                             executed_row["Entry Price %"] = (
                                 float(fresh_estimate.get("price", 0) or 0) * 100
                             )
                             executed_row["Position Size $"] = capped_amount
 
-                            save_to_journal(executed_row)
+                            journal_action, _ = save_to_journal(
+                                executed_row,
+                                update_existing=True,
+                            )
                             load_journal.clear()
                             st.session_state.pop("mcp_trade_preview", None)
-                            st.success("Model trade executed through MCP and saved to Google Sheets.")
+                            if journal_action == "updated":
+                                st.success(
+                                    "Model trade executed through MCP and the existing Google Sheets row was updated."
+                                )
+                            else:
+                                st.success(
+                                    "Model trade executed through MCP and a new Google Sheets row was created."
+                                )
                             st.json(order_response)
             except Exception as error:
                 st.error(f"MCP execution setup error: {error}")
@@ -1199,9 +1279,12 @@ with tab1:
             row = results[results["Market"] == selected_save].iloc[0].to_dict()
 
             try:
-                save_to_journal(row)
+                journal_action, _ = save_to_journal(row, update_existing=True)
                 load_journal.clear()
-                st.success("Trade saved permanently to Google Sheets.")
+                if journal_action == "updated":
+                    st.success("The existing Google Sheets trade row was refreshed.")
+                else:
+                    st.success("Trade saved permanently to Google Sheets.")
             except Exception as error:
                 st.error(f"Trade could not be saved: {error}")
 
