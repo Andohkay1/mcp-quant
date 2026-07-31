@@ -299,7 +299,10 @@ class MCPQuantEngine:
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
 
-        sigma = vol * np.sqrt(max(days, 1) / 252)
+        # Preserve fractional trading days. A market with only a few hours left
+        # must not be treated as though it has a full day to move.
+        horizon_days = max(float(days), 1 / 390)
+        sigma = vol * np.sqrt(horizon_days / 252)
         z = np.log(target / current) / sigma
 
         if direction == "above":
@@ -312,7 +315,11 @@ class MCPQuantEngine:
         current = close.iloc[-1]
 
         required_return = target / current - 1
-        future_returns = (close.shift(-days) / close - 1).dropna()
+        # Daily historical data cannot be shifted by a fraction. Use the next
+        # full trading day as the nearest empirical comparison while EWMA uses
+        # the exact fractional horizon.
+        historical_days = max(int(np.ceil(float(days))), 1)
+        future_returns = (close.shift(-historical_days) / close - 1).dropna()
 
         if direction == "above":
             return (future_returns >= required_return).mean() * 100
@@ -364,7 +371,8 @@ class MCPQuantEngine:
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
 
-        sigma = vol * np.sqrt(max(days, 1) / 252)
+        horizon_days = max(float(days), 1 / 390)
+        sigma = vol * np.sqrt(horizon_days / 252)
 
         z_low = np.log(lower / current) / sigma
         z_high = np.log(upper / current) / sigma
@@ -376,7 +384,7 @@ class MCPQuantEngine:
         ticker = row["Ticker"]
         target = row["Target"]
         upper = row["Upper"]
-        days = max(int(row["Days"]), 1)
+        days = max(float(row["Days"]), 1 / 390)
         direction = row["Direction"]
         market_probability = row["Market Prob %"]
         market_type = row["Market Type"]
@@ -449,7 +457,7 @@ class MCPQuantEngine:
             "Target": target,
             "Upper": upper,
             "Resolution Date": row["Resolution Date"],
-            "Days": days,
+            "Days": round(days, 4),
             "Type": market_type,
             "Direction": direction,
             "Market Prob %": round(market_yes, 2),
@@ -669,14 +677,34 @@ def pull_markets():
         return df
 
     df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
-    df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.days
+    now_utc = pd.Timestamp.now(tz="UTC")
+    df["Hours Remaining"] = (
+        df["Resolution Date"] - now_utc
+    ).dt.total_seconds() / 3600
+    # Generic fractional calendar days for screening and non-close markets.
+    df["Days"] = df["Hours Remaining"] / 24
     df["Market Type"] = df["Market"].apply(classify_market)
+
+    # For same-day closing markets, volatility should scale to the fraction of
+    # a 6.5-hour US trading session still remaining, not a rounded calendar day.
+    same_day_close = (
+        df["Market Type"].eq("daily_close")
+        & df["Resolution Date"].dt.date.eq(now_utc.date())
+        & df["Hours Remaining"].ge(0)
+    )
+    df.loc[same_day_close, "Days"] = df.loc[same_day_close, "Hours Remaining"] / 6.5
 
     financial_candidates = df[df["Market Type"].isin(["price", "range", "daily_close"])].copy()
     financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
     financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
-    financial_candidates["Upper"] = financial_candidates["Market"].apply(extract_upper)
+    # Only range markets need an upper price. This prevents date numbers such
+    # as the "31" in "July 31" from appearing as a false upper bound.
+    financial_candidates["Upper"] = np.nan
+    range_mask = financial_candidates["Market Type"].eq("range")
+    financial_candidates.loc[range_mask, "Upper"] = (
+        financial_candidates.loc[range_mask, "Market"].apply(extract_upper)
+    )
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
 
     def rejection_reason(row):
@@ -700,7 +728,7 @@ def pull_markets():
     }
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
-    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
+    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Hours Remaining", "Days"]]
     return eligible
 
 def get_news(ticker, limit=5):
@@ -1368,7 +1396,7 @@ with tab1:
         st.write(f"**Direction:** {explain['Direction']}")
         st.write(f"**Target:** {explain['Target']}")
         st.write(f"**Upper Bound:** {explain['Upper']}")
-        st.write(f"**Days to Expiry:** {explain['Days']}")
+        st.write(f"**Model Horizon (trading days):** {explain['Days']}")
         st.write(f"**Momentum Score:** {explain['Momentum']}")
         st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
         st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
