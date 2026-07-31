@@ -25,6 +25,14 @@ WORKSHEET_NAME = "Trades"
 STARTING_BANKROLL = 100
 BUY_THRESHOLD = 6
 
+# Automatic execution filters. A model signal can still appear in the research
+# table even when it is not approved for live execution.
+MIN_ACTIONABLE_EDGE = 8.0
+MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
+MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
+MIN_SELECTED_MODEL_PROB_PCT = 55.0
+MIN_TRADING_DAYS_REMAINING = 0.01  # about four minutes of a 6.5-hour session
+
 
 # MCP competition tracking settings
 COMPETITION_DAYS = 60
@@ -38,6 +46,44 @@ def _safe_float(value, default=0.0):
         return number if np.isfinite(number) else default
     except (TypeError, ValueError):
         return default
+
+
+def evaluate_execution_approval(row):
+    """Return whether a model signal is eligible for live execution and why.
+
+    This separates forecasting from execution. Large apparent edges in nearly
+    resolved or extremely one-sided markets remain visible for research but are
+    blocked from automatic/live execution.
+    """
+    signal = str(row.get("Signal", ""))
+    edge = _safe_float(row.get("Edge %"), 0.0)
+    entry_price = _safe_float(row.get("Entry Price %"), 0.0)
+    days_remaining = _safe_float(row.get("Days"), 0.0)
+    model_yes = _safe_float(row.get("Final Prob %"), 0.0)
+
+    if signal == "BUY YES":
+        selected_model_probability = model_yes
+    elif signal == "BUY NO":
+        selected_model_probability = 100.0 - model_yes
+    else:
+        return False, "No BUY signal", 0.0
+
+    reasons = []
+    if edge < MIN_ACTIONABLE_EDGE:
+        reasons.append(f"edge below {MIN_ACTIONABLE_EDGE:.0f}%")
+    if entry_price < MIN_TRADABLE_ENTRY_PRICE_PCT:
+        reasons.append(f"entry price below {MIN_TRADABLE_ENTRY_PRICE_PCT:.0f}%")
+    if entry_price > MAX_TRADABLE_ENTRY_PRICE_PCT:
+        reasons.append(f"entry price above {MAX_TRADABLE_ENTRY_PRICE_PCT:.0f}%")
+    if selected_model_probability < MIN_SELECTED_MODEL_PROB_PCT:
+        reasons.append(
+            f"selected-outcome model probability below {MIN_SELECTED_MODEL_PROB_PCT:.0f}%"
+        )
+    if days_remaining < MIN_TRADING_DAYS_REMAINING:
+        reasons.append("too little trading time remaining")
+
+    approved = not reasons
+    return approved, ("Approved" if approved else "; ".join(reasons)), selected_model_probability
 
 
 def _asset_class_from_ticker(ticker):
@@ -449,7 +495,7 @@ class MCPQuantEngine:
             entry_side = ""
             entry_price = 0
 
-        return {
+        result = {
             "Market ID": row["Market ID"],
             "Market": market,
             "Ticker": ticker,
@@ -475,8 +521,15 @@ class MCPQuantEngine:
             "Entry Side": entry_side,
             "Entry Price %": round(entry_price, 2),
             "Position Size $": size,
+            "Liquidity": row.get("Liquidity", 0),
             "clobTokenIds": row["clobTokenIds"],
         }
+
+        approved, approval_reason, selected_model_probability = evaluate_execution_approval(result)
+        result["Selected Model Prob %"] = round(selected_model_probability, 2)
+        result["Execution Approved"] = approved
+        result["Execution Decision"] = approval_reason
+        return result
 
 
 # Reliable aliases are checked first. Unknown assets are resolved dynamically
@@ -1330,10 +1383,27 @@ with tab1:
         st.subheader("Top Trade Candidates")
         st.dataframe(results, use_container_width=True)
 
-        buys = results[results["Signal"].isin(["BUY YES", "BUY NO"])]
+        model_signals = results[results["Signal"].isin(["BUY YES", "BUY NO"])].copy()
+        buys = model_signals[model_signals["Execution Approved"] == True].copy()
+        watchlist = model_signals[model_signals["Execution Approved"] != True].copy()
 
-        st.subheader("Actionable Trades")
+        st.subheader("Approved Actionable Trades")
+        st.caption(
+            "Only these trades can be sent to MCP. Approval requires sufficient edge, "
+            "a 15%-85% entry price, at least 55% model probability for the selected outcome, "
+            "and enough time remaining."
+        )
         st.dataframe(buys, use_container_width=True)
+
+        if not watchlist.empty:
+            with st.expander("Model signals not approved for execution"):
+                st.dataframe(
+                    watchlist[[
+                        "Market", "Signal", "Edge %", "Entry Price %",
+                        "Selected Model Prob %", "Days", "Execution Decision"
+                    ]],
+                    use_container_width=True,
+                )
 
         st.markdown("---")
         st.subheader("📰 News Validation")
@@ -1541,7 +1611,14 @@ with tab1:
                                 )
                             st.json(order_response)
             except Exception as error:
-                st.error(f"MCP execution setup error: {error}")
+                message = str(error)
+                if "422" in message and "no match" in message.lower():
+                    st.warning(
+                        "Trade unavailable: MCP found no matchable liquidity for the requested "
+                        "FOK amount. No order was placed. Refresh the screener or try again later."
+                    )
+                else:
+                    st.error(f"MCP execution setup error: {error}")
         else:
             st.info("No actionable model signals are available for execution.")
 
