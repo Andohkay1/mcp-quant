@@ -340,6 +340,24 @@ class MCPQuantEngine:
 
         return np.sqrt(variance) * np.sqrt(252)
 
+    def get_ohlc(self, ticker, period="5y", interval="1d", start=None, end=None):
+        kwargs = {
+            "auto_adjust": True,
+            "progress": False,
+            "interval": interval,
+        }
+        if start is not None:
+            kwargs["start"] = start
+            if end is not None:
+                kwargs["end"] = end
+        else:
+            kwargs["period"] = period
+
+        data = yf.download(ticker, **kwargs)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        return data.dropna(how="all")
+
     def ewma_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
         current = close.iloc[-1]
@@ -371,6 +389,58 @@ class MCPQuantEngine:
             return (future_returns >= required_return).mean() * 100
 
         return (future_returns <= required_return).mean() * 100
+
+    def ewma_barrier_probability(self, ticker, target, days, direction):
+        """Approximate first-passage probability for touching a barrier before expiry."""
+        close = self.get_prices(ticker, "1y")
+        current = float(close.iloc[-1])
+
+        # If the current price is already beyond the barrier, the touch condition
+        # has necessarily been met at the present instant.
+        if direction == "above" and current >= float(target):
+            return 100.0
+        if direction == "below" and current <= float(target):
+            return 100.0
+
+        vol = float(self.ewma_volatility(close))
+        horizon_days = max(float(days), 1 / 390)
+        sigma_t = vol * np.sqrt(horizon_days / 252)
+        if not np.isfinite(sigma_t) or sigma_t <= 0:
+            return 0.0
+
+        log_distance = abs(np.log(float(target) / current))
+        probability = 2 * (1 - norm.cdf(log_distance / sigma_t))
+        return float(np.clip(probability * 100, 0.0, 100.0))
+
+    def historical_barrier_probability(self, ticker, target, days, direction, lookback=756):
+        """Empirical frequency of touching an equivalent barrier within the horizon."""
+        ohlc = self.get_ohlc(ticker, period="5y", interval="1d").tail(lookback)
+        required = {"Close", "High", "Low"}
+        if ohlc.empty or not required.issubset(set(ohlc.columns)):
+            return np.nan
+
+        current = float(ohlc["Close"].dropna().iloc[-1])
+        target_ratio = float(target) / current
+        horizon = max(int(np.ceil(float(days))), 1)
+        hits = []
+
+        for i in range(0, len(ohlc) - horizon):
+            start_price = float(ohlc["Close"].iloc[i])
+            if not np.isfinite(start_price) or start_price <= 0:
+                continue
+            window = ohlc.iloc[i + 1 : i + horizon + 1]
+            if window.empty:
+                continue
+
+            if direction == "above":
+                equivalent_barrier = start_price * target_ratio
+                hit = float(window["High"].max()) >= equivalent_barrier
+            else:
+                equivalent_barrier = start_price * target_ratio
+                hit = float(window["Low"].min()) <= equivalent_barrier
+            hits.append(bool(hit))
+
+        return float(np.mean(hits) * 100) if hits else np.nan
 
     def momentum_score(self, ticker):
         close = self.get_prices(ticker, "1y")
@@ -441,6 +511,11 @@ class MCPQuantEngine:
         if market_type == "range" and pd.notna(upper):
             ewma = self.range_probability(ticker, target, upper, days)
             hist = ewma
+        elif market_type == "barrier":
+            ewma = self.ewma_barrier_probability(ticker, target, days, direction)
+            hist = self.historical_barrier_probability(ticker, target, days, direction)
+            if pd.isna(hist):
+                hist = ewma
         else:
             ewma = self.ewma_probability(ticker, target, days, direction)
             hist = self.historical_probability(ticker, target, days, direction, 252)
@@ -503,6 +578,7 @@ class MCPQuantEngine:
             "Target": target,
             "Upper": upper,
             "Resolution Date": row["Resolution Date"],
+            "Market Start Date": row.get("Market Start Date", ""),
             "Days": round(days, 4),
             "Type": market_type,
             "Direction": direction,
@@ -522,6 +598,7 @@ class MCPQuantEngine:
             "Entry Price %": round(entry_price, 2),
             "Position Size $": size,
             "Liquidity": row.get("Liquidity", 0),
+            "Barrier Already Hit": bool(row.get("Barrier Already Hit", False)),
             "clobTokenIds": row["clobTokenIds"],
         }
 
@@ -592,6 +669,12 @@ def classify_market(market):
         r"\b(?:above|below|over|under)\b", text
     ):
         return "daily_close"
+    # Touch/barrier contracts resolve YES if the level is reached at any point,
+    # not only if the asset finishes beyond the level at expiry.
+    if re.search(r"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\b", text):
+        return "barrier"
+    if re.search(r"\((?:high|low)\)", text):
+        return "barrier"
     if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
         return "price"
     return "event"
@@ -689,6 +772,50 @@ def find_ticker(market):
     return yahoo_symbol_search(extract_asset_phrase(market))
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def barrier_already_hit(ticker, target, direction, start_date):
+    """Check whether a touch barrier has already been crossed since market inception."""
+    try:
+        if pd.isna(start_date):
+            return False
+        start_ts = pd.Timestamp(start_date)
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize("UTC")
+        else:
+            start_ts = start_ts.tz_convert("UTC")
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+        age_days = max((now_utc - start_ts).total_seconds() / 86400, 0)
+        # Intraday data gives a more precise check for recent markets; daily
+        # high/low data extends the check for longer-lived markets.
+        if age_days <= 7:
+            interval = "5m"
+        elif age_days <= 60:
+            interval = "1h"
+        else:
+            interval = "1d"
+
+        data = yf.download(
+            ticker,
+            start=start_ts.tz_localize(None),
+            end=(now_utc + pd.Timedelta(days=1)).tz_localize(None),
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+        )
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        if data.empty:
+            return False
+
+        if direction == "above":
+            return float(data["High"].max()) >= float(target)
+        return float(data["Low"].min()) <= float(target)
+    except Exception:
+        # A failed historical check must not silently assert that a barrier was hit.
+        return False
+
+
 @st.cache_data(ttl=300)
 def pull_markets():
     """Scan all fetched Polymarket markets and keep model-compatible binary price markets."""
@@ -718,6 +845,7 @@ def pull_markets():
             "Market ID": m.get("id"),
             "Market": m.get("question"),
             "Resolution Date": m.get("endDate"),
+            "Market Start Date": m.get("startDate") or m.get("createdAt"),
             "Market Prob %": float(outcome_prices[0]) * 100,
             "No Prob %": float(outcome_prices[1]) * 100,
             "Volume": pd.to_numeric(m.get("volumeNum"), errors="coerce"),
@@ -730,6 +858,7 @@ def pull_markets():
         return df
 
     df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
+    df["Market Start Date"] = pd.to_datetime(df["Market Start Date"], errors="coerce", utc=True)
     now_utc = pd.Timestamp.now(tz="UTC")
     df["Hours Remaining"] = (
         df["Resolution Date"] - now_utc
@@ -747,7 +876,7 @@ def pull_markets():
     )
     df.loc[same_day_close, "Days"] = df.loc[same_day_close, "Hours Remaining"] / 6.5
 
-    financial_candidates = df[df["Market Type"].isin(["price", "range", "daily_close"])].copy()
+    financial_candidates = df[df["Market Type"].isin(["price", "barrier", "range", "daily_close"])].copy()
     financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
     financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
@@ -759,12 +888,23 @@ def pull_markets():
         financial_candidates.loc[range_mask, "Market"].apply(extract_upper)
     )
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
+    financial_candidates["Barrier Already Hit"] = False
+    barrier_mask = financial_candidates["Market Type"].eq("barrier")
+    for idx, barrier_row in financial_candidates.loc[barrier_mask].iterrows():
+        financial_candidates.at[idx, "Barrier Already Hit"] = barrier_already_hit(
+            barrier_row["Ticker"],
+            barrier_row["Target"],
+            barrier_row["Direction"],
+            barrier_row["Market Start Date"],
+        ) if pd.notna(barrier_row["Ticker"]) and pd.notna(barrier_row["Target"]) else False
 
     def rejection_reason(row):
         if pd.isna(row["Resolution Date"]): return "Missing resolution date"
         if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip(): return "Asset could not be resolved"
         if pd.isna(row["Target"]): return "Target price could not be parsed"
         if row["Market Type"] == "range" and pd.isna(row["Upper"]): return "Upper range could not be parsed"
+        if row.get("Market Type") == "barrier" and bool(row.get("Barrier Already Hit", False)):
+            return "Barrier was already hit before screening"
         if row["Days"] < 0: return "Market already expired"
         if row["Days"] > MAX_DAYS: return f"More than {MAX_DAYS} days to expiry"
         if pd.isna(row["Liquidity"]) or row["Liquidity"] < MIN_LIQUIDITY: return "Insufficient liquidity"
@@ -781,7 +921,7 @@ def pull_markets():
     }
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
-    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Hours Remaining", "Days"]]
+    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Barrier Already Hit", "Liquidity", "Hours Remaining", "Days"]]
     return eligible
 
 def get_news(ticker, limit=5):
