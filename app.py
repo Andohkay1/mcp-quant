@@ -33,6 +33,15 @@ MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
 MIN_SELECTED_MODEL_PROB_PCT = 55.0
 MIN_TRADING_DAYS_REMAINING = 0.01  # about four minutes of a 6.5-hour session
 
+# Unattended auto-trading safeguards. These may be overridden in [mcp_trading]
+# Streamlit Secrets. Auto-trading only runs while the Streamlit app has an active
+# session; use the separate worker deployment for true 24/7 execution.
+AUTO_SCAN_INTERVAL = "10m"
+DEFAULT_AUTO_MAX_TRADES_PER_DAY = 3
+DEFAULT_AUTO_MAX_TRADES_PER_CYCLE = 1
+DEFAULT_AUTO_MAX_OPEN_TRADES = 8
+DEFAULT_AUTO_MIN_BALANCE = 75.0
+
 
 # MCP competition tracking settings
 COMPETITION_DAYS = 60
@@ -221,6 +230,11 @@ class MCPTradingClient:
         self.password = str(cfg.get("password", ""))
         self.live_enabled = bool(cfg.get("live_trading_enabled", False))
         self.max_order_amount = float(cfg.get("max_order_amount", 1.0))
+        self.auto_trading_enabled = bool(cfg.get("auto_trading_enabled", False))
+        self.auto_max_trades_per_day = int(cfg.get("auto_max_trades_per_day", DEFAULT_AUTO_MAX_TRADES_PER_DAY))
+        self.auto_max_trades_per_cycle = int(cfg.get("auto_max_trades_per_cycle", DEFAULT_AUTO_MAX_TRADES_PER_CYCLE))
+        self.auto_max_open_trades = int(cfg.get("auto_max_open_trades", DEFAULT_AUTO_MAX_OPEN_TRADES))
+        self.auto_min_balance = float(cfg.get("auto_min_balance", DEFAULT_AUTO_MIN_BALANCE))
         self.timeout = 20
 
         if not self.base_url or not self.email or not self.password:
@@ -882,11 +896,21 @@ def pull_markets():
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
     # Only range markets need an upper price. This prevents date numbers such
     # as the "31" in "July 31" from appearing as a false upper bound.
-    financial_candidates["Upper"] = np.nan
-    range_mask = financial_candidates["Market Type"].eq("range")
-    financial_candidates.loc[range_mask, "Upper"] = (
-        financial_candidates.loc[range_mask, "Market"].apply(extract_upper)
+    # Create Upper as an explicit float column. Newer pandas versions reject
+    # assigning an object-typed Series into a float column, even when the
+    # values are numeric. Coerce the parsed range bounds before assignment.
+    financial_candidates["Upper"] = pd.Series(
+        np.nan,
+        index=financial_candidates.index,
+        dtype="float64",
     )
+    range_mask = financial_candidates["Market Type"].eq("range")
+    if range_mask.any():
+        parsed_upper = pd.to_numeric(
+            financial_candidates.loc[range_mask, "Market"].apply(extract_upper),
+            errors="coerce",
+        ).astype("float64")
+        financial_candidates.loc[range_mask, "Upper"] = parsed_upper.to_numpy()
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
     financial_candidates["Barrier Already Hit"] = False
     barrier_mask = financial_candidates["Market Type"].eq("barrier")
@@ -1454,10 +1478,185 @@ def update_results():
 
     return df, updates
 
+
+def run_quant_scan():
+    """Run the full market scan and return scored results."""
+    markets_df = pull_markets()
+    engine = MCPQuantEngine()
+    scored = []
+    for _, row in markets_df.iterrows():
+        try:
+            scored.append(engine.score_market(row))
+        except Exception:
+            continue
+    results = pd.DataFrame(scored)
+    if not results.empty:
+        results = results.sort_values("Edge %", ascending=False)
+    return markets_df, results
+
+
+def _executed_market_ids(journal):
+    if journal is None or journal.empty or "Market ID" not in journal.columns:
+        return set()
+    ids = journal["Market ID"].astype(str).str.strip()
+    if "MCP Order ID" in journal.columns:
+        order_ids = journal["MCP Order ID"].astype(str).str.strip()
+        ids = ids[order_ids.ne("")]
+    return set(ids[ids.ne("")])
+
+
+def _executed_today_count(journal):
+    if journal is None or journal.empty or "Date Saved" not in journal.columns:
+        return 0
+    work = journal.copy()
+    dates = pd.to_datetime(work["Date Saved"], errors="coerce")
+    today = pd.Timestamp.now().date()
+    mask = dates.dt.date.eq(today)
+    if "MCP Order ID" in work.columns:
+        mask &= work["MCP Order ID"].astype(str).str.strip().ne("")
+    return int(mask.sum())
+
+
+def auto_execute_approved_trades(results):
+    """Execute new approved signals with strict portfolio and duplicate controls."""
+    client = MCPTradingClient()
+    if not client.auto_trading_enabled:
+        return []
+    if results is None or results.empty:
+        return [{"status": "skipped", "reason": "No scored markets"}]
+
+    approved = results[
+        results.get("Execution Approved", False).fillna(False).astype(bool)
+        & results["Signal"].isin(["BUY YES", "BUY NO"])
+    ].copy()
+    if approved.empty:
+        return [{"status": "skipped", "reason": "No approved trades"}]
+
+    journal = load_journal()
+    existing_market_ids = _executed_market_ids(journal)
+    metrics = calculate_competition_metrics(journal)
+    open_count = int(metrics.get("open_count", 0))
+    today_count = _executed_today_count(journal)
+
+    if today_count >= client.auto_max_trades_per_day:
+        return [{"status": "skipped", "reason": "Daily auto-trade limit reached"}]
+    if open_count >= client.auto_max_open_trades:
+        return [{"status": "skipped", "reason": "Maximum open-trade limit reached"}]
+
+    token = client.login()
+    balance_payload = client.balance(token)
+    balance = _safe_float(balance_payload.get("balance"), 0.0)
+    if balance <= client.auto_min_balance:
+        return [{"status": "skipped", "reason": f"Balance ${balance:.2f} is at/below auto floor"}]
+
+    outcomes = []
+    remaining_daily = client.auto_max_trades_per_day - today_count
+    cycle_limit = min(client.auto_max_trades_per_cycle, remaining_daily)
+
+    for _, candidate in approved.iterrows():
+        if len([x for x in outcomes if x.get("status") == "matched"]) >= cycle_limit:
+            break
+        row = candidate.to_dict()
+        market_id = str(row.get("Market ID", "")).strip()
+        if not market_id or market_id in existing_market_ids:
+            continue
+
+        amount = min(_safe_float(row.get("Position Size $"), 0.0), client.max_order_amount)
+        if amount < 1:
+            outcomes.append({"status": "skipped", "market": row.get("Market"), "reason": "Amount below 1 pUSD"})
+            continue
+        # Reserve fee/headroom and preserve the configured competition floor.
+        if balance - amount * 1.10 < client.auto_min_balance:
+            outcomes.append({"status": "skipped", "market": row.get("Market"), "reason": "Insufficient floor buffer"})
+            continue
+
+        try:
+            token_id, outcome = token_for_signal(row)
+            estimate = client.price_estimate(token, token_id, "buy", amount)
+            order_response = client.place_market_order(token, token_id, "buy", amount)
+            status = str(order_response.get("clob_status") or order_response.get("status") or "submitted")
+
+            executed_row = row.copy()
+            executed_row.update({
+                "Execution Token ID": token_id,
+                "Execution Outcome": outcome,
+                "Estimated Fill Price": estimate.get("price", ""),
+                "Executed Amount pUSD": amount,
+                "MCP Order ID": order_response.get("order_id") or order_response.get("id") or "",
+                "CLOB Order ID": order_response.get("clob_order_id", ""),
+                "Execution Status": status,
+                "Execution Response": order_response,
+                "Entry Price %": _safe_float(estimate.get("price"), 0.0) * 100,
+                "Position Size $": amount,
+            })
+            action, row_number = save_to_journal(executed_row, update_existing=True)
+            verify_execution_fields(row_number, {
+                "Execution Token ID": token_id,
+                "Execution Outcome": outcome,
+                "Estimated Fill Price": estimate.get("price", ""),
+                "Executed Amount pUSD": amount,
+                "MCP Order ID": executed_row["MCP Order ID"],
+                "CLOB Order ID": executed_row["CLOB Order ID"],
+                "Execution Status": status,
+                "Execution Response": order_response,
+            })
+            load_journal.clear()
+            existing_market_ids.add(market_id)
+            balance -= amount * 1.10
+            outcomes.append({
+                "status": "matched" if "match" in status.lower() else status,
+                "market": row.get("Market"),
+                "outcome": outcome,
+                "amount": amount,
+                "order_id": executed_row["MCP Order ID"],
+            })
+        except RuntimeError as error:
+            message = str(error)
+            if "422" in message and "no match" in message.lower():
+                outcomes.append({"status": "skipped", "market": row.get("Market"), "reason": "No matchable FOK liquidity"})
+                continue
+            outcomes.append({"status": "error", "market": row.get("Market"), "reason": message})
+        except Exception as error:
+            outcomes.append({"status": "error", "market": row.get("Market"), "reason": str(error)})
+
+    return outcomes or [{"status": "skipped", "reason": "All approved markets were duplicates or unavailable"}]
+
+
+@st.fragment(run_every=AUTO_SCAN_INTERVAL)
+def auto_trading_monitor():
+    """Auto-scan and execute while this Streamlit session remains active."""
+    try:
+        client = MCPTradingClient()
+    except Exception as error:
+        st.error(f"Auto-trading configuration error: {error}")
+        return
+
+    if not client.auto_trading_enabled:
+        st.info("Auto-trading is OFF. Set auto_trading_enabled = true in Streamlit Secrets to enable it.")
+        return
+
+    st.warning(
+        "AUTO-TRADING IS ON. The app scans every 10 minutes while this page/session is active. "
+        "Duplicate markets, daily limits, open-trade limits, price filters and the balance floor remain enforced."
+    )
+    try:
+        markets_df, results = run_quant_scan()
+        st.session_state["markets_df"] = markets_df
+        st.session_state["results"] = results
+        outcomes = auto_execute_approved_trades(results)
+        st.write(f"Last automatic scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        st.dataframe(pd.DataFrame(outcomes), use_container_width=True)
+    except Exception as error:
+        st.error(f"Automatic scan failed safely; no further orders were attempted: {error}")
+
+
 tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Journal", "Competition Tracker", "Research Analytics"])
 
 
 with tab1:
+    st.subheader("Automatic Trading Monitor")
+    auto_trading_monitor()
+    st.markdown("---")
     st.subheader("Run Market Screener")
 
     if st.button("Run MCP Screener", key="run_screener_button"):
