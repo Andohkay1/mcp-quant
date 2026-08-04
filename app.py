@@ -281,6 +281,31 @@ class MCPTradingClient:
     def balance(self, token):
         return self._request("GET", "/v1/balance", token=token)
 
+    def list_markets(self, token, *, limit=100, offset=0, active=True, closed=False,
+                     order="endDate", ascending=True, tag=None, keyword=None):
+        """Browse or search MCP markets using the enhanced discovery endpoint.
+
+        MCP does not allow keyword to be combined with tag, offset, order, or
+        ascending, so this helper builds one valid query mode at a time.
+        """
+        params = {
+            "limit": int(limit),
+            "active": str(bool(active)).lower(),
+            "closed": str(bool(closed)).lower(),
+        }
+        if keyword:
+            params["keyword"] = str(keyword)
+        else:
+            params.update({
+                "offset": int(offset),
+                "order": str(order),
+                "ascending": str(bool(ascending)).lower(),
+            })
+            if tag:
+                params["tag"] = str(tag)
+
+        return self._request("GET", "/v1/markets", token=token, params=params)
+
     def price_estimate(self, token, token_id, side, amount):
         return self._request(
             "GET",
@@ -832,43 +857,159 @@ def barrier_already_hit(ticker, target, direction, start_date):
 
 @st.cache_data(ttl=300)
 def pull_markets():
-    """Scan all fetched Polymarket markets and keep model-compatible binary price markets."""
-    url = "https://gamma-api.polymarket.com/markets"
-    params = {
-        "closed": "false",
-        "limit": 1000,
-        "order": "volume",
-        "ascending": "false",
-    }
-    response = requests.get(url, params=params, timeout=20)
-    response.raise_for_status()
-    markets_raw = response.json()
+    """Browse the complete MCP market catalogue with pagination.
+
+    The enhanced MCP endpoint defaults to high-volume markets, so relying on a
+    single page can hide lower-volume financial contracts. This function uses
+    browse mode only (never keyword mode), paginates with offset, sorts by end
+    date, and then applies the app's existing financial/model filters.
+    """
+    client = MCPTradingClient()
+    token = client.login()
+
+    cfg = st.secrets.get("mcp_trading", {})
+    page_size = max(1, min(int(cfg.get("discovery_page_size", 100)), 500))
+    max_pages = max(1, int(cfg.get("discovery_max_pages", 50)))
+    discovery_tag = str(cfg.get("discovery_tag", "")).strip() or None
+    discovery_order = str(cfg.get("discovery_order", "endDate")).strip() or "endDate"
+    discovery_ascending = bool(cfg.get("discovery_ascending", True))
+
+    markets_raw = []
+    offset = 0
+    pages_fetched = 0
+
+    for _ in range(max_pages):
+        payload = client.list_markets(
+            token,
+            limit=page_size,
+            offset=offset,
+            active=True,
+            closed=False,
+            order=discovery_order,
+            ascending=discovery_ascending,
+            tag=discovery_tag,
+        )
+
+        # The wrapper currently preserves the Gamma response format, but these
+        # fallbacks make the scanner safe if the API later wraps the list.
+        if isinstance(payload, list):
+            page = payload
+        elif isinstance(payload, dict):
+            page = (
+                payload.get("markets")
+                or payload.get("results")
+                or payload.get("data")
+                or payload.get("items")
+                or []
+            )
+        else:
+            page = []
+
+        if not isinstance(page, list):
+            raise RuntimeError("MCP /v1/markets returned an unexpected response shape.")
+
+        pages_fetched += 1
+        if not page:
+            break
+
+        markets_raw.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    # Prevent duplicates if catalogue pages shift while pagination is running.
+    unique_markets = []
+    seen_keys = set()
+    for m in markets_raw:
+        if not isinstance(m, dict):
+            continue
+        key = (
+            m.get("condition_id")
+            or m.get("conditionId")
+            or m.get("id")
+            or m.get("slug")
+            or m.get("question")
+        )
+        key = str(key)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_markets.append(m)
+    markets_raw = unique_markets
+
+    def _json_list(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else []
+            except Exception:
+                return []
+        return []
 
     rows = []
     for m in markets_raw:
-        try:
-            outcome_prices = json.loads(m.get("outcomePrices", "[]"))
-        except Exception:
-            outcome_prices = []
+        outcome_prices = _json_list(
+            m.get("outcomePrices", m.get("outcome_prices", []))
+        )
+        outcomes = _json_list(m.get("outcomes", []))
+        token_ids = m.get("clobTokenIds", m.get("clob_token_ids", m.get("token_ids", [])))
+        token_ids = _json_list(token_ids)
 
-        # The current model and executor require a binary YES/NO market.
-        if len(outcome_prices) != 2:
+        # Some API shapes provide token objects instead of parallel arrays.
+        tokens = m.get("tokens")
+        if (not outcome_prices or not token_ids) and isinstance(tokens, list):
+            outcome_prices = [t.get("price") for t in tokens if isinstance(t, dict)]
+            token_ids = [t.get("token_id") or t.get("tokenId") for t in tokens if isinstance(t, dict)]
+            if not outcomes:
+                outcomes = [t.get("outcome") for t in tokens if isinstance(t, dict)]
+
+        # The model and executor require a binary YES/NO contract.
+        if len(outcome_prices) != 2 or len(token_ids) != 2:
+            continue
+        if outcomes and len(outcomes) == 2:
+            normalized_outcomes = [str(x).strip().lower() for x in outcomes]
+            if set(normalized_outcomes) != {"yes", "no"}:
+                continue
+
+        try:
+            yes_probability = float(outcome_prices[0]) * 100
+            no_probability = float(outcome_prices[1]) * 100
+        except (TypeError, ValueError, IndexError):
             continue
 
         rows.append({
-            "Market ID": m.get("id"),
-            "Market": m.get("question"),
-            "Resolution Date": m.get("endDate"),
-            "Market Start Date": m.get("startDate") or m.get("createdAt"),
-            "Market Prob %": float(outcome_prices[0]) * 100,
-            "No Prob %": float(outcome_prices[1]) * 100,
-            "Volume": pd.to_numeric(m.get("volumeNum"), errors="coerce"),
-            "Liquidity": pd.to_numeric(m.get("liquidityNum"), errors="coerce"),
-            "clobTokenIds": m.get("clobTokenIds"),
+            "Market ID": m.get("id") or m.get("market_id") or m.get("condition_id") or m.get("conditionId"),
+            "Condition ID": m.get("condition_id") or m.get("conditionId"),
+            "Market": m.get("question") or m.get("title"),
+            "Resolution Date": m.get("endDate") or m.get("end_date") or m.get("end_date_iso"),
+            "Market Start Date": m.get("startDate") or m.get("start_date") or m.get("createdAt") or m.get("created_at"),
+            "Market Prob %": yes_probability,
+            "No Prob %": no_probability,
+            "Volume": pd.to_numeric(
+                m.get("volumeNum", m.get("volume24hr", m.get("volume"))),
+                errors="coerce",
+            ),
+            "Liquidity": pd.to_numeric(
+                m.get("liquidityNum", m.get("liquidity")),
+                errors="coerce",
+            ),
+            "clobTokenIds": token_ids,
         })
 
     df = pd.DataFrame(rows)
     if df.empty:
+        df.attrs["scan_stats"] = {
+            "catalog_markets_retrieved": len(markets_raw),
+            "pages_fetched": pages_fetched,
+            "all_binary_markets": 0,
+            "binary_price_markets": 0,
+            "eligible_markets": 0,
+            "rejected_markets": 0,
+        }
         return df
 
     df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
@@ -877,12 +1018,9 @@ def pull_markets():
     df["Hours Remaining"] = (
         df["Resolution Date"] - now_utc
     ).dt.total_seconds() / 3600
-    # Generic fractional calendar days for screening and non-close markets.
     df["Days"] = df["Hours Remaining"] / 24
     df["Market Type"] = df["Market"].apply(classify_market)
 
-    # For same-day closing markets, volatility should scale to the fraction of
-    # a 6.5-hour US trading session still remaining, not a rounded calendar day.
     same_day_close = (
         df["Market Type"].eq("daily_close")
         & df["Resolution Date"].dt.date.eq(now_utc.date())
@@ -894,11 +1032,6 @@ def pull_markets():
     financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
     financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
-    # Only range markets need an upper price. This prevents date numbers such
-    # as the "31" in "July 31" from appearing as a false upper bound.
-    # Create Upper as an explicit float column. Newer pandas versions reject
-    # assigning an object-typed Series into a float column, even when the
-    # values are numeric. Coerce the parsed range bounds before assignment.
     financial_candidates["Upper"] = pd.Series(
         np.nan,
         index=financial_candidates.index,
@@ -938,6 +1071,8 @@ def pull_markets():
     eligible = financial_candidates[financial_candidates["Screen Result"] == "Eligible"].copy()
 
     eligible.attrs["scan_stats"] = {
+        "catalog_markets_retrieved": len(markets_raw),
+        "pages_fetched": pages_fetched,
         "all_binary_markets": len(df),
         "binary_price_markets": len(financial_candidates),
         "eligible_markets": len(eligible),
