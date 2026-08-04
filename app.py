@@ -674,6 +674,18 @@ class MCPQuantEngine:
         return result
 
 
+RESULT_COLUMNS = [
+    "Market ID", "Market", "Ticker", "Current Price", "Target", "Upper",
+    "Resolution Date", "Market Start Date", "Days", "Type", "Direction",
+    "Market Prob %", "No Prob %", "EWMA Prob %", "Historical Prob %",
+    "Base Prob %", "Momentum", "Momentum Adj %", "Final Prob %",
+    "YES Edge %", "NO Edge %", "Edge %", "Signal", "Entry Side",
+    "Entry Price %", "Position Size $", "Liquidity", "Barrier Already Hit",
+    "clobTokenIds", "Selected Model Prob %", "Execution Approved",
+    "Execution Decision",
+]
+
+
 # Reliable aliases are checked first. Unknown assets are resolved dynamically
 # through Yahoo Finance only after the market has passed the binary-price filter.
 ASSET_ALIASES = {
@@ -1688,7 +1700,7 @@ def run_quant_scan():
             scored.append(engine.score_market(row))
         except Exception:
             continue
-    results = pd.DataFrame(scored)
+    results = pd.DataFrame(scored, columns=RESULT_COLUMNS)
     if not results.empty:
         results = results.sort_values("Edge %", ascending=False)
     return markets_df, results
@@ -1873,11 +1885,13 @@ with tab1:
             except Exception:
                 pass
 
-        results = pd.DataFrame(scored)
+        results = pd.DataFrame(scored, columns=RESULT_COLUMNS)
+
+        # Always replace the previous scan, including when no markets were scored.
+        st.session_state["results"] = results
 
         if len(results) > 0:
             results = results.sort_values("Edge %", ascending=False)
-            st.session_state["results"] = results
             results.to_csv("mcp_dashboard_results.csv", index=False)
 
     if "markets_df" in st.session_state:
@@ -1917,13 +1931,24 @@ with tab1:
 
     if "results" in st.session_state:
         results = st.session_state["results"]
+        if not isinstance(results, pd.DataFrame):
+            results = pd.DataFrame(columns=RESULT_COLUMNS)
+        else:
+            results = results.reindex(columns=RESULT_COLUMNS)
 
         st.subheader("Top Trade Candidates")
         st.dataframe(results, use_container_width=True)
 
+        if results.empty:
+            st.info(
+                "No markets were successfully scored in this scan. This can happen when "
+                "market discovery returns no eligible financial contracts or all price-data "
+                "requests fail temporarily. No trade was attempted."
+            )
+
         model_signals = results[results["Signal"].isin(["BUY YES", "BUY NO"])].copy()
-        buys = model_signals[model_signals["Execution Approved"] == True].copy()
-        watchlist = model_signals[model_signals["Execution Approved"] != True].copy()
+        buys = model_signals[model_signals["Execution Approved"].fillna(False).astype(bool)].copy()
+        watchlist = model_signals[~model_signals["Execution Approved"].fillna(False).astype(bool)].copy()
 
         st.subheader("Approved Actionable Trades")
         st.caption(
