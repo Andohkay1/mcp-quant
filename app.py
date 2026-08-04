@@ -1890,6 +1890,17 @@ with tab1:
         # Always replace the previous scan, including when no markets were scored.
         st.session_state["results"] = results
 
+        # Remove stale widget selections and previews from the previous scan.
+        for stale_key in (
+            "explain_trade_selectbox",
+            "save_trade_selectbox",
+            "news_trade_selectbox",
+            "execute_trade_selectbox",
+            "mcp_trade_preview",
+            "confirm_live_mcp_trade",
+        ):
+            st.session_state.pop(stale_key, None)
+
         if len(results) > 0:
             results = results.sort_values("Edge %", ascending=False)
             results.to_csv("mcp_dashboard_results.csv", index=False)
@@ -2004,48 +2015,61 @@ with tab1:
         st.markdown("---")
         st.subheader("🔍 Explain Model")
 
-        selected_trade = st.selectbox(
-            "Select a trade to explain",
-            results["Market"].tolist(),
-            key="explain_trade_selectbox",
+        market_options = (
+            results["Market"].dropna().astype(str).drop_duplicates().tolist()
+            if not results.empty and "Market" in results.columns
+            else []
         )
 
-        explain = results[results["Market"] == selected_trade].iloc[0]
+        if market_options:
+            selected_trade = st.selectbox(
+                "Select a trade to explain",
+                market_options,
+                key="explain_trade_selectbox",
+            )
 
-        c1, c2, c3 = st.columns(3)
+            matching_rows = results[results["Market"].astype(str) == str(selected_trade)]
+            if not matching_rows.empty:
+                explain = matching_rows.iloc[0]
 
-        c1.metric("Current Price", explain["Current Price"])
-        c1.metric("Market Probability", f"{explain['Market Prob %']}%")
+                c1, c2, c3 = st.columns(3)
 
-        c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
-        c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
+                c1.metric("Current Price", explain["Current Price"])
+                c1.metric("Market Probability", f"{explain['Market Prob %']}%")
 
-        c3.metric("Final Probability", f"{explain['Final Prob %']}%")
-        c3.metric("Edge", f"{explain['Edge %']}%")
+                c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
+                c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
 
-        st.markdown("### Model Components")
+                c3.metric("Final Probability", f"{explain['Final Prob %']}%")
+                c3.metric("Edge", f"{explain['Edge %']}%")
 
-        st.write(f"**Market Type:** {explain['Type']}")
-        st.write(f"**Direction:** {explain['Direction']}")
-        st.write(f"**Target:** {explain['Target']}")
-        st.write(f"**Upper Bound:** {explain['Upper']}")
-        st.write(f"**Model Horizon (trading days):** {explain['Days']}")
-        st.write(f"**Momentum Score:** {explain['Momentum']}")
-        st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
-        st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
-        st.write(f"**YES Edge:** {explain['YES Edge %']}%")
-        st.write(f"**NO Edge:** {explain['NO Edge %']}%")
-        st.write(f"**Signal:** {explain['Signal']}")
-        st.write(f"**Entry Side:** {explain['Entry Side']}")
-        st.write(f"**Entry Price:** {explain['Entry Price %']}%")
-        st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+                st.markdown("### Model Components")
 
-        if explain["Signal"] == "BUY YES":
-            st.success("✅ YES is underpriced based on the model probability.")
-        elif explain["Signal"] == "BUY NO":
-            st.error("❌ NO is underpriced based on the model probability.")
+                st.write(f"**Market Type:** {explain['Type']}")
+                st.write(f"**Direction:** {explain['Direction']}")
+                st.write(f"**Target:** {explain['Target']}")
+                st.write(f"**Upper Bound:** {explain['Upper']}")
+                st.write(f"**Model Horizon (trading days):** {explain['Days']}")
+                st.write(f"**Momentum Score:** {explain['Momentum']}")
+                st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
+                st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
+                st.write(f"**YES Edge:** {explain['YES Edge %']}%")
+                st.write(f"**NO Edge:** {explain['NO Edge %']}%")
+                st.write(f"**Signal:** {explain['Signal']}")
+                st.write(f"**Entry Side:** {explain['Entry Side']}")
+                st.write(f"**Entry Price:** {explain['Entry Price %']}%")
+                st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+
+                if explain["Signal"] == "BUY YES":
+                    st.success("✅ YES is underpriced based on the model probability.")
+                elif explain["Signal"] == "BUY NO":
+                    st.error("❌ NO is underpriced based on the model probability.")
+                else:
+                    st.info("⚪ The model does not see enough edge to trade.")
+            else:
+                st.warning("The selected trade is no longer available. Run the screener again.")
         else:
-            st.info("⚪ The model does not see enough edge to trade.")
+            st.info("No scored trades are available to explain.")
 
         st.markdown("---")
         st.subheader("Execute Model Trade through MCP")
@@ -2188,24 +2212,36 @@ with tab1:
         st.markdown("---")
         st.subheader("Save Trade to Journal")
 
-        selected_save = st.selectbox(
-            "Select trade to save",
-            results["Market"].tolist(),
-            key="save_trade_selectbox",
+        save_options = (
+            results["Market"].dropna().astype(str).drop_duplicates().tolist()
+            if not results.empty and "Market" in results.columns
+            else []
         )
 
-        if st.button("Save Selected Trade", key="save_trade_button"):
-            row = results[results["Market"] == selected_save].iloc[0].to_dict()
+        if save_options:
+            selected_save = st.selectbox(
+                "Select trade to save",
+                save_options,
+                key="save_trade_selectbox",
+            )
 
-            try:
-                journal_action, _ = save_to_journal(row, update_existing=True)
-                load_journal.clear()
-                if journal_action == "updated":
-                    st.success("The existing Google Sheets trade row was refreshed.")
+            if st.button("Save Selected Trade", key="save_trade_button"):
+                matching_rows = results[results["Market"].astype(str) == str(selected_save)]
+                if matching_rows.empty:
+                    st.warning("The selected trade is no longer available. Run the screener again.")
                 else:
-                    st.success("Trade saved permanently to Google Sheets.")
-            except Exception as error:
-                st.error(f"Trade could not be saved: {error}")
+                    row = matching_rows.iloc[0].to_dict()
+                    try:
+                        journal_action, _ = save_to_journal(row, update_existing=True)
+                        load_journal.clear()
+                        if journal_action == "updated":
+                            st.success("The existing Google Sheets trade row was refreshed.")
+                        else:
+                            st.success("Trade saved permanently to Google Sheets.")
+                    except Exception as error:
+                        st.error(f"Trade could not be saved: {error}")
+        else:
+            st.info("No scored trades are available to save.")
 
 
 with tab2:
