@@ -8,6 +8,7 @@ import re
 import xml.etree.ElementTree as ET
 from scipy.stats import norm
 from datetime import datetime
+import time
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -247,25 +248,50 @@ class MCPTradingClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
-        response = requests.request(
-            method,
-            f"{self.base_url}{path}",
-            headers=headers,
-            params=params,
-            json=json_body,
-            timeout=self.timeout,
-        )
+        # Retry transient upstream failures for safe, read-only GET requests.
+        # POST orders are never retried here because that could duplicate a trade.
+        max_attempts = 4 if str(method).upper() == "GET" else 1
+        response = None
+        payload = None
 
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {"detail": response.text or "Non-JSON response"}
+        for attempt in range(max_attempts):
+            try:
+                response = requests.request(
+                    method,
+                    f"{self.base_url}{path}",
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as error:
+                if attempt + 1 < max_attempts:
+                    time.sleep(1.5 * (2 ** attempt))
+                    continue
+                raise RuntimeError(f"MCP request failed: {error}") from error
 
-        if not response.ok:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {"detail": response.text or "Non-JSON response"}
+
+            if response.ok:
+                return payload
+
+            if (
+                str(method).upper() == "GET"
+                and response.status_code in {429, 502, 503, 504}
+                and attempt + 1 < max_attempts
+            ):
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+
             detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
             raise RuntimeError(f"MCP API {response.status_code}: {detail}")
 
-        return payload
+        detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        status = response.status_code if response is not None else "unknown"
+        raise RuntimeError(f"MCP API {status}: {detail}")
 
     def login(self):
         payload = self._request(
@@ -878,17 +904,54 @@ def pull_markets():
     offset = 0
     pages_fetched = 0
 
+    discovery_source = "MCP"
+
     for _ in range(max_pages):
-        payload = client.list_markets(
-            token,
-            limit=page_size,
-            offset=offset,
-            active=True,
-            closed=False,
-            order=discovery_order,
-            ascending=discovery_ascending,
-            tag=discovery_tag,
-        )
+        try:
+            payload = client.list_markets(
+                token,
+                limit=page_size,
+                offset=offset,
+                active=True,
+                closed=False,
+                order=discovery_order,
+                ascending=discovery_ascending,
+                tag=discovery_tag,
+            )
+        except RuntimeError as mcp_error:
+            # The wrapper can occasionally return a transient 502 when its
+            # upstream Polymarket request fails. Market discovery is read-only,
+            # so safely fall back to Polymarket's public Gamma endpoint. Order
+            # execution still goes exclusively through MCP.
+            gamma_params = {
+                "limit": page_size,
+                "offset": offset,
+                "active": "true",
+                "closed": "false",
+                "order": discovery_order,
+                "ascending": str(discovery_ascending).lower(),
+            }
+            if discovery_tag:
+                gamma_params["tag_slug"] = discovery_tag
+
+            try:
+                gamma_response = requests.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params=gamma_params,
+                    timeout=30,
+                )
+                gamma_response.raise_for_status()
+                payload = gamma_response.json()
+                discovery_source = "Gamma fallback"
+            except Exception as gamma_error:
+                if markets_raw:
+                    # Keep the pages already retrieved rather than crashing the
+                    # whole scanner because one later page failed.
+                    break
+                raise RuntimeError(
+                    "Market discovery failed through both MCP and Polymarket. "
+                    f"MCP error: {mcp_error}; fallback error: {gamma_error}"
+                ) from gamma_error
 
         # The wrapper currently preserves the Gamma response format, but these
         # fallbacks make the scanner safe if the API later wraps the list.
@@ -916,6 +979,7 @@ def pull_markets():
         if len(page) < page_size:
             break
         offset += page_size
+        time.sleep(0.15)
 
     # Prevent duplicates if catalogue pages shift while pagination is running.
     unique_markets = []
