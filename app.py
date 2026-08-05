@@ -473,6 +473,10 @@ NON_PRICE_EVENT_WORDS = [
     "ceo", "president", "election", "nominee", "fed chair", "interest rate",
     "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
     "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
+    # Non-price quantities that must not be mapped to an asset-price ticker.
+    "reserves", "inventory", "inventories", "transits", "shipments",
+    "production", "output", "fdv", "fully diluted valuation", "supply",
+    "market capitalization", "average daily", "all-time high", "ath",
 ]
 
 
@@ -502,27 +506,82 @@ def infer_direction(market):
     return "above"
 
 
+def _number_value(raw):
+    """Convert a displayed market number such as $1,900 or 62.5 to float."""
+    try:
+        return float(str(raw).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_price_levels(market):
+    """Extract only contract price levels, not dates or numbers inside asset names.
+
+    The parser gives priority to explicit dollar amounts and then to numbers that
+    immediately follow price-language such as above, below, reach, hit, or dip to.
+    Range contracts are parsed only from the text after ``between``.
+    """
+    text = str(market or "")
+
+    # Explicit dollar amounts are the most reliable signal and naturally ignore
+    # S&P 500, August 3, September 30, and similar non-price numbers.
+    dollar_matches = re.findall(r"\$\s*(\d[\d,]*(?:\.\d+)?)", text)
+    dollar_values = [_number_value(value) for value in dollar_matches]
+    dollar_values = [value for value in dollar_values if value is not None]
+
+    lower_text = text.lower()
+    if "between" in lower_text:
+        after_between = re.split(r"between", text, maxsplit=1, flags=re.I)[-1]
+        range_dollars = re.findall(r"\$\s*(\d[\d,]*(?:\.\d+)?)", after_between)
+        range_values = [_number_value(value) for value in range_dollars]
+        range_values = [value for value in range_values if value is not None]
+        if len(range_values) >= 2:
+            return range_values[:2]
+
+        range_match = re.search(
+            r"^\s*(\d[\d,]*(?:\.\d+)?)\s*(?:and|to|-)\s*\$?\s*(\d[\d,]*(?:\.\d+)?)",
+            after_between,
+            flags=re.I,
+        )
+        if range_match:
+            values = [_number_value(range_match.group(1)), _number_value(range_match.group(2))]
+            return [value for value in values if value is not None]
+        return []
+
+    if dollar_values:
+        # The first explicit dollar amount is the contract target. A second dollar
+        # amount is not treated as an upper bound unless this is a range contract.
+        return dollar_values[:1]
+
+    trigger_pattern = re.compile(
+        r"(?:above|below|over|under|greater\s+than|less\s+than|"
+        r"reach|reaches|hit|hits|touch|touches|dip\s+to|fall\s+to|"
+        r"rise\s+to|trade\s+as\s+high\s+as|trade\s+as\s+low\s+as)"
+        r"(?:\s*\((?:high|low)\))?\s*[:=]?\s*"
+        r"(\d[\d,]*(?:\.\d+)?)",
+        flags=re.I,
+    )
+    match = trigger_pattern.search(text)
+    if match:
+        value = _number_value(match.group(1))
+        return [value] if value is not None else []
+
+    return []
+
+
 def extract_numbers(market):
-    text = str(market or "").replace(",", "")
-    # Prefer explicit prices and large index levels; remove dates and percentages.
-    raw = re.findall(r"(?<![%\w])\$?(\d+(?:\.\d+)?)", text)
-    values = []
-    for item in raw:
-        value = float(item)
-        if 1900 <= value <= 2100:  # likely a year
-            continue
-        values.append(value)
-    return values
+    """Backward-compatible wrapper for the context-aware price parser."""
+    return extract_price_levels(market)
 
 
 def extract_target(market):
-    nums = extract_numbers(market)
-    return nums[0] if nums else None
+    levels = extract_price_levels(market)
+    return levels[0] if levels else None
 
 
 def extract_upper(market):
-    nums = extract_numbers(market)
-    return nums[1] if len(nums) > 1 else None
+    levels = extract_price_levels(market)
+    return levels[1] if len(levels) > 1 else None
 
 
 def extract_asset_phrase(market):
@@ -712,6 +771,55 @@ def pull_markets():
         financial_candidates["Screen Result"] != "Eligible"
     ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
     return eligible
+
+
+def superforecasting_reasoning(row):
+    """Build a transparent outside-view / inside-view explanation for one forecast."""
+    hist = _safe_float(row.get("Historical Prob %"), np.nan)
+    ewma = _safe_float(row.get("EWMA Prob %"), np.nan)
+    market = _safe_float(row.get("Market Prob %"), np.nan)
+    final = _safe_float(row.get("Final Prob %"), np.nan)
+    momentum = _safe_float(row.get("Momentum"), 0.0)
+    edge = _safe_float(row.get("Edge %"), 0.0)
+    liquidity = _safe_float(row.get("Liquidity"), 0.0)
+
+    components = [value for value in (hist, ewma) if np.isfinite(value)]
+    disagreement = (max(components) - min(components)) if len(components) >= 2 else 0.0
+
+    if liquidity >= 5000 and disagreement <= 15 and abs(edge) >= 12:
+        confidence = "High"
+    elif liquidity >= MIN_LIQUIDITY and disagreement <= 30:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    reasons = []
+    if np.isfinite(hist):
+        reasons.append(f"Outside view: comparable historical windows imply about {hist:.1f}% YES.")
+    if np.isfinite(ewma):
+        reasons.append(f"Current volatility view: EWMA implies about {ewma:.1f}% YES.")
+    if momentum > 0:
+        reasons.append("Recent price momentum supports a higher YES probability.")
+    elif momentum < 0:
+        reasons.append("Recent price momentum supports a lower YES probability.")
+    else:
+        reasons.append("Momentum is broadly neutral.")
+    if np.isfinite(market) and np.isfinite(final):
+        reasons.append(f"Polymarket prices YES at {market:.1f}% versus the model at {final:.1f}%.")
+    reasons.append(f"The selected signal has an estimated edge of {edge:.1f}% after the execution filters.")
+
+    return {
+        "confidence": confidence,
+        "disagreement": disagreement,
+        "reasons": reasons,
+    }
+
+
+def brier_score(probability_pct, outcome):
+    """Binary Brier score on the 0-to-1 probability scale; lower is better."""
+    p = np.clip(_safe_float(probability_pct, 50.0) / 100.0, 0.0, 1.0)
+    y = 1.0 if str(outcome).upper() == "YES" else 0.0
+    return float((p - y) ** 2)
 
 
 def get_news(ticker, limit=5):
@@ -1398,6 +1506,20 @@ with tab1:
             st.write(f"**Entry Side:** {explain['Entry Side']}")
             st.write(f"**Entry Price:** {explain['Entry Price %']}%")
             st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+
+            st.markdown("### Superforecasting Review")
+            sf = superforecasting_reasoning(explain)
+            st.write(f"**Confidence:** {sf['confidence']}")
+            st.write(f"**Model disagreement:** {sf['disagreement']:.1f} percentage points")
+            st.write("**Outside view:** Historical probability is used as the base-rate anchor.")
+            st.write("**Inside view:** EWMA volatility and momentum adjust that anchor for current conditions.")
+            st.write("**Market benchmark:** The final probability is compared with the live Polymarket price.")
+            for reason in sf["reasons"]:
+                st.write(f"• {reason}")
+            st.caption(
+                "Treat this as a forecast to test, not a certainty. Save the probability, update it when evidence changes, "
+                "and judge it later with calibration and Brier score."
+            )
     
             if explain["Signal"] == "BUY YES":
                 st.success("✅ YES is underpriced based on the model probability.")
@@ -1633,5 +1755,37 @@ with tab3:
         if len(closed) > 0:
             st.subheader("PnL by Trade")
             st.bar_chart(closed["PnL"])
+
+            resolved = closed[closed["Result"].astype(str).str.upper().isin(["YES", "NO"])].copy()
+            if not resolved.empty:
+                resolved["Model Brier"] = resolved.apply(
+                    lambda row: brier_score(row.get("Final Prob %"), row.get("Result")), axis=1
+                )
+                resolved["Market Brier"] = resolved.apply(
+                    lambda row: brier_score(row.get("Market Prob %"), row.get("Result")), axis=1
+                )
+
+                st.subheader("Superforecasting Scorecard")
+                b1, b2 = st.columns(2)
+                b1.metric("Model Brier Score", f"{resolved['Model Brier'].mean():.3f}")
+                b2.metric("Polymarket Brier Score", f"{resolved['Market Brier'].mean():.3f}")
+                st.caption("Lower Brier scores are better. Compare like-for-like resolved forecasts.")
+
+                resolved["Probability Band"] = pd.cut(
+                    pd.to_numeric(resolved["Final Prob %"], errors="coerce"),
+                    bins=[0, 20, 40, 60, 80, 100],
+                    labels=["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"],
+                    include_lowest=True,
+                )
+                resolved["YES Outcome"] = resolved["Result"].astype(str).str.upper().eq("YES").astype(float)
+                calibration = resolved.groupby("Probability Band", observed=False).agg(
+                    Forecasts=("Market ID", "count"),
+                    Average_Model_Probability=("Final Prob %", "mean"),
+                    Actual_YES_Rate=("YES Outcome", "mean"),
+                    Average_Brier=("Model Brier", "mean"),
+                ).reset_index()
+                calibration["Actual_YES_Rate"] = calibration["Actual_YES_Rate"] * 100
+                st.subheader("Calibration by Probability Band")
+                st.dataframe(calibration, use_container_width=True)
     else:
         st.info("No analytics available yet.")
