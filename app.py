@@ -39,6 +39,24 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def forecast_confidence(ewma_probability, historical_probability, liquidity):
+    """Transparent confidence label for forecast review."""
+    disagreement = abs(_safe_float(ewma_probability) - _safe_float(historical_probability))
+    liquidity_value = _safe_float(liquidity)
+    if disagreement <= 15 and liquidity_value >= 1000:
+        return "High"
+    if disagreement <= 30 and liquidity_value >= MIN_LIQUIDITY:
+        return "Medium"
+    return "Low"
+
+
+def brier_score(probability_pct, outcome_yes):
+    """Binary Brier score: 0 is perfect and 1 is the worst possible score."""
+    probability = np.clip(_safe_float(probability_pct) / 100.0, 0.0, 1.0)
+    outcome = 1.0 if bool(outcome_yes) else 0.0
+    return float((probability - outcome) ** 2)
+
+
 def evaluate_execution_approval(row):
     signal = str(row.get("Signal", ""))
     edge = _safe_float(row.get("Edge %"), 0.0)
@@ -425,6 +443,9 @@ class MCPQuantEngine:
         result["Selected Model Prob %"] = round(selected_prob, 2)
         result["Execution Approved"] = approved
         result["Execution Decision"] = reason
+        result["Forecast Confidence"] = forecast_confidence(
+            result["EWMA Prob %"], result["Historical Prob %"], row.get("Liquidity", 0)
+        )
         return result
 
 
@@ -468,15 +489,14 @@ PRICE_MARKET_PATTERNS = [
 ]
 
 NON_PRICE_EVENT_WORDS = [
-    "earnings", "revenue", "eps", "market cap", "acquire", "acquisition",
-    "merger", "ipo", "etf approval", "approve", "regulation", "lawsuit",
-    "ceo", "president", "election", "nominee", "fed chair", "interest rate",
-    "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
-    "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
-    # Non-price quantities that must not be mapped to an asset-price ticker.
-    "reserves", "inventory", "inventories", "transits", "shipments",
-    "production", "output", "fdv", "fully diluted valuation", "supply",
-    "market capitalization", "average daily", "all-time high", "ath",
+    "earnings", "revenue", "eps", "market cap", "fully diluted", "fdv",
+    "acquire", "acquisition", "merger", "ipo", "etf approval", "approve",
+    "regulation", "lawsuit", "ceo", "president", "election", "nominee",
+    "fed chair", "interest rate", "cpi", "inflation", "gdp", "unemployment",
+    "tariff", "win", "wins", "champion", "world cup", "ufc", "nba",
+    "nfl", "mlb", "tennis", "reserves", "inventory", "inventories",
+    "production", "output", "transit", "transits", "shipments",
+    "strait of hormuz", "temperature", "rainfall", "kills", "total rounds",
 ]
 
 
@@ -506,82 +526,56 @@ def infer_direction(market):
     return "above"
 
 
-def _number_value(raw):
-    """Convert a displayed market number such as $1,900 or 62.5 to float."""
+def _parse_number(value):
     try:
-        return float(str(raw).replace(",", "").replace("$", "").strip())
+        return float(str(value).replace(",", ""))
     except (TypeError, ValueError):
         return None
 
 
-def extract_price_levels(market):
-    """Extract only contract price levels, not dates or numbers inside asset names.
-
-    The parser gives priority to explicit dollar amounts and then to numbers that
-    immediately follow price-language such as above, below, reach, hit, or dip to.
-    Range contracts are parsed only from the text after ``between``.
-    """
+def extract_price_bounds(market):
+    """Extract contract price levels while ignoring dates and asset-name numbers."""
     text = str(market or "")
+    number = r"(?:US\$|\$)?\s*(\d[\d,]*(?:\.\d+)?)"
 
-    # Explicit dollar amounts are the most reliable signal and naturally ignore
-    # S&P 500, August 3, September 30, and similar non-price numbers.
-    dollar_matches = re.findall(r"\$\s*(\d[\d,]*(?:\.\d+)?)", text)
-    dollar_values = [_number_value(value) for value in dollar_matches]
-    dollar_values = [value for value in dollar_values if value is not None]
-
-    lower_text = text.lower()
-    if "between" in lower_text:
-        after_between = re.split(r"between", text, maxsplit=1, flags=re.I)[-1]
-        range_dollars = re.findall(r"\$\s*(\d[\d,]*(?:\.\d+)?)", after_between)
-        range_values = [_number_value(value) for value in range_dollars]
-        range_values = [value for value in range_values if value is not None]
-        if len(range_values) >= 2:
-            return range_values[:2]
-
-        range_match = re.search(
-            r"^\s*(\d[\d,]*(?:\.\d+)?)\s*(?:and|to|-)\s*\$?\s*(\d[\d,]*(?:\.\d+)?)",
-            after_between,
-            flags=re.I,
-        )
-        if range_match:
-            values = [_number_value(range_match.group(1)), _number_value(range_match.group(2))]
-            return [value for value in values if value is not None]
-        return []
-
-    if dollar_values:
-        # The first explicit dollar amount is the contract target. A second dollar
-        # amount is not treated as an upper bound unless this is a range contract.
-        return dollar_values[:1]
-
-    trigger_pattern = re.compile(
-        r"(?:above|below|over|under|greater\s+than|less\s+than|"
-        r"reach|reaches|hit|hits|touch|touches|dip\s+to|fall\s+to|"
-        r"rise\s+to|trade\s+as\s+high\s+as|trade\s+as\s+low\s+as)"
-        r"(?:\s*\((?:high|low)\))?\s*[:=]?\s*"
-        r"(\d[\d,]*(?:\.\d+)?)",
+    range_match = re.search(
+        rf"\bbetween\s+{number}\s+(?:and|to|-)\s+{number}",
+        text,
         flags=re.I,
     )
-    match = trigger_pattern.search(text)
-    if match:
-        value = _number_value(match.group(1))
-        return [value] if value is not None else []
+    if range_match:
+        lower = _parse_number(range_match.group(1))
+        upper = _parse_number(range_match.group(2))
+        if lower is not None and upper is not None and 0 < lower < upper:
+            return lower, upper
 
-    return []
+    trigger_patterns = [
+        rf"\b(?:close|closes|closed|finish|finishes|settle|settles)[^?]*?\b(?:above|below|over|under)\s+{number}",
+        rf"\b(?:above|below|over|under|greater than|less than)\s+{number}",
+        rf"\b(?:reach|hit|touch|dip to|fall to|rise to|trade as high as|trade as low as)\s+(?:\((?:high|low)\)\s*)?{number}",
+        rf"\((?:high|low)\)\s*{number}",
+    ]
+    for pattern in trigger_patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            value = _parse_number(match.group(1))
+            if value is not None and value > 0:
+                return value, None
+
+    return None, None
 
 
 def extract_numbers(market):
-    """Backward-compatible wrapper for the context-aware price parser."""
-    return extract_price_levels(market)
+    lower, upper = extract_price_bounds(market)
+    return [value for value in (lower, upper) if value is not None]
 
 
 def extract_target(market):
-    levels = extract_price_levels(market)
-    return levels[0] if levels else None
+    return extract_price_bounds(market)[0]
 
 
 def extract_upper(market):
-    levels = extract_price_levels(market)
-    return levels[1] if len(levels) > 1 else None
+    return extract_price_bounds(market)[1]
 
 
 def extract_asset_phrase(market):
@@ -632,7 +626,13 @@ def yahoo_symbol_search(query):
 
 
 def find_ticker(market):
-    text = str(market or "").lower()
+    raw_text = str(market or "")
+    text = raw_text.lower()
+
+    # Explicit SPY contracts reference the ETF price, not the index level.
+    if re.search(r"(?<!\w)spy(?!\w)", text):
+        return "SPY"
+
     # Longest aliases first to avoid matching "oil" before "crude oil".
     for key in sorted(ASSET_ALIASES, key=len, reverse=True):
         if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text):
@@ -773,55 +773,6 @@ def pull_markets():
     return eligible
 
 
-def superforecasting_reasoning(row):
-    """Build a transparent outside-view / inside-view explanation for one forecast."""
-    hist = _safe_float(row.get("Historical Prob %"), np.nan)
-    ewma = _safe_float(row.get("EWMA Prob %"), np.nan)
-    market = _safe_float(row.get("Market Prob %"), np.nan)
-    final = _safe_float(row.get("Final Prob %"), np.nan)
-    momentum = _safe_float(row.get("Momentum"), 0.0)
-    edge = _safe_float(row.get("Edge %"), 0.0)
-    liquidity = _safe_float(row.get("Liquidity"), 0.0)
-
-    components = [value for value in (hist, ewma) if np.isfinite(value)]
-    disagreement = (max(components) - min(components)) if len(components) >= 2 else 0.0
-
-    if liquidity >= 5000 and disagreement <= 15 and abs(edge) >= 12:
-        confidence = "High"
-    elif liquidity >= MIN_LIQUIDITY and disagreement <= 30:
-        confidence = "Medium"
-    else:
-        confidence = "Low"
-
-    reasons = []
-    if np.isfinite(hist):
-        reasons.append(f"Outside view: comparable historical windows imply about {hist:.1f}% YES.")
-    if np.isfinite(ewma):
-        reasons.append(f"Current volatility view: EWMA implies about {ewma:.1f}% YES.")
-    if momentum > 0:
-        reasons.append("Recent price momentum supports a higher YES probability.")
-    elif momentum < 0:
-        reasons.append("Recent price momentum supports a lower YES probability.")
-    else:
-        reasons.append("Momentum is broadly neutral.")
-    if np.isfinite(market) and np.isfinite(final):
-        reasons.append(f"Polymarket prices YES at {market:.1f}% versus the model at {final:.1f}%.")
-    reasons.append(f"The selected signal has an estimated edge of {edge:.1f}% after the execution filters.")
-
-    return {
-        "confidence": confidence,
-        "disagreement": disagreement,
-        "reasons": reasons,
-    }
-
-
-def brier_score(probability_pct, outcome):
-    """Binary Brier score on the 0-to-1 probability scale; lower is better."""
-    p = np.clip(_safe_float(probability_pct, 50.0) / 100.0, 0.0, 1.0)
-    y = 1.0 if str(outcome).upper() == "YES" else 0.0
-    return float((p - y) ** 2)
-
-
 def get_news(ticker, limit=5):
     query = ticker.replace("-", " ")
 
@@ -956,6 +907,7 @@ JOURNAL_COLUMNS = [
     "Entry Side",
     "Entry Price %",
     "Position Size $",
+    "Forecast Confidence",
     "clobTokenIds",
     "Execution Token ID",
     "Execution Outcome",
@@ -1507,19 +1459,46 @@ with tab1:
             st.write(f"**Entry Price:** {explain['Entry Price %']}%")
             st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
 
+
             st.markdown("### Superforecasting Review")
-            sf = superforecasting_reasoning(explain)
-            st.write(f"**Confidence:** {sf['confidence']}")
-            st.write(f"**Model disagreement:** {sf['disagreement']:.1f} percentage points")
-            st.write("**Outside view:** Historical probability is used as the base-rate anchor.")
-            st.write("**Inside view:** EWMA volatility and momentum adjust that anchor for current conditions.")
-            st.write("**Market benchmark:** The final probability is compared with the live Polymarket price.")
-            for reason in sf["reasons"]:
-                st.write(f"• {reason}")
-            st.caption(
-                "Treat this as a forecast to test, not a certainty. Save the probability, update it when evidence changes, "
-                "and judge it later with calibration and Brier score."
+            historical_prob = _safe_float(explain.get("Historical Prob %"))
+            ewma_prob = _safe_float(explain.get("EWMA Prob %"))
+            market_prob = _safe_float(explain.get("Market Prob %"))
+            final_prob = _safe_float(explain.get("Final Prob %"))
+            confidence = str(explain.get("Forecast Confidence", "Low"))
+            disagreement = abs(ewma_prob - historical_prob)
+
+            sf1, sf2, sf3, sf4 = st.columns(4)
+            sf1.metric("Outside view", f"{historical_prob:.2f}%")
+            sf2.metric("Current-data view", f"{ewma_prob:.2f}%")
+            sf3.metric("Polymarket benchmark", f"{market_prob:.2f}%")
+            sf4.metric("Confidence", confidence)
+
+            reasoning = []
+            if final_prob > market_prob:
+                reasoning.append(
+                    f"The model assigns YES {final_prob - market_prob:.2f} percentage points more probability than the market."
+                )
+            elif final_prob < market_prob:
+                reasoning.append(
+                    f"The model assigns YES {market_prob - final_prob:.2f} percentage points less probability than the market."
+                )
+            else:
+                reasoning.append("The model and market assign the same YES probability.")
+            reasoning.append(
+                f"The historical base rate is {historical_prob:.2f}% and the current-volatility estimate is {ewma_prob:.2f}%."
             )
+            if disagreement > 30:
+                reasoning.append("The outside and current-data views disagree substantially, so confidence is reduced.")
+            elif disagreement > 15:
+                reasoning.append("The two model views disagree moderately, so the forecast should be monitored closely.")
+            else:
+                reasoning.append("The two model views are broadly aligned.")
+            reasoning.append(
+                "Treat this as a dated probability estimate: update it when meaningful evidence changes and score it after resolution."
+            )
+            for item in reasoning:
+                st.write(f"• {item}")
     
             if explain["Signal"] == "BUY YES":
                 st.success("✅ YES is underpriced based on the model probability.")
@@ -1758,34 +1737,44 @@ with tab3:
 
             resolved = closed[closed["Result"].astype(str).str.upper().isin(["YES", "NO"])].copy()
             if not resolved.empty:
+                resolved["Outcome YES"] = resolved["Result"].astype(str).str.upper().eq("YES")
                 resolved["Model Brier"] = resolved.apply(
-                    lambda row: brier_score(row.get("Final Prob %"), row.get("Result")), axis=1
+                    lambda row: brier_score(row.get("Final Prob %", 0), row["Outcome YES"]), axis=1
                 )
                 resolved["Market Brier"] = resolved.apply(
-                    lambda row: brier_score(row.get("Market Prob %"), row.get("Result")), axis=1
+                    lambda row: brier_score(row.get("Market Prob %", 0), row["Outcome YES"]), axis=1
                 )
 
-                st.subheader("Superforecasting Scorecard")
-                b1, b2 = st.columns(2)
-                b1.metric("Model Brier Score", f"{resolved['Model Brier'].mean():.3f}")
-                b2.metric("Polymarket Brier Score", f"{resolved['Market Brier'].mean():.3f}")
-                st.caption("Lower Brier scores are better. Compare like-for-like resolved forecasts.")
+                st.subheader("Forecast Accuracy")
+                b1, b2, b3 = st.columns(3)
+                model_brier = resolved["Model Brier"].mean()
+                market_brier = resolved["Market Brier"].mean()
+                b1.metric("Model Brier Score", f"{model_brier:.4f}")
+                b2.metric("Market Brier Score", f"{market_brier:.4f}")
+                b3.metric("Model vs Market", "Better" if model_brier < market_brier else "Worse")
+                st.caption("Lower is better: 0 is perfect and 1 is the worst possible binary Brier score.")
 
+                resolved["Final Prob %"] = pd.to_numeric(resolved["Final Prob %"], errors="coerce")
+                resolved = resolved[resolved["Final Prob %"].notna()].copy()
                 resolved["Probability Band"] = pd.cut(
-                    pd.to_numeric(resolved["Final Prob %"], errors="coerce"),
-                    bins=[0, 20, 40, 60, 80, 100],
-                    labels=["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"],
+                    resolved["Final Prob %"],
+                    bins=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
                     include_lowest=True,
                 )
-                resolved["YES Outcome"] = resolved["Result"].astype(str).str.upper().eq("YES").astype(float)
-                calibration = resolved.groupby("Probability Band", observed=False).agg(
-                    Forecasts=("Market ID", "count"),
-                    Average_Model_Probability=("Final Prob %", "mean"),
-                    Actual_YES_Rate=("YES Outcome", "mean"),
-                    Average_Brier=("Model Brier", "mean"),
-                ).reset_index()
-                calibration["Actual_YES_Rate"] = calibration["Actual_YES_Rate"] * 100
+                calibration = (
+                    resolved.groupby("Probability Band", observed=False)
+                    .agg(
+                        Forecasts=("Market ID", "count"),
+                        Average_Model_Probability=("Final Prob %", "mean"),
+                        Actual_YES_Rate=("Outcome YES", "mean"),
+                    )
+                    .reset_index()
+                )
+                calibration["Actual_YES_Rate"] *= 100
+                calibration = calibration[calibration["Forecasts"] > 0]
                 st.subheader("Calibration by Probability Band")
                 st.dataframe(calibration, use_container_width=True)
+            else:
+                st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
     else:
         st.info("No analytics available yet.")
