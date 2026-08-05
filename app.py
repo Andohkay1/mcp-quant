@@ -1036,6 +1036,23 @@ def get_journal_worksheet():
     return worksheet
 
 
+def ensure_worksheet_capacity(worksheet, required_row=None, required_cols=None, row_buffer=500):
+    """Expand the worksheet before a write would exceed its grid limits."""
+    target_row = int(required_row or worksheet.row_count)
+    target_cols = int(required_cols or worksheet.col_count)
+
+    new_rows = worksheet.row_count
+    new_cols = worksheet.col_count
+
+    if target_row > worksheet.row_count:
+        new_rows = max(target_row, worksheet.row_count + row_buffer)
+    if target_cols > worksheet.col_count:
+        new_cols = target_cols
+
+    if new_rows != worksheet.row_count or new_cols != worksheet.col_count:
+        worksheet.resize(rows=new_rows, cols=new_cols)
+
+
 def save_to_journal(row, update_existing=False):
     """Save a trade, updating its existing journal row when requested."""
     worksheet = get_journal_worksheet()
@@ -1112,8 +1129,22 @@ def save_to_journal(row, update_existing=False):
     journal_row["PnL"] = journal_row.get("PnL", 0.0)
 
     values = [_clean_sheet_value(journal_row.get(column, "")) for column in headers]
-    worksheet.append_row(values, value_input_option="USER_ENTERED")
-    return "created", worksheet.row_count
+
+    # Write to the exact next populated row rather than relying on append_row.
+    # This lets us expand the grid first and return the real journal row number.
+    next_row = len(worksheet.get_all_values()) + 1
+    ensure_worksheet_capacity(
+        worksheet,
+        required_row=next_row,
+        required_cols=len(headers),
+    )
+    end_cell = gspread.utils.rowcol_to_a1(next_row, len(headers))
+    worksheet.update(
+        range_name=f"A{next_row}:{end_cell}",
+        values=[values],
+        value_input_option="USER_ENTERED",
+    )
+    return "created", next_row
 
 
 def verify_execution_fields(sheet_row_number, expected):
@@ -1579,6 +1610,9 @@ with tab1:
                             fresh_estimate = client.price_estimate(
                                 token, preview_token_id, "buy", capped_amount
                             )
+
+                            # Order placement is the critical step. Once this succeeds, a later
+                            # journal failure must never be reported as a failed trade.
                             order_response = client.place_market_order(
                                 token, preview_token_id, "buy", capped_amount
                             )
@@ -1591,9 +1625,14 @@ with tab1:
                             executed_row["MCP Order ID"] = (
                                 order_response.get("order_id")
                                 or order_response.get("id")
+                                or order_response.get("taker_order_id")
                                 or ""
                             )
-                            executed_row["CLOB Order ID"] = order_response.get("clob_order_id", "")
+                            executed_row["CLOB Order ID"] = (
+                                order_response.get("clob_order_id")
+                                or order_response.get("taker_order_id")
+                                or ""
+                            )
                             executed_row["Execution Status"] = (
                                 order_response.get("clob_status")
                                 or order_response.get("status")
@@ -1605,34 +1644,57 @@ with tab1:
                             )
                             executed_row["Position Size $"] = capped_amount
 
-                            journal_action, journal_row_number = save_to_journal(
-                                executed_row,
-                                update_existing=True,
+                            st.success("✅ Trade order was accepted by MCP.")
+                            r1, r2, r3, r4 = st.columns(4)
+                            r1.metric("Outcome", preview_outcome)
+                            r2.metric("Amount", f"${capped_amount:.2f}")
+                            r3.metric(
+                                "Estimated Price",
+                                f"${float(fresh_estimate.get('price', 0) or 0):.4f}",
                             )
-                            verify_execution_fields(
-                                journal_row_number,
-                                {
-                                    "Execution Token ID": preview_token_id,
-                                    "Execution Outcome": preview_outcome,
-                                    "Estimated Fill Price": fresh_estimate.get("price", ""),
-                                    "Executed Amount pUSD": capped_amount,
-                                    "MCP Order ID": executed_row["MCP Order ID"],
-                                    "CLOB Order ID": executed_row["CLOB Order ID"],
-                                    "Execution Status": executed_row["Execution Status"],
-                                    "Execution Response": order_response,
-                                },
-                            )
-                            load_journal.clear()
-                            st.session_state.pop("mcp_trade_preview", None)
-                            if journal_action == "updated":
-                                st.success(
-                                    "Model trade executed through MCP and the existing Google Sheets row was updated."
-                                )
-                            else:
-                                st.success(
-                                    "Model trade executed through MCP and a new Google Sheets row was created."
-                                )
+                            r4.metric("Status", executed_row["Execution Status"])
+                            if executed_row["MCP Order ID"]:
+                                st.caption(f"MCP Order ID: {executed_row['MCP Order ID']}")
+                            if executed_row["CLOB Order ID"]:
+                                st.caption(f"CLOB Order ID: {executed_row['CLOB Order ID']}")
                             st.json(order_response)
+
+                            # Journal persistence is non-critical. Report it separately so a
+                            # Sheets problem cannot create uncertainty or trigger a duplicate order.
+                            try:
+                                journal_action, journal_row_number = save_to_journal(
+                                    executed_row,
+                                    update_existing=True,
+                                )
+                                verify_execution_fields(
+                                    journal_row_number,
+                                    {
+                                        "Execution Token ID": preview_token_id,
+                                        "Execution Outcome": preview_outcome,
+                                        "Estimated Fill Price": fresh_estimate.get("price", ""),
+                                        "Executed Amount pUSD": capped_amount,
+                                        "MCP Order ID": executed_row["MCP Order ID"],
+                                        "CLOB Order ID": executed_row["CLOB Order ID"],
+                                        "Execution Status": executed_row["Execution Status"],
+                                        "Execution Response": order_response,
+                                    },
+                                )
+                                load_journal.clear()
+                                if journal_action == "updated":
+                                    st.success("📒 Existing Google Sheets journal row updated.")
+                                else:
+                                    st.success("📒 New Google Sheets journal row created.")
+                            except Exception as journal_error:
+                                st.warning(
+                                    "⚠️ The trade was submitted successfully, but the Google Sheets "
+                                    f"journal could not be updated: {journal_error}"
+                                )
+                                st.info(
+                                    "Do not submit this trade again. Verify it in MCP Trade History "
+                                    "and repair the journal separately."
+                                )
+
+                            st.session_state.pop("mcp_trade_preview", None)
             except Exception as error:
                 message = str(error)
                 if "422" in message and "no match" in message.lower():
