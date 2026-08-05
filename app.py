@@ -186,15 +186,40 @@ def token_for_signal(row):
     raise RuntimeError("The selected market is not an actionable BUY signal.")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_close_prices(ticker, period="5y"):
+    """Download and cache adjusted close prices so each ticker/period is fetched once per scan."""
+    data = yf.download(
+        ticker, period=period, auto_adjust=True, progress=False, threads=False
+    )
+    if data is None or data.empty or "Close" not in data:
+        return pd.Series(dtype=float)
+    close = data["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    return pd.to_numeric(close, errors="coerce").dropna()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_ohlc_prices(ticker, period="5y", interval="1d"):
+    """Download and cache OHLC data used by barrier calculations."""
+    data = yf.download(
+        ticker, period=period, interval=interval, auto_adjust=True,
+        progress=False, threads=False
+    )
+    if data is None or data.empty:
+        return pd.DataFrame()
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    return data.dropna(how="all")
+
+
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
-        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-        close = data["Close"]
-
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-
-        return close.dropna()
+        close = cached_close_prices(str(ticker), period)
+        if close.empty:
+            raise RuntimeError(f"No Yahoo Finance price history returned for {ticker}.")
+        return close.copy()
 
     def ewma_volatility(self, close):
         returns = np.log(close / close.shift(1)).dropna()
@@ -232,10 +257,10 @@ class MCPQuantEngine:
         return (future_returns <= required_return).mean() * 100
 
     def get_ohlc(self, ticker, period="5y", interval="1d"):
-        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        return data.dropna(how="all")
+        data = cached_ohlc_prices(str(ticker), period, interval)
+        if data.empty:
+            raise RuntimeError(f"No Yahoo Finance OHLC history returned for {ticker}.")
+        return data.copy()
 
     def ewma_barrier_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
@@ -1323,14 +1348,23 @@ with tab1:
 
         engine = MCPQuantEngine()
         scored = []
+        score_errors = []
+        total_to_score = len(markets_df)
+        progress = st.progress(0, text=f"Scoring 0 of {total_to_score} eligible markets...")
 
-        for _, row in markets_df.iterrows():
+        for position, (_, row) in enumerate(markets_df.iterrows(), start=1):
             try:
                 scored.append(engine.score_market(row))
-            except Exception:
-                pass
+            except Exception as error:
+                score_errors.append({"Market": row.get("Market", ""), "Reason": str(error)})
+            progress.progress(
+                position / max(total_to_score, 1),
+                text=f"Scoring {position} of {total_to_score} eligible markets...",
+            )
 
+        progress.empty()
         results = pd.DataFrame(scored)
+        st.session_state["score_errors"] = pd.DataFrame(score_errors)
         st.session_state["results"] = results
 
         if len(results) > 0:
@@ -1380,6 +1414,10 @@ with tab1:
 
         st.subheader("Top Trade Candidates")
         st.dataframe(results, use_container_width=True)
+        score_errors = st.session_state.get("score_errors", pd.DataFrame())
+        if isinstance(score_errors, pd.DataFrame) and not score_errors.empty:
+            with st.expander(f"See {len(score_errors)} markets skipped because price data or scoring failed"):
+                st.dataframe(score_errors, use_container_width=True)
 
         buys = results[results["Signal"].isin(["BUY YES", "BUY NO"]) & results.get("Execution Approved", False).fillna(False).astype(bool)]
 
