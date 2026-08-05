@@ -18,13 +18,13 @@ st.title("MCP Quant Dashboard")
 
 EDGE_THRESHOLD = 5
 MIN_LIQUIDITY = 250
-MAX_DAYS = 10
+MAX_DAYS = 60
 MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
 SPREADSHEET_NAME = "Polymarket Journal"
 WORKSHEET_NAME = "Trades"
 STARTING_BANKROLL = 100
-BUY_THRESHOLD = 6
+BUY_THRESHOLD = 5
 
 # Automatic execution filters. A model signal can still appear in the research
 # table even when it is not approved for live execution.
@@ -903,15 +903,42 @@ def pull_markets():
     markets to be misclassified or rejected.
     """
     url = "https://gamma-api.polymarket.com/markets"
-    params = {
-        "closed": "false",
-        "limit": 1000,
-        "order": "volume",
-        "ascending": "false",
-    }
-    response = requests.get(url, params=params, timeout=20)
-    response.raise_for_status()
-    markets_raw = response.json()
+
+    # Gamma currently caps individual responses, so paginate instead of assuming
+    # one large request returns the full active catalogue. Sorting by end date
+    # brings near-term contracts forward while still allowing up to 60 days.
+    page_size = 100
+    max_pages = 20
+    markets_raw = []
+    seen_market_ids = set()
+
+    for page_number in range(max_pages):
+        params = {
+            "closed": "false",
+            "limit": page_size,
+            "offset": page_number * page_size,
+            "order": "endDate",
+            "ascending": "true",
+        }
+
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, list) or not page:
+            break
+
+        new_items = 0
+        for market in page:
+            market_id = str(market.get("id", "")).strip()
+            dedupe_key = market_id or str(market.get("conditionId", "")).strip() or str(market.get("question", "")).strip()
+            if not dedupe_key or dedupe_key in seen_market_ids:
+                continue
+            seen_market_ids.add(dedupe_key)
+            markets_raw.append(market)
+            new_items += 1
+
+        if len(page) < page_size or new_items == 0:
+            break
 
     rows = []
     for m in markets_raw:
