@@ -686,8 +686,9 @@ RESULT_COLUMNS = [
 ]
 
 
-# Reliable aliases are checked first. Unknown assets are resolved dynamically
-# through Yahoo Finance only after the market has passed the binary-price filter.
+# Reliable aliases are checked first. The discovery layer only sends markets
+# with a resolvable financial underlying to the probability engine. This avoids
+# treating generic sports/esports "over/under" questions as asset-price markets.
 ASSET_ALIASES = {
     # Crypto
     "bitcoin": "BTC-USD", "btc": "BTC-USD",
@@ -698,16 +699,30 @@ ASSET_ALIASES = {
     "avalanche": "AVAX-USD", "avax": "AVAX-USD",
     "chainlink": "LINK-USD", "link": "LINK-USD",
     "sui": "SUI20947-USD", "bnb": "BNB-USD",
-    # Major equities
+    "binance coin": "BNB-USD", "litecoin": "LTC-USD", "ltc": "LTC-USD",
+    "polkadot": "DOT-USD", "dot": "DOT-USD",
+    # Major equities and commonly listed Polymarket names
     "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA",
     "microsoft": "MSFT", "amazon": "AMZN", "alphabet": "GOOGL",
-    "google": "GOOGL", "meta": "META", "netflix": "NFLX",
-    "amd": "AMD", "coinbase": "COIN", "palantir": "PLTR",
-    "spotify": "SPOT", "uber": "UBER", "berkshire hathaway": "BRK-B",
+    "google": "GOOGL", "meta platforms": "META", "meta": "META",
+    "netflix": "NFLX", "amd": "AMD", "advanced micro devices": "AMD",
+    "coinbase": "COIN", "palantir": "PLTR", "spotify": "SPOT",
+    "uber": "UBER", "berkshire hathaway": "BRK-B",
+    "robinhood markets": "HOOD", "robinhood": "HOOD",
+    "microstrategy": "MSTR", "strategy": "MSTR",
+    "broadcom": "AVGO", "oracle": "ORCL", "salesforce": "CRM",
+    "intel": "INTC", "qualcomm": "QCOM", "arm holdings": "ARM",
+    "taiwan semiconductor": "TSM", "tsmc": "TSM",
+    "jpmorgan": "JPM", "goldman sachs": "GS", "bank of america": "BAC",
+    "walmart": "WMT", "costco": "COST", "disney": "DIS",
+    "coca-cola": "KO", "coca cola": "KO", "pepsico": "PEP",
+    # ETFs
+    "spy": "SPY", "spdr s&p 500": "SPY", "qqq": "QQQ",
+    "invesco qqq": "QQQ", "dia": "DIA", "iwm": "IWM",
     # Indices
     "s&p 500": "^GSPC", "s&p500": "^GSPC", "sp 500": "^GSPC",
-    "nasdaq 100": "^NDX", "nasdaq": "^IXIC", "dow jones": "^DJI",
-    "russell 2000": "^RUT",
+    "nasdaq 100": "^NDX", "nasdaq composite": "^IXIC", "nasdaq": "^IXIC",
+    "dow jones": "^DJI", "dow": "^DJI", "russell 2000": "^RUT",
     # Commodities
     "gold": "GC=F", "silver": "SI=F", "wti": "CL=F",
     "crude oil": "CL=F", "oil": "CL=F", "brent": "BZ=F",
@@ -719,59 +734,50 @@ ASSET_ALIASES = {
 }
 
 PRICE_MARKET_PATTERNS = [
-    r"\b(?:reach|hit|touch|dip to|fall to|rise to)\b.*?\$?\d",
-    r"\b(?:above|below|over|under|greater than|less than)\b.*?\$?\d",
-    r"\b(?:close|closes|finish|finishes|settle|settles)\b.*?\b(?:above|below|over|under)\b",
-    r"\bbetween\b.*?\d.*?\band\b.*?\d",
+    r"\b(?:reach|reaches|hit|hits|touch|touches|dip to|fall to|rise to)\b.*?(?:\$|€|£)?\d",
+    r"\b(?:close|closes|finish|finishes|settle|settles)\b.*?\b(?:above|below|over|under)\b.*?(?:\$|€|£)?\d",
+    r"\b(?:be|trade|end)\b.*?\b(?:above|below|over|under|greater than|less than)\b.*?(?:\$|€|£)?\d",
+    r"\bbetween\b.*?(?:\$|€|£)?\d.*?\b(?:and|to)\b.*?(?:\$|€|£)?\d",
+    r"\((?:high|low)\).*?(?:\$|€|£)?\d",
 ]
 
+# Terms that strongly indicate the number is not an asset price. They are used
+# only after ticker resolution, providing a second guard against false matches.
 NON_PRICE_EVENT_WORDS = [
-    "earnings", "revenue", "eps", "market cap", "acquire", "acquisition",
-    "merger", "ipo", "etf approval", "approve", "regulation", "lawsuit",
-    "ceo", "president", "election", "nominee", "fed chair", "interest rate",
-    "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
-    "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
+    "earnings", "revenue", "eps", "market cap", "fdv", "valuation",
+    "acquire", "acquisition", "merger", "ipo", "etf approval", "approve",
+    "regulation", "lawsuit", "ceo", "president", "election", "nominee",
+    "fed chair", "interest rate", "cpi", "inflation", "gdp", "unemployment",
+    "tariff", "total kills", "total rounds", "map 1", "map 2", "map 3",
+    "game 1", "game 2", "game 3", "temperature", "degrees fahrenheit",
+    "degrees celsius", "world cup", "ufc", "nba", "nfl", "mlb", "wnba",
+    "nhl", "tennis", "cricket", "soccer", "football", "basketball",
 ]
-
-
-def classify_market(market):
-    """Classify only binary financial price markets supported by the model."""
-    text = str(market or "").lower().strip()
-
-    if any(word in text for word in NON_PRICE_EVENT_WORDS):
-        return "event"
-    if "between" in text and len(extract_numbers(text)) >= 2:
-        return "range"
-    if re.search(r"\b(?:close|closes|finish|finishes|settle|settles)\b", text) and re.search(
-        r"\b(?:above|below|over|under)\b", text
-    ):
-        return "daily_close"
-    # Touch/barrier contracts resolve YES if the level is reached at any point,
-    # not only if the asset finishes beyond the level at expiry.
-    if re.search(r"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\b", text):
-        return "barrier"
-    if re.search(r"\((?:high|low)\)", text):
-        return "barrier"
-    if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
-        return "price"
-    return "event"
-
-
-def infer_direction(market):
-    text = str(market or "").lower()
-    if re.search(r"\b(?:below|under|less than|dip|fall to|low)\b", text):
-        return "below"
-    return "above"
 
 
 def extract_numbers(market):
+    """Extract likely price levels while excluding dates, years and percentages."""
     text = str(market or "").replace(",", "")
-    # Prefer explicit prices and large index levels; remove dates and percentages.
-    raw = re.findall(r"(?<![%\w])\$?(\d+(?:\.\d+)?)", text)
+
+    # Prefer explicitly currency-marked values first.
+    explicit = re.findall(r"(?:\$|US\$|€|£)\s*(\d+(?:\.\d+)?)", text, flags=re.I)
+    if explicit:
+        return [float(x) for x in explicit]
+
+    raw = re.findall(r"(?<![%\w])(-?\d+(?:\.\d+)?)", text)
     values = []
     for item in raw:
         value = float(item)
-        if 1900 <= value <= 2100:  # likely a year
+        if 1900 <= value <= 2100:
+            continue
+        # Remove common calendar day numbers when adjacent to a month name.
+        if re.search(
+            rf"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            rf"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+            rf"dec(?:ember)?)\s+{re.escape(item)}\b",
+            text,
+            flags=re.I,
+        ):
             continue
         values.append(value)
     return values
@@ -788,13 +794,13 @@ def extract_upper(market):
 
 
 def extract_asset_phrase(market):
-    """Extract the likely underlying name from a binary price question."""
+    """Extract the likely financial underlying from a price-market question."""
     text = str(market or "").strip()
     text = re.sub(r"^(will|can|could|does|is)\s+", "", text, flags=re.I)
     split_patterns = [
-        r"\s+(?:reach|hit|touch|dip to|fall to|rise to)\s+",
+        r"\s+(?:reach|reaches|hit|hits|touch|touches|dip to|fall to|rise to)\s+",
         r"\s+(?:close|closes|finish|finishes|settle|settles)\s+",
-        r"\s+(?:be|trade)\s+(?:above|below|over|under|between)\s+",
+        r"\s+(?:be|trade|end)\s+(?:above|below|over|under|between)\s+",
         r"\s+(?:above|below|over|under|greater than|less than)\s+",
     ]
     phrase = text
@@ -804,15 +810,15 @@ def extract_asset_phrase(market):
             phrase = parts[0]
             break
     phrase = re.sub(r"\b(price|stock|shares|token|coin|index|futures?)\b", "", phrase, flags=re.I)
-    phrase = re.sub(r"[^A-Za-z0-9&./\- ]", " ", phrase)
+    phrase = re.sub(r"[^A-Za-z0-9&./\-() ]", " ", phrase)
     return re.sub(r"\s+", " ", phrase).strip(" -?")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def yahoo_symbol_search(query):
-    """Resolve a name to a Yahoo symbol. Returns None when confidence is weak."""
+    """Resolve a financial name to Yahoo only after strict price-market checks."""
     query = str(query or "").strip()
-    if not query:
+    if not query or len(query) > 80:
         return None
     try:
         response = requests.get(
@@ -834,26 +840,60 @@ def yahoo_symbol_search(query):
     return None
 
 
-def find_ticker(market):
-    text = str(market or "").lower()
-    # Longest aliases first to avoid matching "oil" before "crude oil".
+def find_ticker(market, allow_dynamic=True):
+    original = str(market or "")
+    text = original.lower()
+
+    # Direct ticker notation such as $AAPL or (AAPL) is the strongest signal.
+    direct = re.search(r"\$([A-Z]{1,6})\b|\(([A-Z]{1,6})\)", original)
+    if direct:
+        symbol = direct.group(1) or direct.group(2)
+        # Currency symbols followed by numeric prices are excluded automatically
+        # because this expression requires letters.
+        return symbol
+
     for key in sorted(ASSET_ALIASES, key=len, reverse=True):
         if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text):
             return ASSET_ALIASES[key]
 
-    # Direct ticker notation such as $AAPL or (AAPL).
-    direct = re.search(r"\$([A-Z]{1,6})\b|\(([A-Z]{1,6})\)", str(market or ""))
-    if direct:
-        return direct.group(1) or direct.group(2)
+    return yahoo_symbol_search(extract_asset_phrase(original)) if allow_dynamic else None
 
-    return yahoo_symbol_search(extract_asset_phrase(market))
+
+def classify_market(market, ticker=None):
+    """Classify a supported financial price contract, otherwise return event."""
+    text = str(market or "").lower().strip()
+    if not ticker:
+        return "event"
+    if any(word in text for word in NON_PRICE_EVENT_WORDS):
+        return "event"
+    if not any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
+        return "event"
+    if "between" in text and len(extract_numbers(text)) >= 2:
+        return "range"
+    if re.search(r"\b(?:close|closes|finish|finishes|settle|settles|end)\b", text) and re.search(
+        r"\b(?:above|below|over|under)\b", text
+    ):
+        return "daily_close"
+    if re.search(
+        r"\b(?:hit|hits|reach|reaches|touch|touches|dip to|fall to|rise to|trade as high as|trade as low as)\b",
+        text,
+    ) or re.search(r"\((?:high|low)\)", text):
+        return "barrier"
+    return "price"
+
+
+def infer_direction(market):
+    text = str(market or "").lower()
+    if re.search(r"\b(?:below|under|less than|dip|fall to|low)\b", text):
+        return "below"
+    return "above"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def barrier_already_hit(ticker, target, direction, start_date):
     """Check whether a touch barrier has already been crossed since market inception."""
     try:
-        if pd.isna(start_date):
+        if not ticker or pd.isna(target) or pd.isna(start_date):
             return False
         start_ts = pd.Timestamp(start_date)
         if start_ts.tzinfo is None:
@@ -863,15 +903,7 @@ def barrier_already_hit(ticker, target, direction, start_date):
 
         now_utc = pd.Timestamp.now(tz="UTC")
         age_days = max((now_utc - start_ts).total_seconds() / 86400, 0)
-        # Intraday data gives a more precise check for recent markets; daily
-        # high/low data extends the check for longer-lived markets.
-        if age_days <= 7:
-            interval = "5m"
-        elif age_days <= 60:
-            interval = "1h"
-        else:
-            interval = "1d"
-
+        interval = "5m" if age_days <= 7 else "1h" if age_days <= 60 else "1d"
         data = yf.download(
             ticker,
             start=start_ts.tz_localize(None),
@@ -882,103 +914,153 @@ def barrier_already_hit(ticker, target, direction, start_date):
         )
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
-        if data.empty:
+        if data.empty or not {"High", "Low"}.issubset(data.columns):
             return False
-
-        if direction == "above":
-            return float(data["High"].max()) >= float(target)
-        return float(data["Low"].min()) <= float(target)
+        return (
+            float(data["High"].max()) >= float(target)
+            if direction == "above"
+            else float(data["Low"].min()) <= float(target)
+        )
     except Exception:
-        # A failed historical check must not silently assert that a barrier was hit.
         return False
+
+
+def _parse_json_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _fetch_gamma_catalog(page_size=500, max_pages=10):
+    """Fetch active Gamma markets page by page and deduplicate by market id."""
+    url = "https://gamma-api.polymarket.com/markets"
+    collected = []
+    seen = set()
+    for page in range(max_pages):
+        params = {
+            "closed": "false",
+            "active": "true",
+            "limit": page_size,
+            "offset": page * page_size,
+            "order": "endDate",
+            "ascending": "true",
+        }
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list) or not payload:
+            break
+        new_count = 0
+        for market in payload:
+            market_id = str(market.get("id") or market.get("conditionId") or market.get("question"))
+            if market_id in seen:
+                continue
+            seen.add(market_id)
+            collected.append(market)
+            new_count += 1
+        if len(payload) < page_size or new_count == 0:
+            break
+    return collected
 
 
 @st.cache_data(ttl=300)
 def pull_markets():
-    """Stable market discovery fallback using Polymarket Gamma.
+    """Discover active binary financial price contracts from Gamma.
 
-    This intentionally restores the last working discovery path while retaining
-    the newer barrier, execution-filter, logging, analytics, and UI-safety logic.
-    It avoids the MCP browse-response mapping issue that caused financial
-    markets to be misclassified or rejected.
+    The pipeline first enforces active/accepting-order and binary YES/NO rules,
+    then requires a resolvable financial underlying before applying price-market
+    language. Generic sports, esports, weather and geopolitical numbers are never
+    sent to Yahoo Finance or to the probability engine.
     """
-    url = "https://gamma-api.polymarket.com/markets"
-
-    # Gamma currently caps individual responses, so paginate instead of assuming
-    # one large request returns the full active catalogue. Sorting by end date
-    # brings near-term contracts forward while still allowing up to 60 days.
-    page_size = 100
-    max_pages = 20
-    markets_raw = []
-    seen_market_ids = set()
-
-    for page_number in range(max_pages):
-        params = {
-            "closed": "false",
-            "limit": page_size,
-            "offset": page_number * page_size,
-            "order": "endDate",
-            "ascending": "true",
-        }
-
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
-        page = response.json()
-        if not isinstance(page, list) or not page:
-            break
-
-        new_items = 0
-        for market in page:
-            market_id = str(market.get("id", "")).strip()
-            dedupe_key = market_id or str(market.get("conditionId", "")).strip() or str(market.get("question", "")).strip()
-            if not dedupe_key or dedupe_key in seen_market_ids:
-                continue
-            seen_market_ids.add(dedupe_key)
-            markets_raw.append(market)
-            new_items += 1
-
-        if len(page) < page_size or new_items == 0:
-            break
-
+    markets_raw = _fetch_gamma_catalog()
+    now_utc = pd.Timestamp.now(tz="UTC")
     rows = []
-    for m in markets_raw:
-        try:
-            outcome_prices = json.loads(m.get("outcomePrices", "[]"))
-        except Exception:
-            outcome_prices = []
 
-        # The current model and executor require a binary YES/NO market.
-        if len(outcome_prices) != 2:
+    for m in markets_raw:
+        question = str(m.get("question") or "").strip()
+        if not question:
+            continue
+        if bool(m.get("closed", False)) or bool(m.get("archived", False)):
+            continue
+        if m.get("active") is False or m.get("acceptingOrders") is False:
+            continue
+
+        outcomes = _parse_json_list(m.get("outcomes"))
+        prices = _parse_json_list(m.get("outcomePrices"))
+        token_ids = _parse_json_list(m.get("clobTokenIds"))
+        normalized_outcomes = [str(x).strip().lower() for x in outcomes]
+        if len(prices) != 2 or len(token_ids) != 2:
+            continue
+        if normalized_outcomes and set(normalized_outcomes) != {"yes", "no"}:
+            continue
+
+        try:
+            yes_price, no_price = float(prices[0]), float(prices[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (0 <= yes_price <= 1 and 0 <= no_price <= 1):
+            continue
+
+        resolution = pd.to_datetime(m.get("endDate"), errors="coerce", utc=True)
+        if pd.isna(resolution) or resolution <= now_utc:
+            continue
+
+        # Cheap resolution pass first: aliases and explicit tickers only. Dynamic
+        # Yahoo search is attempted only if the wording clearly describes a price.
+        ticker = find_ticker(question, allow_dynamic=False)
+        text_lower = question.lower()
+        looks_like_price = any(re.search(pattern, text_lower) for pattern in PRICE_MARKET_PATTERNS)
+        if not ticker and looks_like_price and not any(word in text_lower for word in NON_PRICE_EVENT_WORDS):
+            ticker = find_ticker(question, allow_dynamic=True)
+        market_type = classify_market(question, ticker=ticker)
+        if market_type == "event":
             continue
 
         rows.append({
             "Market ID": m.get("id"),
-            "Market": m.get("question"),
-            "Resolution Date": m.get("endDate"),
-            "Market Start Date": m.get("startDate") or m.get("createdAt"),
-            "Market Prob %": float(outcome_prices[0]) * 100,
-            "No Prob %": float(outcome_prices[1]) * 100,
+            "Market": question,
+            "Resolution Date": resolution,
+            "Market Start Date": pd.to_datetime(
+                m.get("startDate") or m.get("createdAt"), errors="coerce", utc=True
+            ),
+            "Market Prob %": yes_price * 100,
+            "No Prob %": no_price * 100,
             "Volume": pd.to_numeric(m.get("volumeNum"), errors="coerce"),
             "Liquidity": pd.to_numeric(m.get("liquidityNum"), errors="coerce"),
-            "clobTokenIds": m.get("clobTokenIds"),
+            "clobTokenIds": token_ids,
+            "Ticker": ticker,
+            "Market Type": market_type,
         })
 
-    df = pd.DataFrame(rows)
+    columns = [
+        "Market ID", "Market", "Resolution Date", "Market Start Date",
+        "Market Prob %", "No Prob %", "Volume", "Liquidity", "clobTokenIds",
+        "Ticker", "Market Type",
+    ]
+    df = pd.DataFrame(rows, columns=columns)
     if df.empty:
-        return df
+        empty = pd.DataFrame(columns=columns + [
+            "Hours Remaining", "Days", "Asset Phrase", "Target", "Upper",
+            "Direction", "Barrier Already Hit", "Screen Result",
+        ])
+        empty.attrs["scan_stats"] = {
+            "all_binary_markets": len(markets_raw),
+            "binary_price_markets": 0,
+            "eligible_markets": 0,
+            "rejected_markets": 0,
+        }
+        empty.attrs["rejections"] = pd.DataFrame()
+        return empty
 
-    df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
-    df["Market Start Date"] = pd.to_datetime(df["Market Start Date"], errors="coerce", utc=True)
-    now_utc = pd.Timestamp.now(tz="UTC")
-    df["Hours Remaining"] = (
-        df["Resolution Date"] - now_utc
-    ).dt.total_seconds() / 3600
-    # Generic fractional calendar days for screening and non-close markets.
+    df = df.drop_duplicates(subset=["Market ID"], keep="first")
+    df["Hours Remaining"] = (df["Resolution Date"] - now_utc).dt.total_seconds() / 3600
     df["Days"] = df["Hours Remaining"] / 24
-    df["Market Type"] = df["Market"].apply(classify_market)
-
-    # For same-day closing markets, volatility should scale to the fraction of
-    # a 6.5-hour US trading session still remaining, not a rounded calendar day.
     same_day_close = (
         df["Market Type"].eq("daily_close")
         & df["Resolution Date"].dt.date.eq(now_utc.date())
@@ -986,62 +1068,55 @@ def pull_markets():
     )
     df.loc[same_day_close, "Days"] = df.loc[same_day_close, "Hours Remaining"] / 6.5
 
-    financial_candidates = df[df["Market Type"].isin(["price", "barrier", "range", "daily_close"])].copy()
-    financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
-    financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
-    financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
-    # Only range markets need an upper price. This prevents date numbers such
-    # as the "31" in "July 31" from appearing as a false upper bound.
-    # Create Upper as an explicit float column. Newer pandas versions reject
-    # assigning an object-typed Series into a float column, even when the
-    # values are numeric. Coerce the parsed range bounds before assignment.
-    financial_candidates["Upper"] = pd.Series(
-        np.nan,
-        index=financial_candidates.index,
-        dtype="float64",
-    )
-    range_mask = financial_candidates["Market Type"].eq("range")
+    df["Asset Phrase"] = df["Market"].apply(extract_asset_phrase)
+    df["Target"] = pd.to_numeric(df["Market"].apply(extract_target), errors="coerce")
+    df["Upper"] = pd.Series(np.nan, index=df.index, dtype="float64")
+    range_mask = df["Market Type"].eq("range")
     if range_mask.any():
-        parsed_upper = pd.to_numeric(
-            financial_candidates.loc[range_mask, "Market"].apply(extract_upper),
-            errors="coerce",
-        ).astype("float64")
-        financial_candidates.loc[range_mask, "Upper"] = parsed_upper.to_numpy()
-    financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
-    financial_candidates["Barrier Already Hit"] = False
-    barrier_mask = financial_candidates["Market Type"].eq("barrier")
-    for idx, barrier_row in financial_candidates.loc[barrier_mask].iterrows():
-        financial_candidates.at[idx, "Barrier Already Hit"] = barrier_already_hit(
-            barrier_row["Ticker"],
-            barrier_row["Target"],
-            barrier_row["Direction"],
-            barrier_row["Market Start Date"],
-        ) if pd.notna(barrier_row["Ticker"]) and pd.notna(barrier_row["Target"]) else False
+        df.loc[range_mask, "Upper"] = pd.to_numeric(
+            df.loc[range_mask, "Market"].apply(extract_upper), errors="coerce"
+        ).to_numpy(dtype=float)
+    df["Direction"] = df["Market"].apply(infer_direction)
+    df["Barrier Already Hit"] = False
+
+    barrier_mask = df["Market Type"].eq("barrier") & df["Ticker"].notna() & df["Target"].notna()
+    for idx, barrier_row in df.loc[barrier_mask].iterrows():
+        df.at[idx, "Barrier Already Hit"] = barrier_already_hit(
+            barrier_row["Ticker"], barrier_row["Target"],
+            barrier_row["Direction"], barrier_row["Market Start Date"],
+        )
 
     def rejection_reason(row):
-        if pd.isna(row["Resolution Date"]): return "Missing resolution date"
-        if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip(): return "Asset could not be resolved"
-        if pd.isna(row["Target"]): return "Target price could not be parsed"
-        if row["Market Type"] == "range" and pd.isna(row["Upper"]): return "Upper range could not be parsed"
-        if row.get("Market Type") == "barrier" and bool(row.get("Barrier Already Hit", False)):
+        if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip():
+            return "Asset could not be resolved"
+        if pd.isna(row["Target"]):
+            return "Target price could not be parsed"
+        if row["Market Type"] == "range" and pd.isna(row["Upper"]):
+            return "Upper range could not be parsed"
+        if row["Market Type"] == "barrier" and bool(row["Barrier Already Hit"]):
             return "Barrier was already hit before screening"
-        if row["Days"] < 0: return "Market already expired"
-        if row["Days"] > MAX_DAYS: return f"More than {MAX_DAYS} days to expiry"
-        if pd.isna(row["Liquidity"]) or row["Liquidity"] < MIN_LIQUIDITY: return "Insufficient liquidity"
+        if row["Days"] < 0:
+            return "Market already expired"
+        if row["Days"] > MAX_DAYS:
+            return f"More than {MAX_DAYS} days to expiry"
+        if pd.isna(row["Liquidity"]) or float(row["Liquidity"]) < MIN_LIQUIDITY:
+            return "Insufficient liquidity"
         return "Eligible"
 
-    financial_candidates["Screen Result"] = financial_candidates.apply(rejection_reason, axis=1)
-    eligible = financial_candidates[financial_candidates["Screen Result"] == "Eligible"].copy()
+    df["Screen Result"] = df.apply(rejection_reason, axis=1)
+    eligible = df[df["Screen Result"].eq("Eligible")].copy()
+    rejected = df[~df["Screen Result"].eq("Eligible")].copy()
 
     eligible.attrs["scan_stats"] = {
-        "all_binary_markets": len(df),
-        "binary_price_markets": len(financial_candidates),
+        "all_binary_markets": len(markets_raw),
+        "binary_price_markets": len(df),
         "eligible_markets": len(eligible),
-        "rejected_markets": len(financial_candidates) - len(eligible),
+        "rejected_markets": len(rejected),
     }
-    eligible.attrs["rejections"] = financial_candidates[
-        financial_candidates["Screen Result"] != "Eligible"
-    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Barrier Already Hit", "Liquidity", "Hours Remaining", "Days"]]
+    eligible.attrs["rejections"] = rejected[[
+        "Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result",
+        "Barrier Already Hit", "Liquidity", "Hours Remaining", "Days",
+    ]]
     return eligible
 
 def get_news(ticker, limit=5):
