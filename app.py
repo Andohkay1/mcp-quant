@@ -589,20 +589,56 @@ def find_ticker(market):
 
 @st.cache_data(ttl=300)
 def pull_markets():
-    """Scan all fetched Polymarket markets and keep model-compatible binary price markets."""
+    """Paginate the stable Gamma discovery feed and keep supported price markets.
+
+    Only market retrieval is expanded here. The model, execution, journal, and
+    approval logic remain unchanged.
+    """
     url = "https://gamma-api.polymarket.com/markets"
-    params = {
-        "closed": "false",
-        "limit": 1000,
-        "order": "volume",
-        "ascending": "false",
-    }
-    response = requests.get(url, params=params, timeout=20)
-    response.raise_for_status()
-    markets_raw = response.json()
+    page_size = 100
+    max_pages = 20  # up to 2,000 active markets per scan
+    markets_raw = []
+    seen_ids = set()
+
+    for page_number in range(max_pages):
+        offset = page_number * page_size
+        params = {
+            "closed": "false",
+            "active": "true",
+            "limit": page_size,
+            "offset": offset,
+            "order": "volume",
+            "ascending": "false",
+        }
+
+        response = requests.get(url, params=params, timeout=25)
+        response.raise_for_status()
+        page = response.json()
+
+        if not isinstance(page, list) or not page:
+            break
+
+        new_on_page = 0
+        for market in page:
+            market_id = str(market.get("id", "")).strip()
+            dedupe_key = market_id or str(market.get("conditionId", "")).strip() or str(market.get("question", "")).strip()
+            if not dedupe_key or dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            markets_raw.append(market)
+            new_on_page += 1
+
+        # A short page means the catalogue is exhausted. Also stop if the API
+        # returns a repeated page that adds nothing new.
+        if len(page) < page_size or new_on_page == 0:
+            break
 
     rows = []
     for m in markets_raw:
+        # Defensive checks in case Gamma returns stale records despite the query.
+        if bool(m.get("closed", False)) or m.get("active") is False:
+            continue
+
         try:
             outcome_prices = json.loads(m.get("outcomePrices", "[]"))
         except Exception:
@@ -612,12 +648,18 @@ def pull_markets():
         if len(outcome_prices) != 2:
             continue
 
+        try:
+            yes_probability = float(outcome_prices[0]) * 100
+            no_probability = float(outcome_prices[1]) * 100
+        except (TypeError, ValueError):
+            continue
+
         rows.append({
             "Market ID": m.get("id"),
             "Market": m.get("question"),
             "Resolution Date": m.get("endDate"),
-            "Market Prob %": float(outcome_prices[0]) * 100,
-            "No Prob %": float(outcome_prices[1]) * 100,
+            "Market Prob %": yes_probability,
+            "No Prob %": no_probability,
             "Volume": pd.to_numeric(m.get("volumeNum"), errors="coerce"),
             "Liquidity": pd.to_numeric(m.get("liquidityNum"), errors="coerce"),
             "clobTokenIds": m.get("clobTokenIds"),
@@ -627,6 +669,7 @@ def pull_markets():
     if df.empty:
         return df
 
+    df = df.drop_duplicates(subset=["Market ID"], keep="first")
     df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
     df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.total_seconds() / 86400
     df["Market Type"] = df["Market"].apply(classify_market)
@@ -638,7 +681,10 @@ def pull_markets():
     financial_candidates["Upper"] = pd.Series(np.nan, index=financial_candidates.index, dtype="float64")
     range_mask = financial_candidates["Market Type"].eq("range")
     if range_mask.any():
-        parsed_upper = pd.to_numeric(financial_candidates.loc[range_mask, "Market"].apply(extract_upper), errors="coerce")
+        parsed_upper = pd.to_numeric(
+            financial_candidates.loc[range_mask, "Market"].apply(extract_upper),
+            errors="coerce",
+        )
         financial_candidates.loc[range_mask, "Upper"] = parsed_upper.to_numpy()
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
 
@@ -660,11 +706,13 @@ def pull_markets():
         "binary_price_markets": len(financial_candidates),
         "eligible_markets": len(eligible),
         "rejected_markets": len(financial_candidates) - len(eligible),
+        "catalogue_markets_fetched": len(markets_raw),
     }
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
     ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
     return eligible
+
 
 def get_news(ticker, limit=5):
     query = ticker.replace("-", " ")
