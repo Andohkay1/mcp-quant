@@ -29,6 +29,9 @@ MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
 MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
 MIN_SELECTED_MODEL_PROB_PCT = 55.0
 MIN_TRADING_DAYS_REMAINING = 0.01
+MAX_AUTO_APPROVAL_PROB_PCT = 95.0
+MIN_TARGET_TO_SPOT_RATIO = 0.10
+MAX_TARGET_TO_SPOT_RATIO = 10.0
 
 
 def _safe_float(value, default=0.0):
@@ -62,6 +65,10 @@ def evaluate_execution_approval(row):
         reasons.append(f"selected-outcome model probability below {MIN_SELECTED_MODEL_PROB_PCT:.0f}%")
     if days_remaining < MIN_TRADING_DAYS_REMAINING:
         reasons.append("too little trading time remaining")
+    if selected_model_probability > MAX_AUTO_APPROVAL_PROB_PCT:
+        reasons.append(f"model probability above {MAX_AUTO_APPROVAL_PROB_PCT:.0f}% requires manual review")
+    if bool(row.get("Manual Review Required", False)):
+        reasons.append(str(row.get("Review Reason", "manual review required")))
     approved = not reasons
     return approved, ("Approved" if approved else "; ".join(reasons)), selected_model_probability
 
@@ -329,7 +336,14 @@ class MCPQuantEngine:
         market_type = row["Market Type"]
 
         close = self.get_prices(ticker, "1y")
-        current = close.iloc[-1]
+        if close.empty:
+            raise ValueError(f"No price history returned for {ticker}")
+        current = float(close.iloc[-1])
+        target_ratio = float(target) / current if current > 0 else np.nan
+        if not np.isfinite(target_ratio) or not (MIN_TARGET_TO_SPOT_RATIO <= target_ratio <= MAX_TARGET_TO_SPOT_RATIO):
+            raise ValueError(
+                f"Parsed target {target} is implausible relative to current price {current:.4f}"
+            )
 
         if market_type == "range" and pd.notna(upper):
             ewma = self.range_probability(ticker, target, upper, days)
@@ -351,7 +365,7 @@ class MCPQuantEngine:
         if direction == "below":
             mom_adj = -mom_adj
 
-        final = max(0.01, min(99.99, base + mom_adj))
+        final = max(0.5, min(99.5, base + mom_adj))
 
         model_yes = final
         model_no = 100 - final
@@ -420,6 +434,11 @@ class MCPQuantEngine:
             "Entry Price %": round(entry_price, 2),
             "Position Size $": size,
             "clobTokenIds": row["clobTokenIds"],
+            "Manual Review Required": bool(max(final, 100 - final) > MAX_AUTO_APPROVAL_PROB_PCT),
+            "Review Reason": (
+                "extreme model probability requires calibration review"
+                if max(final, 100 - final) > MAX_AUTO_APPROVAL_PROB_PCT else ""
+            ),
         }
         approved, reason, selected_prob = evaluate_execution_approval(result)
         result["Selected Model Prob %"] = round(selected_prob, 2)
@@ -468,29 +487,81 @@ PRICE_MARKET_PATTERNS = [
 ]
 
 NON_PRICE_EVENT_WORDS = [
-    "earnings", "revenue", "eps", "market cap", "acquire", "acquisition",
+    "earnings", "revenue", "eps", "market cap", "fdv", "fully diluted valuation",
+    "reserves", "inventory", "inventories", "barrels", "transits", "shipments",
+    "strait of hormuz", "production", "supply", "demand", "acquire", "acquisition",
     "merger", "ipo", "etf approval", "approve", "regulation", "lawsuit",
     "ceo", "president", "election", "nominee", "fed chair", "interest rate",
     "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
     "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
+    "total kills", "total rounds", "map 1", "map 2", "map 3", "temperature",
 ]
 
 
-def classify_market(market):
-    """Classify only binary financial price markets supported by the model."""
-    text = str(market or "").lower().strip()
+def _clean_numeric_token(token):
+    token = str(token).replace(",", "").replace("$", "").strip()
+    multiplier = 1.0
+    if token and token[-1:].lower() in {"k", "m", "b", "t"}:
+        multiplier = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[token[-1].lower()]
+        token = token[:-1]
+    try:
+        return float(token) * multiplier
+    except (TypeError, ValueError):
+        return None
 
+
+def extract_price_levels(market):
+    """Extract only contract price levels, ignoring dates and asset-name numbers."""
+    text = str(market or "").replace(",", "")
+
+    # Range contracts: parse values only after the word 'between'.
+    range_match = re.search(
+        r"\bbetween\s+\$?([0-9]+(?:\.[0-9]+)?[kmbt]?)\s+(?:and|to|-)\s+\$?([0-9]+(?:\.[0-9]+)?[kmbt]?)",
+        text,
+        flags=re.I,
+    )
+    if range_match:
+        lower = _clean_numeric_token(range_match.group(1))
+        upper = _clean_numeric_token(range_match.group(2))
+        return [x for x in (lower, upper) if x is not None]
+
+    # Prefer an explicit dollar level anywhere in the question.
+    dollar_matches = re.findall(r"\$\s*([0-9]+(?:\.[0-9]+)?[kmbt]?)", text, flags=re.I)
+    if dollar_matches:
+        values = [_clean_numeric_token(x) for x in dollar_matches]
+        return [x for x in values if x is not None]
+
+    # Otherwise parse the number immediately following a resolution verb.
+    trigger = re.search(
+        r"\b(?:reach|hit|touch|dip\s+to|fall\s+to|rise\s+to|close(?:s)?\s+(?:above|below|over|under)|"
+        r"finish(?:es)?\s+(?:above|below|over|under)|settle(?:s)?\s+(?:above|below|over|under)|"
+        r"be\s+(?:above|below|over|under)|price\s+(?:of\s+[^?]+?\s+)?(?:above|below|over|under|less\s+than|greater\s+than))"
+        r"\s*\$?([0-9]+(?:\.[0-9]+)?[kmbt]?)",
+        text,
+        flags=re.I,
+    )
+    if trigger:
+        value = _clean_numeric_token(trigger.group(1))
+        return [value] if value is not None else []
+
+    return []
+
+
+def classify_market(market):
+    """Classify only model-compatible asset-price contracts."""
+    text = str(market or "").lower().strip()
     if any(word in text for word in NON_PRICE_EVENT_WORDS):
         return "event"
-    if "between" in text and len(extract_numbers(text)) >= 2:
+    levels = extract_price_levels(market)
+    if "between" in text and len(levels) == 2:
         return "range"
     if re.search(r"\b(?:close|closes|finish|finishes|settle|settles)\b", text) and re.search(
         r"\b(?:above|below|over|under)\b", text
-    ):
+    ) and levels:
         return "daily_close"
     if re.search(r"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\b", text) or re.search(r"\((?:high|low)\)", text):
-        return "barrier"
-    if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
+        return "barrier" if levels else "event"
+    if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS) and levels:
         return "price"
     return "event"
 
@@ -503,26 +574,17 @@ def infer_direction(market):
 
 
 def extract_numbers(market):
-    text = str(market or "").replace(",", "")
-    # Prefer explicit prices and large index levels; remove dates and percentages.
-    raw = re.findall(r"(?<![%\w])\$?(\d+(?:\.\d+)?)", text)
-    values = []
-    for item in raw:
-        value = float(item)
-        if 1900 <= value <= 2100:  # likely a year
-            continue
-        values.append(value)
-    return values
+    return extract_price_levels(market)
 
 
 def extract_target(market):
-    nums = extract_numbers(market)
-    return nums[0] if nums else None
+    levels = extract_price_levels(market)
+    return levels[0] if levels else None
 
 
 def extract_upper(market):
-    nums = extract_numbers(market)
-    return nums[1] if len(nums) > 1 else None
+    levels = extract_price_levels(market)
+    return levels[1] if len(levels) > 1 else None
 
 
 def extract_asset_phrase(market):
@@ -692,6 +754,9 @@ def pull_markets():
         if pd.isna(row["Resolution Date"]): return "Missing resolution date"
         if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip(): return "Asset could not be resolved"
         if pd.isna(row["Target"]): return "Target price could not be parsed"
+        if any(term in str(row["Market"]).lower() for term in [
+            "reserves", "inventory", "inventories", "transits", "fdv", "market cap", "production"
+        ]): return "Underlying variable is not the asset price"
         if row["Market Type"] == "range" and pd.isna(row["Upper"]): return "Upper range could not be parsed"
         if row["Days"] < 0: return "Market already expired"
         if row["Days"] > MAX_DAYS: return f"More than {MAX_DAYS} days to expiry"
