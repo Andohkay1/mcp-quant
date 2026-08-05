@@ -29,9 +29,6 @@ MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
 MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
 MIN_SELECTED_MODEL_PROB_PCT = 55.0
 MIN_TRADING_DAYS_REMAINING = 0.01
-MAX_AUTO_APPROVAL_PROB_PCT = 95.0
-MIN_TARGET_TO_SPOT_RATIO = 0.10
-MAX_TARGET_TO_SPOT_RATIO = 10.0
 
 
 def _safe_float(value, default=0.0):
@@ -65,10 +62,6 @@ def evaluate_execution_approval(row):
         reasons.append(f"selected-outcome model probability below {MIN_SELECTED_MODEL_PROB_PCT:.0f}%")
     if days_remaining < MIN_TRADING_DAYS_REMAINING:
         reasons.append("too little trading time remaining")
-    if selected_model_probability > MAX_AUTO_APPROVAL_PROB_PCT:
-        reasons.append(f"model probability above {MAX_AUTO_APPROVAL_PROB_PCT:.0f}% requires manual review")
-    if bool(row.get("Manual Review Required", False)):
-        reasons.append(str(row.get("Review Reason", "manual review required")))
     approved = not reasons
     return approved, ("Approved" if approved else "; ".join(reasons)), selected_model_probability
 
@@ -186,40 +179,15 @@ def token_for_signal(row):
     raise RuntimeError("The selected market is not an actionable BUY signal.")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_close_prices(ticker, period="5y"):
-    """Download and cache adjusted close prices so each ticker/period is fetched once per scan."""
-    data = yf.download(
-        ticker, period=period, auto_adjust=True, progress=False, threads=False
-    )
-    if data is None or data.empty or "Close" not in data:
-        return pd.Series(dtype=float)
-    close = data["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    return pd.to_numeric(close, errors="coerce").dropna()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_ohlc_prices(ticker, period="5y", interval="1d"):
-    """Download and cache OHLC data used by barrier calculations."""
-    data = yf.download(
-        ticker, period=period, interval=interval, auto_adjust=True,
-        progress=False, threads=False
-    )
-    if data is None or data.empty:
-        return pd.DataFrame()
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    return data.dropna(how="all")
-
-
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
-        close = cached_close_prices(str(ticker), period)
-        if close.empty:
-            raise RuntimeError(f"No Yahoo Finance price history returned for {ticker}.")
-        return close.copy()
+        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+        close = data["Close"]
+
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+
+        return close.dropna()
 
     def ewma_volatility(self, close):
         returns = np.log(close / close.shift(1)).dropna()
@@ -257,10 +225,10 @@ class MCPQuantEngine:
         return (future_returns <= required_return).mean() * 100
 
     def get_ohlc(self, ticker, period="5y", interval="1d"):
-        data = cached_ohlc_prices(str(ticker), period, interval)
-        if data.empty:
-            raise RuntimeError(f"No Yahoo Finance OHLC history returned for {ticker}.")
-        return data.copy()
+        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        return data.dropna(how="all")
 
     def ewma_barrier_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
@@ -361,14 +329,7 @@ class MCPQuantEngine:
         market_type = row["Market Type"]
 
         close = self.get_prices(ticker, "1y")
-        if close.empty:
-            raise ValueError(f"No price history returned for {ticker}")
-        current = float(close.iloc[-1])
-        target_ratio = float(target) / current if current > 0 else np.nan
-        if not np.isfinite(target_ratio) or not (MIN_TARGET_TO_SPOT_RATIO <= target_ratio <= MAX_TARGET_TO_SPOT_RATIO):
-            raise ValueError(
-                f"Parsed target {target} is implausible relative to current price {current:.4f}"
-            )
+        current = close.iloc[-1]
 
         if market_type == "range" and pd.notna(upper):
             ewma = self.range_probability(ticker, target, upper, days)
@@ -390,7 +351,7 @@ class MCPQuantEngine:
         if direction == "below":
             mom_adj = -mom_adj
 
-        final = max(0.5, min(99.5, base + mom_adj))
+        final = max(0.01, min(99.99, base + mom_adj))
 
         model_yes = final
         model_no = 100 - final
@@ -459,11 +420,6 @@ class MCPQuantEngine:
             "Entry Price %": round(entry_price, 2),
             "Position Size $": size,
             "clobTokenIds": row["clobTokenIds"],
-            "Manual Review Required": bool(max(final, 100 - final) > MAX_AUTO_APPROVAL_PROB_PCT),
-            "Review Reason": (
-                "extreme model probability requires calibration review"
-                if max(final, 100 - final) > MAX_AUTO_APPROVAL_PROB_PCT else ""
-            ),
         }
         approved, reason, selected_prob = evaluate_execution_approval(result)
         result["Selected Model Prob %"] = round(selected_prob, 2)
@@ -513,80 +469,37 @@ PRICE_MARKET_PATTERNS = [
 
 NON_PRICE_EVENT_WORDS = [
     "earnings", "revenue", "eps", "market cap", "fdv", "fully diluted valuation",
-    "reserves", "inventory", "inventories", "barrels", "transits", "shipments",
-    "strait of hormuz", "production", "supply", "demand", "acquire", "acquisition",
-    "merger", "ipo", "etf approval", "approve", "regulation", "lawsuit",
-    "ceo", "president", "election", "nominee", "fed chair", "interest rate",
-    "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
-    "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
-    "total kills", "total rounds", "map 1", "map 2", "map 3", "temperature",
+    "acquire", "acquisition", "merger", "ipo", "etf approval", "approve",
+    "regulation", "lawsuit", "ceo", "president", "election", "nominee",
+    "fed chair", "interest rate", "cpi", "inflation", "gdp", "unemployment",
+    "tariff", "win", "wins", "champion", "world cup", "ufc", "nba",
+    "nfl", "mlb", "tennis",
+]
+
+UNSUPPORTED_PRICE_VARIABLE_TERMS = [
+    "reserve", "reserves", "inventory", "inventories", "stockpile", "stockpiles",
+    "transit", "transits", "ship", "ships", "shipping", "tanker", "tankers",
+    "production", "output", "supply", "demand", "export", "exports", "import",
+    "imports", "barrels per day", "bpd", "daily volume", "trading volume",
+    "market capitalization", "circulating supply", "total value locked", "tvl",
 ]
 
 
-def _clean_numeric_token(token):
-    token = str(token).replace(",", "").replace("$", "").strip()
-    multiplier = 1.0
-    if token and token[-1:].lower() in {"k", "m", "b", "t"}:
-        multiplier = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[token[-1].lower()]
-        token = token[:-1]
-    try:
-        return float(token) * multiplier
-    except (TypeError, ValueError):
-        return None
-
-
-def extract_price_levels(market):
-    """Extract only contract price levels, ignoring dates and asset-name numbers."""
-    text = str(market or "").replace(",", "")
-
-    # Range contracts: parse values only after the word 'between'.
-    range_match = re.search(
-        r"\bbetween\s+\$?([0-9]+(?:\.[0-9]+)?[kmbt]?)\s+(?:and|to|-)\s+\$?([0-9]+(?:\.[0-9]+)?[kmbt]?)",
-        text,
-        flags=re.I,
-    )
-    if range_match:
-        lower = _clean_numeric_token(range_match.group(1))
-        upper = _clean_numeric_token(range_match.group(2))
-        return [x for x in (lower, upper) if x is not None]
-
-    # Prefer an explicit dollar level anywhere in the question.
-    dollar_matches = re.findall(r"\$\s*([0-9]+(?:\.[0-9]+)?[kmbt]?)", text, flags=re.I)
-    if dollar_matches:
-        values = [_clean_numeric_token(x) for x in dollar_matches]
-        return [x for x in values if x is not None]
-
-    # Otherwise parse the number immediately following a resolution verb.
-    trigger = re.search(
-        r"\b(?:reach|hit|touch|dip\s+to|fall\s+to|rise\s+to|close(?:s)?\s+(?:above|below|over|under)|"
-        r"finish(?:es)?\s+(?:above|below|over|under)|settle(?:s)?\s+(?:above|below|over|under)|"
-        r"be\s+(?:above|below|over|under)|price\s+(?:of\s+[^?]+?\s+)?(?:above|below|over|under|less\s+than|greater\s+than))"
-        r"\s*\$?([0-9]+(?:\.[0-9]+)?[kmbt]?)",
-        text,
-        flags=re.I,
-    )
-    if trigger:
-        value = _clean_numeric_token(trigger.group(1))
-        return [value] if value is not None else []
-
-    return []
-
-
 def classify_market(market):
-    """Classify only model-compatible asset-price contracts."""
+    """Classify only binary financial price markets supported by the model."""
     text = str(market or "").lower().strip()
+
     if any(word in text for word in NON_PRICE_EVENT_WORDS):
         return "event"
-    levels = extract_price_levels(market)
-    if "between" in text and len(levels) == 2:
+    if "between" in text and len(extract_numbers(text)) >= 2:
         return "range"
     if re.search(r"\b(?:close|closes|finish|finishes|settle|settles)\b", text) and re.search(
         r"\b(?:above|below|over|under)\b", text
-    ) and levels:
+    ):
         return "daily_close"
     if re.search(r"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\b", text) or re.search(r"\((?:high|low)\)", text):
-        return "barrier" if levels else "event"
-    if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS) and levels:
+        return "barrier"
+    if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
         return "price"
     return "event"
 
@@ -598,19 +511,50 @@ def infer_direction(market):
     return "above"
 
 
+def _to_number(raw_value):
+    """Convert a price token such as $1,900, 74.5, 225M, or 1.2k to float."""
+    if raw_value is None:
+        return None
+    token = str(raw_value).strip().replace("$", "").replace(",", "").replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMbBtT]?)", token)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value * {"": 1.0, "k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[match.group(2).lower()]
+
+
+def _context_price_matches(market):
+    """Extract contract price levels while ignoring dates and asset-name numbers."""
+    text = str(market or "")
+    number = r"\$?\s*(\d[\d,]*(?:\.\d+)?\s*[kKmMbBtT]?)"
+    patterns = [
+        rf"\b(?:between|from)\s+{number}\s+(?:and|to)\s+{number}",
+        rf"\b(?:close|closes|closed|finish|finishes|finished|settle|settles|settled)\s+(?:at|above|below|over|under|greater than|less than)\s+{number}",
+        rf"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\s+{number}",
+        rf"\b(?:be|remain|end|ends|ending|trade)\s+(?:at|above|below|over|under|greater than|less than)\s+{number}",
+        rf"\b(?:above|below|over|under|greater than|less than)\s+{number}",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            values = [_to_number(group) for group in match.groups()]
+            return [value for value in values if value is not None]
+    dollar_matches = re.findall(r"\$\s*(\d[\d,]*(?:\.\d+)?\s*[kKmMbBtT]?)", text)
+    return [value for value in (_to_number(x) for x in dollar_matches) if value is not None]
+
+
 def extract_numbers(market):
-    return extract_price_levels(market)
+    return _context_price_matches(market)
 
 
 def extract_target(market):
-    levels = extract_price_levels(market)
-    return levels[0] if levels else None
+    nums = _context_price_matches(market)
+    return nums[0] if nums else None
 
 
 def extract_upper(market):
-    levels = extract_price_levels(market)
-    return levels[1] if len(levels) > 1 else None
-
+    nums = _context_price_matches(market)
+    return nums[1] if len(nums) > 1 else None
 
 def extract_asset_phrase(market):
     """Extract the likely underlying name from a binary price question."""
@@ -776,12 +720,12 @@ def pull_markets():
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
 
     def rejection_reason(row):
+        market_text = str(row.get("Market", "")).lower()
         if pd.isna(row["Resolution Date"]): return "Missing resolution date"
+        if any(term in market_text for term in UNSUPPORTED_PRICE_VARIABLE_TERMS):
+            return "Unsupported non-price variable"
         if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip(): return "Asset could not be resolved"
-        if pd.isna(row["Target"]): return "Target price could not be parsed"
-        if any(term in str(row["Market"]).lower() for term in [
-            "reserves", "inventory", "inventories", "transits", "fdv", "market cap", "production"
-        ]): return "Underlying variable is not the asset price"
+        if pd.isna(row["Target"]): return "Explicit target price could not be parsed"
         if row["Market Type"] == "range" and pd.isna(row["Upper"]): return "Upper range could not be parsed"
         if row["Days"] < 0: return "Market already expired"
         if row["Days"] > MAX_DAYS: return f"More than {MAX_DAYS} days to expiry"
@@ -1334,6 +1278,39 @@ def update_results():
 
     return df, updates
 
+def add_forecasting_scores(closed):
+    """Add Brier scores for resolved binary forecasts. Lower is better."""
+    if closed is None or closed.empty:
+        return pd.DataFrame()
+    scored = closed.copy()
+    scored["Resolved YES"] = scored.get("Result", "").astype(str).str.upper().eq("YES").astype(int)
+    scored["Model Probability"] = pd.to_numeric(scored.get("Final Prob %"), errors="coerce") / 100.0
+    scored["Market Probability"] = pd.to_numeric(scored.get("Market Prob %"), errors="coerce") / 100.0
+    scored["Model Brier"] = (scored["Model Probability"] - scored["Resolved YES"]) ** 2
+    scored["Market Brier"] = (scored["Market Probability"] - scored["Resolved YES"]) ** 2
+    return scored.dropna(subset=["Model Probability", "Market Probability"])
+
+
+def calibration_table(scored):
+    if scored is None or scored.empty:
+        return pd.DataFrame()
+    work = scored.copy()
+    bins = [0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.0001]
+    labels = ["0-10%", "10-20%", "20-30%", "30-40%", "40-50%", "50-60%", "60-70%", "70-80%", "80-90%", "90-100%"]
+    work["Probability Band"] = pd.cut(work["Model Probability"], bins=bins, labels=labels, right=False, include_lowest=True)
+    table = work.groupby("Probability Band", observed=False).agg(
+        Forecasts=("Resolved YES", "size"),
+        Average_Model_Probability=("Model Probability", "mean"),
+        Actual_YES_Rate=("Resolved YES", "mean"),
+        Average_Brier=("Model Brier", "mean"),
+    ).reset_index()
+    table = table[table["Forecasts"] > 0]
+    table["Avg Model %"] = (table.pop("Average_Model_Probability") * 100).round(1)
+    table["Actual YES %"] = (table.pop("Actual_YES_Rate") * 100).round(1)
+    table["Avg Brier"] = table.pop("Average_Brier").round(4)
+    return table
+
+
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
 
@@ -1348,23 +1325,14 @@ with tab1:
 
         engine = MCPQuantEngine()
         scored = []
-        score_errors = []
-        total_to_score = len(markets_df)
-        progress = st.progress(0, text=f"Scoring 0 of {total_to_score} eligible markets...")
 
-        for position, (_, row) in enumerate(markets_df.iterrows(), start=1):
+        for _, row in markets_df.iterrows():
             try:
                 scored.append(engine.score_market(row))
-            except Exception as error:
-                score_errors.append({"Market": row.get("Market", ""), "Reason": str(error)})
-            progress.progress(
-                position / max(total_to_score, 1),
-                text=f"Scoring {position} of {total_to_score} eligible markets...",
-            )
+            except Exception:
+                pass
 
-        progress.empty()
         results = pd.DataFrame(scored)
-        st.session_state["score_errors"] = pd.DataFrame(score_errors)
         st.session_state["results"] = results
 
         if len(results) > 0:
@@ -1414,10 +1382,6 @@ with tab1:
 
         st.subheader("Top Trade Candidates")
         st.dataframe(results, use_container_width=True)
-        score_errors = st.session_state.get("score_errors", pd.DataFrame())
-        if isinstance(score_errors, pd.DataFrame) and not score_errors.empty:
-            with st.expander(f"See {len(score_errors)} markets skipped because price data or scoring failed"):
-                st.dataframe(score_errors, use_container_width=True)
 
         buys = results[results["Signal"].isin(["BUY YES", "BUY NO"]) & results.get("Execution Approved", False).fillna(False).astype(bool)]
 
@@ -1486,6 +1450,13 @@ with tab1:
             c3.metric("Edge", f"{explain['Edge %']}%")
     
             st.markdown("### Model Components")
+
+            st.markdown("#### Superforecasting reasoning")
+            st.write(f"**Outside view / base rate:** Historical probability = {explain['Historical Prob %']}%.")
+            st.write(f"**Current statistical view:** EWMA probability = {explain['EWMA Prob %']}%.")
+            st.write(f"**Evidence adjustment:** Momentum adjustment = {explain['Momentum Adj %']} percentage points.")
+            st.write(f"**Benchmark:** Polymarket YES = {explain['Market Prob %']}%; model YES = {explain['Final Prob %']}%.")
+            st.caption("Treat this as a testable probability, not a certainty. Save it, score it after resolution, and revise only when evidence supports a change.")
     
             st.write(f"**Market Type:** {explain['Type']}")
             st.write(f"**Direction:** {explain['Direction']}")
@@ -1736,5 +1707,28 @@ with tab3:
         if len(closed) > 0:
             st.subheader("PnL by Trade")
             st.bar_chart(closed["PnL"])
+
+
+            scored = add_forecasting_scores(closed)
+            if not scored.empty:
+                st.markdown("---")
+                st.subheader("Superforecasting Scorecard")
+                model_brier = float(scored["Model Brier"].mean())
+                market_brier = float(scored["Market Brier"].mean())
+                improvement = market_brier - model_brier
+                b1, b2, b3 = st.columns(3)
+                b1.metric("Model Brier Score", f"{model_brier:.4f}", help="Lower is better; 0 is perfect.")
+                b2.metric("Polymarket Brier", f"{market_brier:.4f}", help="Benchmark using the saved market probability.")
+                b3.metric("Brier Advantage", f"{improvement:+.4f}", help="Positive means the model beat Polymarket.")
+                st.caption("Brier score evaluates the full probability estimate and penalizes confident mistakes more heavily.")
+                st.subheader("Probability Calibration")
+                calibration = calibration_table(scored)
+                if calibration.empty:
+                    st.info("More resolved forecasts are needed for calibration bands.")
+                else:
+                    st.dataframe(calibration, use_container_width=True)
+                st.subheader("Resolved Forecast Audit")
+                audit_columns = ["Market", "Final Prob %", "Market Prob %", "Result", "Model Brier", "Market Brier", "PnL"]
+                st.dataframe(scored[[c for c in audit_columns if c in scored.columns]], use_container_width=True)
     else:
         st.info("No analytics available yet.")
