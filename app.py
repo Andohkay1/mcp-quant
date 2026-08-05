@@ -17,53 +17,13 @@ st.title("MCP Quant Dashboard")
 
 EDGE_THRESHOLD = 5
 MIN_LIQUIDITY = 250
-MAX_DAYS = 60
+MAX_DAYS = 10
 MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
 SPREADSHEET_NAME = "Polymarket Journal"
 WORKSHEET_NAME = "Trades"
 STARTING_BANKROLL = 100
 BUY_THRESHOLD = 6
-MIN_ACTIONABLE_EDGE = 8.0
-MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
-MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
-MIN_SELECTED_MODEL_PROB_PCT = 55.0
-MIN_TRADING_DAYS_REMAINING = 0.01
-
-
-def _safe_float(value, default=0.0):
-    try:
-        number = float(value)
-        return number if np.isfinite(number) else default
-    except (TypeError, ValueError):
-        return default
-
-
-def evaluate_execution_approval(row):
-    signal = str(row.get("Signal", ""))
-    edge = _safe_float(row.get("Edge %"), 0.0)
-    entry_price = _safe_float(row.get("Entry Price %"), 0.0)
-    days_remaining = _safe_float(row.get("Days"), 0.0)
-    model_yes = _safe_float(row.get("Final Prob %"), 0.0)
-    if signal == "BUY YES":
-        selected_model_probability = model_yes
-    elif signal == "BUY NO":
-        selected_model_probability = 100.0 - model_yes
-    else:
-        return False, "No BUY signal", 0.0
-    reasons = []
-    if edge < MIN_ACTIONABLE_EDGE:
-        reasons.append(f"edge below {MIN_ACTIONABLE_EDGE:.0f}%")
-    if entry_price < MIN_TRADABLE_ENTRY_PRICE_PCT:
-        reasons.append(f"entry price below {MIN_TRADABLE_ENTRY_PRICE_PCT:.0f}%")
-    if entry_price > MAX_TRADABLE_ENTRY_PRICE_PCT:
-        reasons.append(f"entry price above {MAX_TRADABLE_ENTRY_PRICE_PCT:.0f}%")
-    if selected_model_probability < MIN_SELECTED_MODEL_PROB_PCT:
-        reasons.append(f"selected-outcome model probability below {MIN_SELECTED_MODEL_PROB_PCT:.0f}%")
-    if days_remaining < MIN_TRADING_DAYS_REMAINING:
-        reasons.append("too little trading time remaining")
-    approved = not reasons
-    return approved, ("Approved" if approved else "; ".join(reasons)), selected_model_probability
 
 
 class MCPTradingClient:
@@ -203,7 +163,7 @@ class MCPQuantEngine:
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
 
-        sigma = vol * np.sqrt(max(float(days), 1 / 390) / 252)
+        sigma = vol * np.sqrt(max(days, 1) / 252)
         z = np.log(target / current) / sigma
 
         if direction == "above":
@@ -216,55 +176,12 @@ class MCPQuantEngine:
         current = close.iloc[-1]
 
         required_return = target / current - 1
-        historical_days = max(int(np.ceil(float(days))), 1)
-        future_returns = (close.shift(-historical_days) / close - 1).dropna()
+        future_returns = (close.shift(-days) / close - 1).dropna()
 
         if direction == "above":
             return (future_returns >= required_return).mean() * 100
 
         return (future_returns <= required_return).mean() * 100
-
-    def get_ohlc(self, ticker, period="5y", interval="1d"):
-        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        return data.dropna(how="all")
-
-    def ewma_barrier_probability(self, ticker, target, days, direction):
-        close = self.get_prices(ticker, "1y")
-        current = float(close.iloc[-1])
-        if direction == "above" and current >= float(target):
-            return 100.0
-        if direction == "below" and current <= float(target):
-            return 100.0
-        vol = float(self.ewma_volatility(close))
-        horizon_days = max(float(days), 1 / 390)
-        sigma_t = vol * np.sqrt(horizon_days / 252)
-        if not np.isfinite(sigma_t) or sigma_t <= 0:
-            return 0.0
-        log_distance = abs(np.log(float(target) / current))
-        probability = 2 * (1 - norm.cdf(log_distance / sigma_t))
-        return float(np.clip(probability * 100, 0.0, 100.0))
-
-    def historical_barrier_probability(self, ticker, target, days, direction, lookback=756):
-        ohlc = self.get_ohlc(ticker, period="5y", interval="1d").tail(lookback)
-        if ohlc.empty or not {"Close", "High", "Low"}.issubset(ohlc.columns):
-            return np.nan
-        current = float(ohlc["Close"].dropna().iloc[-1])
-        target_ratio = float(target) / current
-        horizon = max(int(np.ceil(float(days))), 1)
-        hits = []
-        for i in range(0, len(ohlc) - horizon):
-            start_price = float(ohlc["Close"].iloc[i])
-            if not np.isfinite(start_price) or start_price <= 0:
-                continue
-            window = ohlc.iloc[i + 1:i + horizon + 1]
-            if direction == "above":
-                hit = float(window["High"].max()) >= start_price * target_ratio
-            else:
-                hit = float(window["Low"].min()) <= start_price * target_ratio
-            hits.append(bool(hit))
-        return float(np.mean(hits) * 100) if hits else np.nan
 
     def momentum_score(self, ticker):
         close = self.get_prices(ticker, "1y")
@@ -311,7 +228,7 @@ class MCPQuantEngine:
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
 
-        sigma = vol * np.sqrt(max(float(days), 1 / 390) / 252)
+        sigma = vol * np.sqrt(max(days, 1) / 252)
 
         z_low = np.log(lower / current) / sigma
         z_high = np.log(upper / current) / sigma
@@ -323,7 +240,7 @@ class MCPQuantEngine:
         ticker = row["Ticker"]
         target = row["Target"]
         upper = row["Upper"]
-        days = max(float(row["Days"]), 1 / 390)
+        days = max(int(row["Days"]), 1)
         direction = row["Direction"]
         market_probability = row["Market Prob %"]
         market_type = row["Market Type"]
@@ -334,11 +251,6 @@ class MCPQuantEngine:
         if market_type == "range" and pd.notna(upper):
             ewma = self.range_probability(ticker, target, upper, days)
             hist = ewma
-        elif market_type == "barrier":
-            ewma = self.ewma_barrier_probability(ticker, target, days, direction)
-            hist = self.historical_barrier_probability(ticker, target, days, direction)
-            if pd.isna(hist):
-                hist = ewma
         else:
             ewma = self.ewma_probability(ticker, target, days, direction)
             hist = self.historical_probability(ticker, target, days, direction, 252)
@@ -393,7 +305,7 @@ class MCPQuantEngine:
             entry_side = ""
             entry_price = 0
 
-        result = {
+        return {
             "Market ID": row["Market ID"],
             "Market": market,
             "Ticker": ticker,
@@ -421,11 +333,6 @@ class MCPQuantEngine:
             "Position Size $": size,
             "clobTokenIds": row["clobTokenIds"],
         }
-        approved, reason, selected_prob = evaluate_execution_approval(result)
-        result["Selected Model Prob %"] = round(selected_prob, 2)
-        result["Execution Approved"] = approved
-        result["Execution Decision"] = reason
-        return result
 
 
 # Reliable aliases are checked first. Unknown assets are resolved dynamically
@@ -488,8 +395,6 @@ def classify_market(market):
         r"\b(?:above|below|over|under)\b", text
     ):
         return "daily_close"
-    if re.search(r"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\b", text) or re.search(r"\((?:high|low)\)", text):
-        return "barrier"
     if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
         return "price"
     return "event"
@@ -589,56 +494,20 @@ def find_ticker(market):
 
 @st.cache_data(ttl=300)
 def pull_markets():
-    """Paginate the stable Gamma discovery feed and keep supported price markets.
-
-    Only market retrieval is expanded here. The model, execution, journal, and
-    approval logic remain unchanged.
-    """
+    """Scan all fetched Polymarket markets and keep model-compatible binary price markets."""
     url = "https://gamma-api.polymarket.com/markets"
-    page_size = 100
-    max_pages = 20  # up to 2,000 active markets per scan
-    markets_raw = []
-    seen_ids = set()
-
-    for page_number in range(max_pages):
-        offset = page_number * page_size
-        params = {
-            "closed": "false",
-            "active": "true",
-            "limit": page_size,
-            "offset": offset,
-            "order": "volume",
-            "ascending": "false",
-        }
-
-        response = requests.get(url, params=params, timeout=25)
-        response.raise_for_status()
-        page = response.json()
-
-        if not isinstance(page, list) or not page:
-            break
-
-        new_on_page = 0
-        for market in page:
-            market_id = str(market.get("id", "")).strip()
-            dedupe_key = market_id or str(market.get("conditionId", "")).strip() or str(market.get("question", "")).strip()
-            if not dedupe_key or dedupe_key in seen_ids:
-                continue
-            seen_ids.add(dedupe_key)
-            markets_raw.append(market)
-            new_on_page += 1
-
-        # A short page means the catalogue is exhausted. Also stop if the API
-        # returns a repeated page that adds nothing new.
-        if len(page) < page_size or new_on_page == 0:
-            break
+    params = {
+        "closed": "false",
+        "limit": 1000,
+        "order": "volume",
+        "ascending": "false",
+    }
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    markets_raw = response.json()
 
     rows = []
     for m in markets_raw:
-        # Defensive checks in case Gamma returns stale records despite the query.
-        if bool(m.get("closed", False)) or m.get("active") is False:
-            continue
-
         try:
             outcome_prices = json.loads(m.get("outcomePrices", "[]"))
         except Exception:
@@ -648,18 +517,12 @@ def pull_markets():
         if len(outcome_prices) != 2:
             continue
 
-        try:
-            yes_probability = float(outcome_prices[0]) * 100
-            no_probability = float(outcome_prices[1]) * 100
-        except (TypeError, ValueError):
-            continue
-
         rows.append({
             "Market ID": m.get("id"),
             "Market": m.get("question"),
             "Resolution Date": m.get("endDate"),
-            "Market Prob %": yes_probability,
-            "No Prob %": no_probability,
+            "Market Prob %": float(outcome_prices[0]) * 100,
+            "No Prob %": float(outcome_prices[1]) * 100,
             "Volume": pd.to_numeric(m.get("volumeNum"), errors="coerce"),
             "Liquidity": pd.to_numeric(m.get("liquidityNum"), errors="coerce"),
             "clobTokenIds": m.get("clobTokenIds"),
@@ -669,23 +532,15 @@ def pull_markets():
     if df.empty:
         return df
 
-    df = df.drop_duplicates(subset=["Market ID"], keep="first")
     df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
-    df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.total_seconds() / 86400
+    df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.days
     df["Market Type"] = df["Market"].apply(classify_market)
 
-    financial_candidates = df[df["Market Type"].isin(["price", "barrier", "range", "daily_close"])].copy()
+    financial_candidates = df[df["Market Type"].isin(["price", "range", "daily_close"])].copy()
     financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
     financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
-    financial_candidates["Upper"] = pd.Series(np.nan, index=financial_candidates.index, dtype="float64")
-    range_mask = financial_candidates["Market Type"].eq("range")
-    if range_mask.any():
-        parsed_upper = pd.to_numeric(
-            financial_candidates.loc[range_mask, "Market"].apply(extract_upper),
-            errors="coerce",
-        )
-        financial_candidates.loc[range_mask, "Upper"] = parsed_upper.to_numpy()
+    financial_candidates["Upper"] = financial_candidates["Market"].apply(extract_upper)
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
 
     def rejection_reason(row):
@@ -706,13 +561,11 @@ def pull_markets():
         "binary_price_markets": len(financial_candidates),
         "eligible_markets": len(eligible),
         "rejected_markets": len(financial_candidates) - len(eligible),
-        "catalogue_markets_fetched": len(markets_raw),
     }
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
     ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
     return eligible
-
 
 def get_news(ticker, limit=5):
     query = ticker.replace("-", " ")
@@ -1266,7 +1119,6 @@ with tab1:
                 pass
 
         results = pd.DataFrame(scored)
-        st.session_state["results"] = results
 
         if len(results) > 0:
             results = results.sort_values("Edge %", ascending=False)
@@ -1310,13 +1162,11 @@ with tab1:
 
     if "results" in st.session_state:
         results = st.session_state["results"]
-        if not isinstance(results, pd.DataFrame):
-            results = pd.DataFrame()
 
         st.subheader("Top Trade Candidates")
         st.dataframe(results, use_container_width=True)
 
-        buys = results[results["Signal"].isin(["BUY YES", "BUY NO"]) & results.get("Execution Approved", False).fillna(False).astype(bool)]
+        buys = results[results["Signal"].isin(["BUY YES", "BUY NO"])]
 
         st.subheader("Actionable Trades")
         st.dataframe(buys, use_container_width=True)
@@ -1357,55 +1207,49 @@ with tab1:
         st.markdown("---")
         st.subheader("🔍 Explain Model")
 
-        market_options = results["Market"].dropna().astype(str).drop_duplicates().tolist() if not results.empty and "Market" in results.columns else []
-        if not market_options:
-            st.info("No scored trades are available to explain.")
-            explain = None
-        else:
-            selected_trade = st.selectbox(
-                "Select a trade to explain",
-                market_options,
-                key="explain_trade_selectbox",
-            )
-            matching = results[results["Market"].astype(str) == str(selected_trade)]
-            explain = matching.iloc[0] if not matching.empty else None
+        selected_trade = st.selectbox(
+            "Select a trade to explain",
+            results["Market"].tolist(),
+            key="explain_trade_selectbox",
+        )
 
-        if explain is not None:
-            c1, c2, c3 = st.columns(3)
-    
-            c1.metric("Current Price", explain["Current Price"])
-            c1.metric("Market Probability", f"{explain['Market Prob %']}%")
-    
-            c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
-            c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
-    
-            c3.metric("Final Probability", f"{explain['Final Prob %']}%")
-            c3.metric("Edge", f"{explain['Edge %']}%")
-    
-            st.markdown("### Model Components")
-    
-            st.write(f"**Market Type:** {explain['Type']}")
-            st.write(f"**Direction:** {explain['Direction']}")
-            st.write(f"**Target:** {explain['Target']}")
-            st.write(f"**Upper Bound:** {explain['Upper']}")
-            st.write(f"**Days to Expiry:** {explain['Days']}")
-            st.write(f"**Momentum Score:** {explain['Momentum']}")
-            st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
-            st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
-            st.write(f"**YES Edge:** {explain['YES Edge %']}%")
-            st.write(f"**NO Edge:** {explain['NO Edge %']}%")
-            st.write(f"**Signal:** {explain['Signal']}")
-            st.write(f"**Entry Side:** {explain['Entry Side']}")
-            st.write(f"**Entry Price:** {explain['Entry Price %']}%")
-            st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
-    
-            if explain["Signal"] == "BUY YES":
-                st.success("✅ YES is underpriced based on the model probability.")
-            elif explain["Signal"] == "BUY NO":
-                st.error("❌ NO is underpriced based on the model probability.")
-            else:
-                st.info("⚪ The model does not see enough edge to trade.")
-    
+        explain = results[results["Market"] == selected_trade].iloc[0]
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("Current Price", explain["Current Price"])
+        c1.metric("Market Probability", f"{explain['Market Prob %']}%")
+
+        c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
+        c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
+
+        c3.metric("Final Probability", f"{explain['Final Prob %']}%")
+        c3.metric("Edge", f"{explain['Edge %']}%")
+
+        st.markdown("### Model Components")
+
+        st.write(f"**Market Type:** {explain['Type']}")
+        st.write(f"**Direction:** {explain['Direction']}")
+        st.write(f"**Target:** {explain['Target']}")
+        st.write(f"**Upper Bound:** {explain['Upper']}")
+        st.write(f"**Days to Expiry:** {explain['Days']}")
+        st.write(f"**Momentum Score:** {explain['Momentum']}")
+        st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
+        st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
+        st.write(f"**YES Edge:** {explain['YES Edge %']}%")
+        st.write(f"**NO Edge:** {explain['NO Edge %']}%")
+        st.write(f"**Signal:** {explain['Signal']}")
+        st.write(f"**Entry Side:** {explain['Entry Side']}")
+        st.write(f"**Entry Price:** {explain['Entry Price %']}%")
+        st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+
+        if explain["Signal"] == "BUY YES":
+            st.success("✅ YES is underpriced based on the model probability.")
+        elif explain["Signal"] == "BUY NO":
+            st.error("❌ NO is underpriced based on the model probability.")
+        else:
+            st.info("⚪ The model does not see enough edge to trade.")
+
         st.markdown("---")
         st.subheader("Execute Model Trade through MCP")
         st.caption(
@@ -1533,44 +1377,31 @@ with tab1:
                                 )
                             st.json(order_response)
             except Exception as error:
-                message = str(error)
-                if "422" in message and "no match" in message.lower():
-                    st.warning("Trade unavailable: no matchable FOK liquidity. No order was placed.")
-                else:
-                    st.error(f"MCP execution setup error: {error}")
+                st.error(f"MCP execution setup error: {error}")
         else:
             st.info("No actionable model signals are available for execution.")
 
         st.markdown("---")
         st.subheader("Save Trade to Journal")
 
-        save_options = results["Market"].dropna().astype(str).drop_duplicates().tolist() if not results.empty and "Market" in results.columns else []
-        if save_options:
-            selected_save = st.selectbox(
-                "Select trade to save",
-                save_options,
-                key="save_trade_selectbox",
-            )
-        else:
-            selected_save = None
-            st.info("No scored trades are available to save.")
+        selected_save = st.selectbox(
+            "Select trade to save",
+            results["Market"].tolist(),
+            key="save_trade_selectbox",
+        )
 
-        if selected_save and st.button("Save Selected Trade", key="save_trade_button"):
-            matching = results[results["Market"].astype(str) == str(selected_save)]
-            if matching.empty:
-                st.warning("The selected trade is no longer available. Run the screener again.")
-            else:
-                row = matching.iloc[0].to_dict()
+        if st.button("Save Selected Trade", key="save_trade_button"):
+            row = results[results["Market"] == selected_save].iloc[0].to_dict()
 
-                try:
-                    journal_action, _ = save_to_journal(row, update_existing=True)
-                    load_journal.clear()
-                    if journal_action == "updated":
-                        st.success("The existing Google Sheets trade row was refreshed.")
-                    else:
-                        st.success("Trade saved permanently to Google Sheets.")
-                except Exception as error:
-                    st.error(f"Trade could not be saved: {error}")
+            try:
+                journal_action, _ = save_to_journal(row, update_existing=True)
+                load_journal.clear()
+                if journal_action == "updated":
+                    st.success("The existing Google Sheets trade row was refreshed.")
+                else:
+                    st.success("Trade saved permanently to Google Sheets.")
+            except Exception as error:
+                st.error(f"Trade could not be saved: {error}")
 
 
 with tab2:
