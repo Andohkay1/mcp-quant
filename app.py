@@ -468,11 +468,20 @@ PRICE_MARKET_PATTERNS = [
 ]
 
 NON_PRICE_EVENT_WORDS = [
-    "earnings", "revenue", "eps", "market cap", "acquire", "acquisition",
-    "merger", "ipo", "etf approval", "approve", "regulation", "lawsuit",
-    "ceo", "president", "election", "nominee", "fed chair", "interest rate",
-    "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
-    "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
+    "earnings", "revenue", "eps", "market cap", "fdv", "fully diluted valuation",
+    "acquire", "acquisition", "merger", "ipo", "etf approval", "approve",
+    "regulation", "lawsuit", "ceo", "president", "election", "nominee",
+    "fed chair", "interest rate", "cpi", "inflation", "gdp", "unemployment",
+    "tariff", "win", "wins", "champion", "world cup", "ufc", "nba",
+    "nfl", "mlb", "tennis",
+]
+
+UNSUPPORTED_PRICE_VARIABLE_TERMS = [
+    "reserve", "reserves", "inventory", "inventories", "stockpile", "stockpiles",
+    "transit", "transits", "ship", "ships", "shipping", "tanker", "tankers",
+    "production", "output", "supply", "demand", "export", "exports", "import",
+    "imports", "barrels per day", "bpd", "daily volume", "trading volume",
+    "market capitalization", "circulating supply", "total value locked", "tvl",
 ]
 
 
@@ -502,28 +511,50 @@ def infer_direction(market):
     return "above"
 
 
+def _to_number(raw_value):
+    """Convert a price token such as $1,900, 74.5, 225M, or 1.2k to float."""
+    if raw_value is None:
+        return None
+    token = str(raw_value).strip().replace("$", "").replace(",", "").replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMbBtT]?)", token)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value * {"": 1.0, "k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[match.group(2).lower()]
+
+
+def _context_price_matches(market):
+    """Extract contract price levels while ignoring dates and asset-name numbers."""
+    text = str(market or "")
+    number = r"\$?\s*(\d[\d,]*(?:\.\d+)?\s*[kKmMbBtT]?)"
+    patterns = [
+        rf"\b(?:between|from)\s+{number}\s+(?:and|to)\s+{number}",
+        rf"\b(?:close|closes|closed|finish|finishes|finished|settle|settles|settled)\s+(?:at|above|below|over|under|greater than|less than)\s+{number}",
+        rf"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\s+{number}",
+        rf"\b(?:be|remain|end|ends|ending|trade)\s+(?:at|above|below|over|under|greater than|less than)\s+{number}",
+        rf"\b(?:above|below|over|under|greater than|less than)\s+{number}",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            values = [_to_number(group) for group in match.groups()]
+            return [value for value in values if value is not None]
+    dollar_matches = re.findall(r"\$\s*(\d[\d,]*(?:\.\d+)?\s*[kKmMbBtT]?)", text)
+    return [value for value in (_to_number(x) for x in dollar_matches) if value is not None]
+
+
 def extract_numbers(market):
-    text = str(market or "").replace(",", "")
-    # Prefer explicit prices and large index levels; remove dates and percentages.
-    raw = re.findall(r"(?<![%\w])\$?(\d+(?:\.\d+)?)", text)
-    values = []
-    for item in raw:
-        value = float(item)
-        if 1900 <= value <= 2100:  # likely a year
-            continue
-        values.append(value)
-    return values
+    return _context_price_matches(market)
 
 
 def extract_target(market):
-    nums = extract_numbers(market)
+    nums = _context_price_matches(market)
     return nums[0] if nums else None
 
 
 def extract_upper(market):
-    nums = extract_numbers(market)
+    nums = _context_price_matches(market)
     return nums[1] if len(nums) > 1 else None
-
 
 def extract_asset_phrase(market):
     """Extract the likely underlying name from a binary price question."""
@@ -689,9 +720,12 @@ def pull_markets():
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
 
     def rejection_reason(row):
+        market_text = str(row.get("Market", "")).lower()
         if pd.isna(row["Resolution Date"]): return "Missing resolution date"
+        if any(term in market_text for term in UNSUPPORTED_PRICE_VARIABLE_TERMS):
+            return "Unsupported non-price variable"
         if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip(): return "Asset could not be resolved"
-        if pd.isna(row["Target"]): return "Target price could not be parsed"
+        if pd.isna(row["Target"]): return "Explicit target price could not be parsed"
         if row["Market Type"] == "range" and pd.isna(row["Upper"]): return "Upper range could not be parsed"
         if row["Days"] < 0: return "Market already expired"
         if row["Days"] > MAX_DAYS: return f"More than {MAX_DAYS} days to expiry"
@@ -1244,6 +1278,39 @@ def update_results():
 
     return df, updates
 
+def add_forecasting_scores(closed):
+    """Add Brier scores for resolved binary forecasts. Lower is better."""
+    if closed is None or closed.empty:
+        return pd.DataFrame()
+    scored = closed.copy()
+    scored["Resolved YES"] = scored.get("Result", "").astype(str).str.upper().eq("YES").astype(int)
+    scored["Model Probability"] = pd.to_numeric(scored.get("Final Prob %"), errors="coerce") / 100.0
+    scored["Market Probability"] = pd.to_numeric(scored.get("Market Prob %"), errors="coerce") / 100.0
+    scored["Model Brier"] = (scored["Model Probability"] - scored["Resolved YES"]) ** 2
+    scored["Market Brier"] = (scored["Market Probability"] - scored["Resolved YES"]) ** 2
+    return scored.dropna(subset=["Model Probability", "Market Probability"])
+
+
+def calibration_table(scored):
+    if scored is None or scored.empty:
+        return pd.DataFrame()
+    work = scored.copy()
+    bins = [0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.0001]
+    labels = ["0-10%", "10-20%", "20-30%", "30-40%", "40-50%", "50-60%", "60-70%", "70-80%", "80-90%", "90-100%"]
+    work["Probability Band"] = pd.cut(work["Model Probability"], bins=bins, labels=labels, right=False, include_lowest=True)
+    table = work.groupby("Probability Band", observed=False).agg(
+        Forecasts=("Resolved YES", "size"),
+        Average_Model_Probability=("Model Probability", "mean"),
+        Actual_YES_Rate=("Resolved YES", "mean"),
+        Average_Brier=("Model Brier", "mean"),
+    ).reset_index()
+    table = table[table["Forecasts"] > 0]
+    table["Avg Model %"] = (table.pop("Average_Model_Probability") * 100).round(1)
+    table["Actual YES %"] = (table.pop("Actual_YES_Rate") * 100).round(1)
+    table["Avg Brier"] = table.pop("Average_Brier").round(4)
+    return table
+
+
 tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
 
@@ -1383,6 +1450,13 @@ with tab1:
             c3.metric("Edge", f"{explain['Edge %']}%")
     
             st.markdown("### Model Components")
+
+            st.markdown("#### Superforecasting reasoning")
+            st.write(f"**Outside view / base rate:** Historical probability = {explain['Historical Prob %']}%.")
+            st.write(f"**Current statistical view:** EWMA probability = {explain['EWMA Prob %']}%.")
+            st.write(f"**Evidence adjustment:** Momentum adjustment = {explain['Momentum Adj %']} percentage points.")
+            st.write(f"**Benchmark:** Polymarket YES = {explain['Market Prob %']}%; model YES = {explain['Final Prob %']}%.")
+            st.caption("Treat this as a testable probability, not a certainty. Save it, score it after resolution, and revise only when evidence supports a change.")
     
             st.write(f"**Market Type:** {explain['Type']}")
             st.write(f"**Direction:** {explain['Direction']}")
@@ -1576,26 +1650,32 @@ with tab1:
 with tab2:
     st.subheader("Trade Journal")
 
-    if st.button("Update Results", key="update_results_button"):
-        try:
-            journal, updates = update_results()
-            load_journal.clear()
-            st.success(f"Updated {updates} closed trades.")
-        except Exception as error:
-            st.error(f"Results could not be updated: {error}")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Load Journal", key="load_journal_button"):
+            st.session_state["journal_df"] = load_journal()
+    with c2:
+        if st.button("Update Results", key="update_results_button"):
+            try:
+                journal, updates = update_results()
+                load_journal.clear()
+                st.session_state["journal_df"] = journal
+                st.success(f"Updated {updates} closed trades.")
+            except Exception as error:
+                st.error(f"Results could not be updated: {error}")
 
-    journal = load_journal()
+    journal = st.session_state.get("journal_df", pd.DataFrame(columns=JOURNAL_COLUMNS))
 
     if len(journal) > 0:
         st.dataframe(journal, use_container_width=True)
     else:
-        st.info("No trades saved yet.")
+        st.info("Click Load Journal to retrieve trades from Google Sheets.")
 
 
 with tab3:
     st.subheader("Analytics")
 
-    journal = load_journal()
+    journal = st.session_state.get("journal_df", pd.DataFrame(columns=JOURNAL_COLUMNS))
 
     if len(journal) > 0:
         if "Status" in journal.columns:
@@ -1633,5 +1713,28 @@ with tab3:
         if len(closed) > 0:
             st.subheader("PnL by Trade")
             st.bar_chart(closed["PnL"])
+
+
+            scored = add_forecasting_scores(closed)
+            if not scored.empty:
+                st.markdown("---")
+                st.subheader("Superforecasting Scorecard")
+                model_brier = float(scored["Model Brier"].mean())
+                market_brier = float(scored["Market Brier"].mean())
+                improvement = market_brier - model_brier
+                b1, b2, b3 = st.columns(3)
+                b1.metric("Model Brier Score", f"{model_brier:.4f}", help="Lower is better; 0 is perfect.")
+                b2.metric("Polymarket Brier", f"{market_brier:.4f}", help="Benchmark using the saved market probability.")
+                b3.metric("Brier Advantage", f"{improvement:+.4f}", help="Positive means the model beat Polymarket.")
+                st.caption("Brier score evaluates the full probability estimate and penalizes confident mistakes more heavily.")
+                st.subheader("Probability Calibration")
+                calibration = calibration_table(scored)
+                if calibration.empty:
+                    st.info("More resolved forecasts are needed for calibration bands.")
+                else:
+                    st.dataframe(calibration, use_container_width=True)
+                st.subheader("Resolved Forecast Audit")
+                audit_columns = ["Market", "Final Prob %", "Market Prob %", "Result", "Model Brier", "Market Brier", "PnL"]
+                st.dataframe(scored[[c for c in audit_columns if c in scored.columns]], use_container_width=True)
     else:
         st.info("No analytics available yet.")
