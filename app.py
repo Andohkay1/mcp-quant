@@ -1762,12 +1762,13 @@ with tab3:
 
     if len(journal) > 0:
         if "Status" in journal.columns:
-            closed = journal[journal["Status"] == "Closed"]
-            open_trades = journal[journal["Status"] != "Closed"]
+            closed = journal[journal["Status"] == "Closed"].copy()
+            open_trades = journal[journal["Status"] != "Closed"].copy()
         else:
             closed = pd.DataFrame()
-            open_trades = journal
+            open_trades = journal.copy()
 
+        # Existing headline analytics retained.
         total_pnl = closed["PnL"].sum() if len(closed) > 0 else 0
         bankroll = STARTING_BANKROLL + total_pnl
 
@@ -1778,24 +1779,154 @@ with tab3:
         win_rate = (wins / len(closed) * 100) if len(closed) > 0 else 0
 
         c1, c2, c3, c4 = st.columns(4)
-
         c1.metric("Bankroll", f"${round(bankroll, 2)}")
         c2.metric("Total PnL", f"${round(total_pnl, 2)}")
         c3.metric("Closed Trades", len(closed))
         c4.metric("Win Rate", f"{round(win_rate, 2)}%")
 
         c5, c6, c7 = st.columns(3)
-
         c5.metric("Open Trades", len(open_trades))
         c6.metric("Buy Signals", buy_count)
         c7.metric("Avg Edge", round(avg_edge, 2))
 
+        # -------------------------------------------------------------
+        # MCP COMPETITION SCOREBOARD — read-only analytics only.
+        # -------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("MCP Competition Scoreboard")
+
+        completed_trades = len(closed)
+        progress_pct = min(completed_trades / 80.0, 1.0)
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Completed Trades", f"{completed_trades} / 80")
+        p2.metric("Competition Progress", f"{progress_pct * 100:.1f}%")
+        p3.metric("Bankroll Floor", "PASS" if bankroll >= 70 else "BELOW $70")
+        p4.metric("Total Return", f"{((bankroll / STARTING_BANKROLL) - 1) * 100:.2f}%")
+
+        st.progress(progress_pct)
+        st.caption(
+            "MCP requires at least 80 completed trades and a mark-to-market account value above $70. "
+            "The ratios below are an interim trade-level proxy until a daily portfolio-value history is stored."
+        )
+
+        sharpe = np.nan
+        sortino = np.nan
+        calmar = np.nan
+        max_drawdown = np.nan
+        volatility = np.nan
+        profit_factor = np.nan
+        expectancy = np.nan
+        avg_win = np.nan
+        avg_loss = np.nan
+        largest_win = np.nan
+        largest_loss = np.nan
+
+        if len(closed) > 0:
+            metric_closed = closed.copy()
+            metric_closed["PnL"] = pd.to_numeric(metric_closed["PnL"], errors="coerce")
+            metric_closed["Position Size $"] = pd.to_numeric(
+                metric_closed.get("Position Size $", np.nan), errors="coerce"
+            )
+
+            denominator = metric_closed["Position Size $"].where(
+                metric_closed["Position Size $"] > 0, 1.0
+            )
+            metric_closed["Trade Return"] = metric_closed["PnL"] / denominator
+            trade_returns = metric_closed["Trade Return"].replace([np.inf, -np.inf], np.nan).dropna()
+            pnl_values = metric_closed["PnL"].dropna()
+
+            if len(trade_returns) >= 2:
+                mean_return = trade_returns.mean()
+                std_return = trade_returns.std(ddof=1)
+                volatility = std_return
+
+                if np.isfinite(std_return) and std_return > 0:
+                    sharpe = mean_return / std_return
+
+                if (trade_returns < 0).any():
+                    downside_deviation = float(
+                        np.sqrt(np.mean(np.square(np.minimum(trade_returns, 0.0))))
+                    )
+                    if np.isfinite(downside_deviation) and downside_deviation > 0:
+                        sortino = mean_return / downside_deviation
+
+                equity_curve = STARTING_BANKROLL + pnl_values.cumsum()
+                running_peak = equity_curve.cummax()
+                drawdown_series = (equity_curve / running_peak) - 1.0
+                if len(drawdown_series) > 0:
+                    max_drawdown = float(drawdown_series.min())
+
+                total_return = (equity_curve.iloc[-1] / STARTING_BANKROLL) - 1.0
+                if np.isfinite(max_drawdown) and max_drawdown < 0:
+                    calmar = total_return / abs(max_drawdown)
+
+            winning_pnl = pnl_values[pnl_values > 0]
+            losing_pnl = pnl_values[pnl_values < 0]
+
+            if len(winning_pnl) > 0:
+                avg_win = float(winning_pnl.mean())
+                largest_win = float(winning_pnl.max())
+            if len(losing_pnl) > 0:
+                avg_loss = float(losing_pnl.mean())
+                largest_loss = float(losing_pnl.min())
+
+            gross_profit = float(winning_pnl.sum()) if len(winning_pnl) > 0 else 0.0
+            gross_loss = abs(float(losing_pnl.sum())) if len(losing_pnl) > 0 else 0.0
+            if gross_loss > 0:
+                profit_factor = gross_profit / gross_loss
+            if len(pnl_values) > 0:
+                expectancy = float(pnl_values.mean())
+
+        def _fmt_ratio(value):
+            return "—" if pd.isna(value) or not np.isfinite(value) else f"{value:.2f}"
+
+        def _fmt_pct(value):
+            return "—" if pd.isna(value) or not np.isfinite(value) else f"{value:.2%}"
+
+        st.markdown("#### Risk-Adjusted Performance")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Sortino Ratio*", _fmt_ratio(sortino))
+        r2.metric("Sharpe Ratio*", _fmt_ratio(sharpe))
+        r3.metric("Calmar Ratio*", _fmt_ratio(calmar))
+        r4.metric("Max Drawdown*", _fmt_pct(max_drawdown))
+
+        st.caption(
+            "*Interim trade-level estimates. For exact MCP-style portfolio ratios, use daily mark-to-market "
+            "portfolio returns once daily equity snapshots are available."
+        )
+
+        st.markdown("#### Trading Quality")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Profit Factor", _fmt_ratio(profit_factor))
+        q2.metric("Expectancy / Trade", "—" if pd.isna(expectancy) else f"${expectancy:.2f}")
+        q3.metric("Average Win", "—" if pd.isna(avg_win) else f"${avg_win:.2f}")
+        q4.metric("Average Loss", "—" if pd.isna(avg_loss) else f"${avg_loss:.2f}")
+
+        q5, q6, q7 = st.columns(3)
+        q5.metric("Largest Win", "—" if pd.isna(largest_win) else f"${largest_win:.2f}")
+        q6.metric("Largest Loss", "—" if pd.isna(largest_loss) else f"${largest_loss:.2f}")
+        q7.metric("Trade Return Volatility*", _fmt_pct(volatility))
+
+        # Existing charts retained.
         st.subheader("Edge Distribution")
         st.bar_chart(journal["Edge %"])
 
         if len(closed) > 0:
             st.subheader("PnL by Trade")
             st.bar_chart(closed["PnL"])
+
+            pnl_curve = pd.to_numeric(closed["PnL"], errors="coerce").fillna(0.0)
+            equity_curve = STARTING_BANKROLL + pnl_curve.cumsum()
+            equity_curve.index = range(1, len(equity_curve) + 1)
+
+            st.subheader("Realized Equity Curve")
+            st.line_chart(equity_curve.rename("Bankroll"))
+
+            running_peak = equity_curve.cummax()
+            drawdown_curve = (equity_curve / running_peak) - 1.0
+            st.subheader("Realized Drawdown")
+            st.line_chart((drawdown_curve * 100).rename("Drawdown %"))
 
             resolved = closed[closed["Result"].astype(str).str.upper().isin(["YES", "NO"])].copy()
             if not resolved.empty:
@@ -1836,6 +1967,53 @@ with tab3:
                 calibration = calibration[calibration["Forecasts"] > 0]
                 st.subheader("Calibration by Probability Band")
                 st.dataframe(calibration, use_container_width=True)
+
+                st.subheader("Resolved Trade Breakdown")
+
+                if "Forecast Confidence" in resolved.columns:
+                    confidence_breakdown = (
+                        resolved.assign(Win=resolved["PnL"] > 0)
+                        .groupby("Forecast Confidence", dropna=False)
+                        .agg(
+                            Trades=("Market ID", "count"),
+                            Win_Rate=("Win", "mean"),
+                            Average_PnL=("PnL", "mean"),
+                        )
+                        .reset_index()
+                    )
+                    confidence_breakdown["Win_Rate"] *= 100
+                    st.markdown("**By Forecast Confidence**")
+                    st.dataframe(confidence_breakdown, use_container_width=True)
+
+                if "Type" in resolved.columns:
+                    type_breakdown = (
+                        resolved.assign(Win=resolved["PnL"] > 0)
+                        .groupby("Type", dropna=False)
+                        .agg(
+                            Trades=("Market ID", "count"),
+                            Win_Rate=("Win", "mean"),
+                            Average_PnL=("PnL", "mean"),
+                        )
+                        .reset_index()
+                    )
+                    type_breakdown["Win_Rate"] *= 100
+                    st.markdown("**By Market Type**")
+                    st.dataframe(type_breakdown, use_container_width=True)
+
+                if "Signal" in resolved.columns:
+                    signal_breakdown = (
+                        resolved.assign(Win=resolved["PnL"] > 0)
+                        .groupby("Signal", dropna=False)
+                        .agg(
+                            Trades=("Market ID", "count"),
+                            Win_Rate=("Win", "mean"),
+                            Average_PnL=("PnL", "mean"),
+                        )
+                        .reset_index()
+                    )
+                    signal_breakdown["Win_Rate"] *= 100
+                    st.markdown("**By Signal**")
+                    st.dataframe(signal_breakdown, use_container_width=True)
             else:
                 st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
     else:
