@@ -6,3 +6,4 @@ requests
 yfinance==1.5.1
 gspread
 google-auth
+scikit-learn
