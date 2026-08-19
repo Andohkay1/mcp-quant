@@ -7,6 +7,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from scipy.stats import norm
+from sklearn.linear_model import LogisticRegression
 from datetime import datetime
 
 import gspread
@@ -29,6 +30,9 @@ MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
 MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
 MIN_SELECTED_MODEL_PROB_PCT = 55.0
 MIN_TRADING_DAYS_REMAINING = 0.01
+CALIBRATION_MIN_SAMPLES = 30
+CALIBRATION_BLEND = 0.75
+CALIBRATION_MAX_SHIFT = 15.0
 
 
 def _safe_float(value, default=0.0):
@@ -57,12 +61,72 @@ def brier_score(probability_pct, outcome_yes):
     return float((probability - outcome) ** 2)
 
 
+def calibrate_probability(raw_probability_pct, resolved_df, min_samples=CALIBRATION_MIN_SAMPLES):
+    """
+    Calibrate the existing model probability using resolved historical trades.
+
+    The original model probability is preserved. Calibration is deliberately
+    conservative: it requires a minimum sample, shrinks the regression output
+    toward the raw probability, and caps the adjustment size.
+    """
+    raw = float(np.clip(_safe_float(raw_probability_pct, 50.0), 0.01, 99.99))
+
+    if resolved_df is None or resolved_df.empty:
+        return raw, "RAW (no resolved trades)"
+
+    data = resolved_df.copy()
+    required = {"Final Prob %", "Result"}
+    if not required.issubset(data.columns):
+        return raw, "RAW (missing calibration columns)"
+
+    data["Final Prob %"] = pd.to_numeric(data["Final Prob %"], errors="coerce")
+    data["Outcome"] = (
+        data["Result"].astype(str).str.strip().str.upper().map({"YES": 1, "NO": 0})
+    )
+    data = data.dropna(subset=["Final Prob %", "Outcome"])
+    data = data[data["Final Prob %"].between(0, 100)]
+
+    if len(data) < min_samples:
+        return raw, f"RAW (<{min_samples} resolved)"
+
+    if data["Outcome"].nunique() < 2:
+        return raw, "RAW (one outcome only)"
+
+    try:
+        X = (data[["Final Prob %"]].to_numpy(dtype=float) / 100.0)
+        y = data["Outcome"].to_numpy(dtype=int)
+
+        model = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
+        model.fit(X, y)
+
+        regression_probability = float(
+            model.predict_proba(np.array([[raw / 100.0]]))[0, 1] * 100.0
+        )
+
+        # Conservative shrinkage prevents a small live sample from moving
+        # probabilities too aggressively.
+        calibrated = (
+            CALIBRATION_BLEND * regression_probability
+            + (1.0 - CALIBRATION_BLEND) * raw
+        )
+
+        shift = calibrated - raw
+        if abs(shift) > CALIBRATION_MAX_SHIFT:
+            calibrated = raw + np.sign(shift) * CALIBRATION_MAX_SHIFT
+
+        calibrated = float(np.clip(calibrated, 1.0, 99.0))
+        return calibrated, f"CALIBRATED ({len(data)} resolved)"
+
+    except Exception as error:
+        return raw, f"RAW (calibration error: {type(error).__name__})"
+
+
 def evaluate_execution_approval(row):
     signal = str(row.get("Signal", ""))
     edge = _safe_float(row.get("Edge %"), 0.0)
     entry_price = _safe_float(row.get("Entry Price %"), 0.0)
     days_remaining = _safe_float(row.get("Days"), 0.0)
-    model_yes = _safe_float(row.get("Final Prob %"), 0.0)
+    model_yes = _safe_float(row.get("Calibrated Prob %", row.get("Final Prob %")), 0.0)
     if signal == "BUY YES":
         selected_model_probability = model_yes
     elif signal == "BUY NO":
@@ -336,7 +400,7 @@ class MCPQuantEngine:
 
         return (norm.cdf(z_high) - norm.cdf(z_low)) * 100
 
-    def score_market(self, row):
+    def score_market(self, row, calibration_df=None):
         market = row["Market"]
         ticker = row["Ticker"]
         target = row["Target"]
@@ -371,8 +435,12 @@ class MCPQuantEngine:
 
         final = max(0.01, min(99.99, base + mom_adj))
 
-        model_yes = final
-        model_no = 100 - final
+        calibrated_prob, calibration_status = calibrate_probability(
+            final, calibration_df
+        )
+
+        model_yes = calibrated_prob
+        model_no = 100 - calibrated_prob
 
         market_yes = market_probability
         market_no = row["No Prob %"]
@@ -430,6 +498,8 @@ class MCPQuantEngine:
             "Momentum": momentum,
             "Momentum Adj %": round(mom_adj, 2),
             "Final Prob %": round(final, 2),
+            "Calibrated Prob %": round(calibrated_prob, 2),
+            "Calibration Status": calibration_status,
             "YES Edge %": round(yes_edge, 2),
             "NO Edge %": round(no_edge, 2),
             "Edge %": round(edge, 2),
@@ -900,6 +970,8 @@ JOURNAL_COLUMNS = [
     "Momentum",
     "Momentum Adj %",
     "Final Prob %",
+    "Calibrated Prob %",
+    "Calibration Status",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
@@ -936,6 +1008,7 @@ NUMERIC_JOURNAL_COLUMNS = [
     "Momentum",
     "Momentum Adj %",
     "Final Prob %",
+    "Calibrated Prob %",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
@@ -1350,9 +1423,19 @@ with tab1:
         engine = MCPQuantEngine()
         scored = []
 
+        # Use only already-resolved journal observations for calibration.
+        # Open trades never train the calibration layer.
+        calibration_journal = load_journal()
+        if not calibration_journal.empty and "Result" in calibration_journal.columns:
+            resolved_for_calibration = calibration_journal[
+                calibration_journal["Result"].astype(str).str.upper().isin(["YES", "NO"])
+            ].copy()
+        else:
+            resolved_for_calibration = pd.DataFrame()
+
         for _, row in markets_df.iterrows():
             try:
-                scored.append(engine.score_market(row))
+                scored.append(engine.score_market(row, resolved_for_calibration))
             except Exception:
                 pass
 
@@ -1482,7 +1565,8 @@ with tab1:
             st.write(f"**Days to Expiry:** {explain['Days']}")
             st.write(f"**Momentum Score:** {explain['Momentum']}")
             st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
-            st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
+            st.write(f"**Raw Model YES Probability:** {explain['Final Prob %']}%")
+            st.write(f"**Calibrated YES Probability:** {explain.get('Calibrated Prob %', explain['Final Prob %'])}%")
             st.write(f"**YES Edge:** {explain['YES Edge %']}%")
             st.write(f"**NO Edge:** {explain['NO Edge %']}%")
             st.write(f"**Signal:** {explain['Signal']}")
@@ -1496,6 +1580,7 @@ with tab1:
             ewma_prob = _safe_float(explain.get("EWMA Prob %"))
             market_prob = _safe_float(explain.get("Market Prob %"))
             final_prob = _safe_float(explain.get("Final Prob %"))
+            calibrated_prob = _safe_float(explain.get("Calibrated Prob %", final_prob))
             confidence = str(explain.get("Forecast Confidence", "Low"))
             disagreement = abs(ewma_prob - historical_prob)
 
@@ -1506,13 +1591,13 @@ with tab1:
             sf4.metric("Confidence", confidence)
 
             reasoning = []
-            if final_prob > market_prob:
+            if calibrated_prob > market_prob:
                 reasoning.append(
-                    f"The model assigns YES {final_prob - market_prob:.2f} percentage points more probability than the market."
+                    f"The calibrated model assigns YES {calibrated_prob - market_prob:.2f} percentage points more probability than the market."
                 )
-            elif final_prob < market_prob:
+            elif calibrated_prob < market_prob:
                 reasoning.append(
-                    f"The model assigns YES {market_prob - final_prob:.2f} percentage points less probability than the market."
+                    f"The calibrated model assigns YES {market_prob - calibrated_prob:.2f} percentage points less probability than the market."
                 )
             else:
                 reasoning.append("The model and market assign the same YES probability.")
@@ -1762,13 +1847,12 @@ with tab3:
 
     if len(journal) > 0:
         if "Status" in journal.columns:
-            closed = journal[journal["Status"] == "Closed"].copy()
-            open_trades = journal[journal["Status"] != "Closed"].copy()
+            closed = journal[journal["Status"] == "Closed"]
+            open_trades = journal[journal["Status"] != "Closed"]
         else:
             closed = pd.DataFrame()
-            open_trades = journal.copy()
+            open_trades = journal
 
-        # Existing headline analytics retained.
         total_pnl = closed["PnL"].sum() if len(closed) > 0 else 0
         bankroll = STARTING_BANKROLL + total_pnl
 
@@ -1779,136 +1863,18 @@ with tab3:
         win_rate = (wins / len(closed) * 100) if len(closed) > 0 else 0
 
         c1, c2, c3, c4 = st.columns(4)
+
         c1.metric("Bankroll", f"${round(bankroll, 2)}")
         c2.metric("Total PnL", f"${round(total_pnl, 2)}")
         c3.metric("Closed Trades", len(closed))
         c4.metric("Win Rate", f"{round(win_rate, 2)}%")
 
         c5, c6, c7 = st.columns(3)
+
         c5.metric("Open Trades", len(open_trades))
         c6.metric("Buy Signals", buy_count)
         c7.metric("Avg Edge", round(avg_edge, 2))
 
-        # -------------------------------------------------------------
-        # MCP COMPETITION SCOREBOARD — read-only analytics only.
-        # -------------------------------------------------------------
-        st.markdown("---")
-        st.subheader("MCP Competition Scoreboard")
-
-        completed_trades = len(closed)
-        progress_pct = min(completed_trades / 80.0, 1.0)
-
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Completed Trades", f"{completed_trades} / 80")
-        p2.metric("Competition Progress", f"{progress_pct * 100:.1f}%")
-        p3.metric("Bankroll Floor", "PASS" if bankroll >= 70 else "BELOW $70")
-        p4.metric("Total Return", f"{((bankroll / STARTING_BANKROLL) - 1) * 100:.2f}%")
-
-        st.progress(progress_pct)
-        st.caption(
-            "MCP requires at least 80 completed trades and a mark-to-market account value above $70. "
-            "The ratios below are an interim trade-level proxy until a daily portfolio-value history is stored."
-        )
-
-        sharpe = np.nan
-        sortino = np.nan
-        calmar = np.nan
-        max_drawdown = np.nan
-        volatility = np.nan
-        profit_factor = np.nan
-        expectancy = np.nan
-        avg_win = np.nan
-        avg_loss = np.nan
-        largest_win = np.nan
-        largest_loss = np.nan
-
-        if len(closed) > 0:
-            metric_closed = closed.copy()
-            metric_closed["PnL"] = pd.to_numeric(metric_closed["PnL"], errors="coerce")
-            metric_closed["Position Size $"] = pd.to_numeric(
-                metric_closed.get("Position Size $", np.nan), errors="coerce"
-            )
-
-            denominator = metric_closed["Position Size $"].where(
-                metric_closed["Position Size $"] > 0, 1.0
-            )
-            metric_closed["Trade Return"] = metric_closed["PnL"] / denominator
-            trade_returns = metric_closed["Trade Return"].replace([np.inf, -np.inf], np.nan).dropna()
-            pnl_values = metric_closed["PnL"].dropna()
-
-            if len(trade_returns) >= 2:
-                mean_return = trade_returns.mean()
-                std_return = trade_returns.std(ddof=1)
-                volatility = std_return
-
-                if np.isfinite(std_return) and std_return > 0:
-                    sharpe = mean_return / std_return
-
-                if (trade_returns < 0).any():
-                    downside_deviation = float(
-                        np.sqrt(np.mean(np.square(np.minimum(trade_returns, 0.0))))
-                    )
-                    if np.isfinite(downside_deviation) and downside_deviation > 0:
-                        sortino = mean_return / downside_deviation
-
-                equity_curve = STARTING_BANKROLL + pnl_values.cumsum()
-                running_peak = equity_curve.cummax()
-                drawdown_series = (equity_curve / running_peak) - 1.0
-                if len(drawdown_series) > 0:
-                    max_drawdown = float(drawdown_series.min())
-
-                total_return = (equity_curve.iloc[-1] / STARTING_BANKROLL) - 1.0
-                if np.isfinite(max_drawdown) and max_drawdown < 0:
-                    calmar = total_return / abs(max_drawdown)
-
-            winning_pnl = pnl_values[pnl_values > 0]
-            losing_pnl = pnl_values[pnl_values < 0]
-
-            if len(winning_pnl) > 0:
-                avg_win = float(winning_pnl.mean())
-                largest_win = float(winning_pnl.max())
-            if len(losing_pnl) > 0:
-                avg_loss = float(losing_pnl.mean())
-                largest_loss = float(losing_pnl.min())
-
-            gross_profit = float(winning_pnl.sum()) if len(winning_pnl) > 0 else 0.0
-            gross_loss = abs(float(losing_pnl.sum())) if len(losing_pnl) > 0 else 0.0
-            if gross_loss > 0:
-                profit_factor = gross_profit / gross_loss
-            if len(pnl_values) > 0:
-                expectancy = float(pnl_values.mean())
-
-        def _fmt_ratio(value):
-            return "—" if pd.isna(value) or not np.isfinite(value) else f"{value:.2f}"
-
-        def _fmt_pct(value):
-            return "—" if pd.isna(value) or not np.isfinite(value) else f"{value:.2%}"
-
-        st.markdown("#### Risk-Adjusted Performance")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Sortino Ratio*", _fmt_ratio(sortino))
-        r2.metric("Sharpe Ratio*", _fmt_ratio(sharpe))
-        r3.metric("Calmar Ratio*", _fmt_ratio(calmar))
-        r4.metric("Max Drawdown*", _fmt_pct(max_drawdown))
-
-        st.caption(
-            "*Interim trade-level estimates. For exact MCP-style portfolio ratios, use daily mark-to-market "
-            "portfolio returns once daily equity snapshots are available."
-        )
-
-        st.markdown("#### Trading Quality")
-        q1, q2, q3, q4 = st.columns(4)
-        q1.metric("Profit Factor", _fmt_ratio(profit_factor))
-        q2.metric("Expectancy / Trade", "—" if pd.isna(expectancy) else f"${expectancy:.2f}")
-        q3.metric("Average Win", "—" if pd.isna(avg_win) else f"${avg_win:.2f}")
-        q4.metric("Average Loss", "—" if pd.isna(avg_loss) else f"${avg_loss:.2f}")
-
-        q5, q6, q7 = st.columns(3)
-        q5.metric("Largest Win", "—" if pd.isna(largest_win) else f"${largest_win:.2f}")
-        q6.metric("Largest Loss", "—" if pd.isna(largest_loss) else f"${largest_loss:.2f}")
-        q7.metric("Trade Return Volatility*", _fmt_pct(volatility))
-
-        # Existing charts retained.
         st.subheader("Edge Distribution")
         st.bar_chart(journal["Edge %"])
 
@@ -1916,24 +1882,20 @@ with tab3:
             st.subheader("PnL by Trade")
             st.bar_chart(closed["PnL"])
 
-            pnl_curve = pd.to_numeric(closed["PnL"], errors="coerce").fillna(0.0)
-            equity_curve = STARTING_BANKROLL + pnl_curve.cumsum()
-            equity_curve.index = range(1, len(equity_curve) + 1)
-
-            st.subheader("Realized Equity Curve")
-            st.line_chart(equity_curve.rename("Bankroll"))
-
-            running_peak = equity_curve.cummax()
-            drawdown_curve = (equity_curve / running_peak) - 1.0
-            st.subheader("Realized Drawdown")
-            st.line_chart((drawdown_curve * 100).rename("Drawdown %"))
-
             resolved = closed[closed["Result"].astype(str).str.upper().isin(["YES", "NO"])].copy()
             if not resolved.empty:
                 resolved["Outcome YES"] = resolved["Result"].astype(str).str.upper().eq("YES")
-                resolved["Model Brier"] = resolved.apply(
+                resolved["Raw Model Brier"] = resolved.apply(
                     lambda row: brier_score(row.get("Final Prob %", 0), row["Outcome YES"]), axis=1
                 )
+                resolved["Calibrated Model Brier"] = resolved.apply(
+                    lambda row: brier_score(
+                        row.get("Calibrated Prob %", row.get("Final Prob %", 0)),
+                        row["Outcome YES"],
+                    ),
+                    axis=1,
+                )
+                resolved["Model Brier"] = resolved["Calibrated Model Brier"]
                 resolved["Market Brier"] = resolved.apply(
                     lambda row: brier_score(row.get("Market Prob %", 0), row["Outcome YES"]), axis=1
                 )
@@ -1948,6 +1910,12 @@ with tab3:
                 st.caption("Lower is better: 0 is perfect and 1 is the worst possible binary Brier score.")
 
                 resolved["Final Prob %"] = pd.to_numeric(resolved["Final Prob %"], errors="coerce")
+                if "Calibrated Prob %" in resolved.columns:
+                    resolved["Calibrated Prob %"] = pd.to_numeric(
+                        resolved["Calibrated Prob %"], errors="coerce"
+                    )
+                else:
+                    resolved["Calibrated Prob %"] = resolved["Final Prob %"]
                 resolved = resolved[resolved["Final Prob %"].notna()].copy()
                 resolved["Probability Band"] = pd.cut(
                     resolved["Final Prob %"],
@@ -1967,53 +1935,6 @@ with tab3:
                 calibration = calibration[calibration["Forecasts"] > 0]
                 st.subheader("Calibration by Probability Band")
                 st.dataframe(calibration, use_container_width=True)
-
-                st.subheader("Resolved Trade Breakdown")
-
-                if "Forecast Confidence" in resolved.columns:
-                    confidence_breakdown = (
-                        resolved.assign(Win=resolved["PnL"] > 0)
-                        .groupby("Forecast Confidence", dropna=False)
-                        .agg(
-                            Trades=("Market ID", "count"),
-                            Win_Rate=("Win", "mean"),
-                            Average_PnL=("PnL", "mean"),
-                        )
-                        .reset_index()
-                    )
-                    confidence_breakdown["Win_Rate"] *= 100
-                    st.markdown("**By Forecast Confidence**")
-                    st.dataframe(confidence_breakdown, use_container_width=True)
-
-                if "Type" in resolved.columns:
-                    type_breakdown = (
-                        resolved.assign(Win=resolved["PnL"] > 0)
-                        .groupby("Type", dropna=False)
-                        .agg(
-                            Trades=("Market ID", "count"),
-                            Win_Rate=("Win", "mean"),
-                            Average_PnL=("PnL", "mean"),
-                        )
-                        .reset_index()
-                    )
-                    type_breakdown["Win_Rate"] *= 100
-                    st.markdown("**By Market Type**")
-                    st.dataframe(type_breakdown, use_container_width=True)
-
-                if "Signal" in resolved.columns:
-                    signal_breakdown = (
-                        resolved.assign(Win=resolved["PnL"] > 0)
-                        .groupby("Signal", dropna=False)
-                        .agg(
-                            Trades=("Market ID", "count"),
-                            Win_Rate=("Win", "mean"),
-                            Average_PnL=("PnL", "mean"),
-                        )
-                        .reset_index()
-                    )
-                    signal_breakdown["Win_Rate"] *= 100
-                    st.markdown("**By Signal**")
-                    st.dataframe(signal_breakdown, use_container_width=True)
             else:
                 st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
     else:
