@@ -72,7 +72,7 @@ def calibrate_probability(raw_probability_pct, resolved_df, min_samples=CALIBRAT
     raw = float(np.clip(_safe_float(raw_probability_pct, 50.0), 0.01, 99.99))
 
     if resolved_df is None or resolved_df.empty:
-        return raw, "RAW (no resolved trades)"
+        return raw, "RAW (0 resolved)"
 
     data = resolved_df.copy()
     required = {"Final Prob %", "Result"}
@@ -1423,15 +1423,29 @@ with tab1:
         engine = MCPQuantEngine()
         scored = []
 
-        # Use only already-resolved journal observations for calibration.
+        # Use only CLOSED trades with a resolved YES/NO outcome for calibration.
+        # This uses the same definition of a resolved trade as Analytics.
         # Open trades never train the calibration layer.
         calibration_journal = load_journal()
-        if not calibration_journal.empty and "Result" in calibration_journal.columns:
+
+        if (
+            not calibration_journal.empty
+            and "Status" in calibration_journal.columns
+            and "Result" in calibration_journal.columns
+        ):
+            status = calibration_journal["Status"].astype(str).str.strip().str.upper()
+            result = calibration_journal["Result"].astype(str).str.strip().str.upper()
+
             resolved_for_calibration = calibration_journal[
-                calibration_journal["Result"].astype(str).str.upper().isin(["YES", "NO"])
+                status.eq("CLOSED") & result.isin(["YES", "NO"])
             ].copy()
         else:
             resolved_for_calibration = pd.DataFrame()
+
+        # If the journal has closed rows but the calibration set is empty,
+        # surface the actual count in the UI rather than silently reporting
+        # "no resolved trades".
+        st.session_state["calibration_resolved_count"] = len(resolved_for_calibration)
 
         for _, row in markets_df.iterrows():
             try:
@@ -1456,6 +1470,17 @@ with tab1:
         m2.metric("Binary Price Markets", stats.get("binary_price_markets", len(markets_df)))
         m3.metric("Model Eligible", stats.get("eligible_markets", len(markets_df)))
         m4.metric("Rejected", stats.get("rejected_markets", 0))
+
+        calibration_count = st.session_state.get("calibration_resolved_count", 0)
+        if calibration_count < CALIBRATION_MIN_SAMPLES:
+            st.caption(
+                f"Calibration: {calibration_count} resolved trades "
+                f"(activates at {CALIBRATION_MIN_SAMPLES})"
+            )
+        else:
+            st.caption(
+                f"Calibration: ACTIVE — {calibration_count} resolved trades"
+            )
 
         st.subheader("Filtered Markets")
 
