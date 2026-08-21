@@ -25,7 +25,7 @@ SPREADSHEET_NAME = "Polymarket Journal"
 WORKSHEET_NAME = "Trades"
 STARTING_BANKROLL = 100
 BUY_THRESHOLD = 6
-MIN_ACTIONABLE_EDGE = 8.0
+MIN_ACTIONABLE_EDGE = 12.0
 MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
 MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
 MIN_SELECTED_MODEL_PROB_PCT = 55.0
@@ -119,6 +119,56 @@ def calibrate_probability(raw_probability_pct, resolved_df, min_samples=CALIBRAT
 
     except Exception as error:
         return raw, f"RAW (calibration error: {type(error).__name__})"
+
+
+def evaluate_execution_price(model_row, estimated_price_decimal):
+    """
+    Re-check the trade using the fresh MCP/FOK executable price estimate.
+    This prevents a signal from being executed after its edge has disappeared.
+    """
+    signal = str(model_row.get("Signal", ""))
+    calibrated_prob = _safe_float(
+        model_row.get("Calibrated Prob %", model_row.get("Final Prob %")),
+        0.0,
+    )
+
+    if signal == "BUY YES":
+        selected_probability = calibrated_prob
+    elif signal == "BUY NO":
+        selected_probability = 100.0 - calibrated_prob
+    else:
+        return False, "No BUY signal", 0.0, 0.0
+
+    entry_price_pct = _safe_float(estimated_price_decimal, 0.0) * 100.0
+    fresh_edge = selected_probability - entry_price_pct
+
+    reasons = []
+    if fresh_edge < MIN_ACTIONABLE_EDGE:
+        reasons.append(
+            f"fresh executable edge below {MIN_ACTIONABLE_EDGE:.0f}% "
+            f"({fresh_edge:.2f}%)"
+        )
+    if entry_price_pct < MIN_TRADABLE_ENTRY_PRICE_PCT:
+        reasons.append(
+            f"fresh entry price below {MIN_TRADABLE_ENTRY_PRICE_PCT:.0f}%"
+        )
+    if entry_price_pct > MAX_TRADABLE_ENTRY_PRICE_PCT:
+        reasons.append(
+            f"fresh entry price above {MAX_TRADABLE_ENTRY_PRICE_PCT:.0f}%"
+        )
+    if selected_probability < MIN_SELECTED_MODEL_PROB_PCT:
+        reasons.append(
+            f"selected-outcome model probability below "
+            f"{MIN_SELECTED_MODEL_PROB_PCT:.0f}%"
+        )
+
+    approved = not reasons
+    return (
+        approved,
+        "Approved at fresh executable price" if approved else "; ".join(reasons),
+        selected_probability,
+        fresh_edge,
+    )
 
 
 def evaluate_execution_approval(row):
@@ -1702,11 +1752,31 @@ with tab1:
                     preview = st.session_state.get("mcp_trade_preview")
                     if preview and preview.get("market") == selected_execute:
                         estimate_price = float(preview["estimate"].get("price", 0) or 0)
-                        st.success(f"Fresh estimated execution price: ${estimate_price:.4f} per share")
+                        (
+                            fresh_approved,
+                            fresh_reason,
+                            fresh_selected_prob,
+                            fresh_edge,
+                        ) = evaluate_execution_price(execute_row, estimate_price)
+
+                        st.success(
+                            f"Fresh estimated execution price: ${estimate_price:.4f} per share"
+                        )
+                        ec1, ec2, ec3 = st.columns(3)
+                        ec1.metric("Model Probability", f"{fresh_selected_prob:.2f}%")
+                        ec2.metric("Fresh Executable Edge", f"{fresh_edge:.2f}%")
+                        ec3.metric("Minimum Required Edge", f"{MIN_ACTIONABLE_EDGE:.0f}%")
+
+                        if fresh_approved:
+                            st.success(f"✅ {fresh_reason}")
+                        else:
+                            st.error(f"❌ Trade blocked: {fresh_reason}")
+
                         st.json(preview["estimate"])
 
                         confirm = st.checkbox(
                             f"I confirm this live BUY {preview_outcome} order for ${capped_amount:.2f} pUSD.",
+                            disabled=not fresh_approved,
                             key="confirm_live_mcp_trade",
                         )
 
@@ -1720,6 +1790,24 @@ with tab1:
                             fresh_estimate = client.price_estimate(
                                 token, preview_token_id, "buy", capped_amount
                             )
+
+                            (
+                                final_approved,
+                                final_reason,
+                                final_selected_prob,
+                                final_edge,
+                            ) = evaluate_execution_price(
+                                execute_row,
+                                fresh_estimate.get("price", 0),
+                            )
+
+                            if not final_approved:
+                                st.error(
+                                    "❌ Trade stopped before submission because the fresh "
+                                    f"execution price no longer meets the rule: {final_reason}"
+                                )
+                                st.session_state.pop("mcp_trade_preview", None)
+                                st.stop()
 
                             # Order placement is the critical step. Once this succeeds, a later
                             # journal failure must never be reported as a failed trade.
@@ -1904,6 +1992,19 @@ with tab3:
         st.bar_chart(journal["Edge %"])
 
         if len(closed) > 0:
+            resolved_count = int(
+                closed["Result"].astype(str).str.upper().isin(["YES", "NO"]).sum()
+            )
+            if resolved_count < CALIBRATION_MIN_SAMPLES:
+                st.caption(
+                    f"Calibration: {resolved_count} resolved trades "
+                    f"(activates at {CALIBRATION_MIN_SAMPLES})"
+                )
+            else:
+                st.caption(
+                    f"Calibration: ACTIVE — {resolved_count} resolved trades"
+                )
+
             st.subheader("PnL by Trade")
             st.bar_chart(closed["PnL"])
 
@@ -1927,11 +2028,23 @@ with tab3:
 
                 st.subheader("Forecast Accuracy")
                 b1, b2, b3 = st.columns(3)
-                model_brier = resolved["Model Brier"].mean()
+                raw_brier = resolved["Raw Model Brier"].mean()
+                calibrated_brier = resolved["Calibrated Model Brier"].mean()
                 market_brier = resolved["Market Brier"].mean()
-                b1.metric("Model Brier Score", f"{model_brier:.4f}")
-                b2.metric("Market Brier Score", f"{market_brier:.4f}")
-                b3.metric("Model vs Market", "Better" if model_brier < market_brier else "Worse")
+
+                b1.metric("Raw Model Brier", f"{raw_brier:.4f}")
+                b2.metric("Calibrated Brier", f"{calibrated_brier:.4f}")
+                b3.metric("Market Brier", f"{market_brier:.4f}")
+
+                comparison = (
+                    "Better"
+                    if calibrated_brier < market_brier
+                    else "Worse"
+                )
+                st.caption(
+                    f"Calibrated Model vs Market: {comparison}. "
+                    "Lower Brier is better."
+                )
                 st.caption("Lower is better: 0 is perfect and 1 is the worst possible binary Brier score.")
 
                 resolved["Final Prob %"] = pd.to_numeric(resolved["Final Prob %"], errors="coerce")
