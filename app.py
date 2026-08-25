@@ -7,8 +7,8 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from scipy.stats import norm
-from sklearn.linear_model import LogisticRegression
 from datetime import datetime
+import time
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -18,21 +18,38 @@ st.title("MCP Quant Dashboard")
 
 EDGE_THRESHOLD = 5
 MIN_LIQUIDITY = 250
-MAX_DAYS = 60
+MAX_DAYS = 10
 MOMENTUM_WEIGHT = 1.0
 EWMA_LAMBDA = 0.94
 SPREADSHEET_NAME = "Polymarket Journal"
 WORKSHEET_NAME = "Trades"
 STARTING_BANKROLL = 100
 BUY_THRESHOLD = 6
+
+# Automatic execution filters. A model signal can still appear in the research
+# table even when it is not approved for live execution.
 MIN_ACTIONABLE_EDGE = 8.0
+FOK_LIQUIDITY_RETRIES = 3
+FOK_LIQUIDITY_RETRY_DELAY_SEC = 0.35
 MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
 MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
 MIN_SELECTED_MODEL_PROB_PCT = 55.0
-MIN_TRADING_DAYS_REMAINING = 0.01
-CALIBRATION_MIN_SAMPLES = 30
-CALIBRATION_BLEND = 0.75
-CALIBRATION_MAX_SHIFT = 15.0
+MIN_TRADING_DAYS_REMAINING = 0.01  # about four minutes of a 6.5-hour session
+
+# Unattended auto-trading safeguards. These may be overridden in [mcp_trading]
+# Streamlit Secrets. Auto-trading only runs while the Streamlit app has an active
+# session; use the separate worker deployment for true 24/7 execution.
+AUTO_SCAN_INTERVAL = "10m"
+DEFAULT_AUTO_MAX_TRADES_PER_DAY = 3
+DEFAULT_AUTO_MAX_TRADES_PER_CYCLE = 1
+DEFAULT_AUTO_MAX_OPEN_TRADES = 8
+DEFAULT_AUTO_MIN_BALANCE = 75.0
+
+
+# MCP competition tracking settings
+COMPETITION_DAYS = 60
+REQUIRED_COMPLETED_TRADES = 80
+MARK_TO_MARKET_FLOOR = 70.0
 
 
 def _safe_float(value, default=0.0):
@@ -43,146 +60,26 @@ def _safe_float(value, default=0.0):
         return default
 
 
-def forecast_confidence(ewma_probability, historical_probability, liquidity):
-    """Transparent confidence label for forecast review."""
-    disagreement = abs(_safe_float(ewma_probability) - _safe_float(historical_probability))
-    liquidity_value = _safe_float(liquidity)
-    if disagreement <= 15 and liquidity_value >= 1000:
-        return "High"
-    if disagreement <= 30 and liquidity_value >= MIN_LIQUIDITY:
-        return "Medium"
-    return "Low"
-
-
-def brier_score(probability_pct, outcome_yes):
-    """Binary Brier score: 0 is perfect and 1 is the worst possible score."""
-    probability = np.clip(_safe_float(probability_pct) / 100.0, 0.0, 1.0)
-    outcome = 1.0 if bool(outcome_yes) else 0.0
-    return float((probability - outcome) ** 2)
-
-
-def calibrate_probability(raw_probability_pct, resolved_df, min_samples=CALIBRATION_MIN_SAMPLES):
-    """
-    Calibrate the existing model probability using resolved historical trades.
-
-    The original model probability is preserved. Calibration is deliberately
-    conservative: it requires a minimum sample, shrinks the regression output
-    toward the raw probability, and caps the adjustment size.
-    """
-    raw = float(np.clip(_safe_float(raw_probability_pct, 50.0), 0.01, 99.99))
-
-    if resolved_df is None or resolved_df.empty:
-        return raw, "RAW (0 resolved)"
-
-    data = resolved_df.copy()
-    required = {"Final Prob %", "Result"}
-    if not required.issubset(data.columns):
-        return raw, "RAW (missing calibration columns)"
-
-    data["Final Prob %"] = pd.to_numeric(data["Final Prob %"], errors="coerce")
-    data["Outcome"] = (
-        data["Result"].astype(str).str.strip().str.upper().map({"YES": 1, "NO": 0})
-    )
-    data = data.dropna(subset=["Final Prob %", "Outcome"])
-    data = data[data["Final Prob %"].between(0, 100)]
-
-    if len(data) < min_samples:
-        return raw, f"RAW (<{min_samples} resolved)"
-
-    if data["Outcome"].nunique() < 2:
-        return raw, "RAW (one outcome only)"
-
-    try:
-        X = (data[["Final Prob %"]].to_numpy(dtype=float) / 100.0)
-        y = data["Outcome"].to_numpy(dtype=int)
-
-        model = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
-        model.fit(X, y)
-
-        regression_probability = float(
-            model.predict_proba(np.array([[raw / 100.0]]))[0, 1] * 100.0
-        )
-
-        # Conservative shrinkage prevents a small live sample from moving
-        # probabilities too aggressively.
-        calibrated = (
-            CALIBRATION_BLEND * regression_probability
-            + (1.0 - CALIBRATION_BLEND) * raw
-        )
-
-        shift = calibrated - raw
-        if abs(shift) > CALIBRATION_MAX_SHIFT:
-            calibrated = raw + np.sign(shift) * CALIBRATION_MAX_SHIFT
-
-        calibrated = float(np.clip(calibrated, 1.0, 99.0))
-        return calibrated, f"CALIBRATED ({len(data)} resolved)"
-
-    except Exception as error:
-        return raw, f"RAW (calibration error: {type(error).__name__})"
-
-
-def evaluate_execution_price(model_row, estimated_price_decimal):
-    """
-    Re-check the trade using the fresh MCP/FOK executable price estimate.
-    This prevents a signal from being executed after its edge has disappeared.
-    """
-    signal = str(model_row.get("Signal", ""))
-    calibrated_prob = _safe_float(
-        model_row.get("Calibrated Prob %", model_row.get("Final Prob %")),
-        0.0,
-    )
-
-    if signal == "BUY YES":
-        selected_probability = calibrated_prob
-    elif signal == "BUY NO":
-        selected_probability = 100.0 - calibrated_prob
-    else:
-        return False, "No BUY signal", 0.0, 0.0
-
-    entry_price_pct = _safe_float(estimated_price_decimal, 0.0) * 100.0
-    fresh_edge = selected_probability - entry_price_pct
-
-    reasons = []
-    if fresh_edge < MIN_ACTIONABLE_EDGE:
-        reasons.append(
-            f"fresh executable edge below {MIN_ACTIONABLE_EDGE:.0f}% "
-            f"({fresh_edge:.2f}%)"
-        )
-    if entry_price_pct < MIN_TRADABLE_ENTRY_PRICE_PCT:
-        reasons.append(
-            f"fresh entry price below {MIN_TRADABLE_ENTRY_PRICE_PCT:.0f}%"
-        )
-    if entry_price_pct > MAX_TRADABLE_ENTRY_PRICE_PCT:
-        reasons.append(
-            f"fresh entry price above {MAX_TRADABLE_ENTRY_PRICE_PCT:.0f}%"
-        )
-    if selected_probability < MIN_SELECTED_MODEL_PROB_PCT:
-        reasons.append(
-            f"selected-outcome model probability below "
-            f"{MIN_SELECTED_MODEL_PROB_PCT:.0f}%"
-        )
-
-    approved = not reasons
-    return (
-        approved,
-        "Approved at fresh executable price" if approved else "; ".join(reasons),
-        selected_probability,
-        fresh_edge,
-    )
-
-
 def evaluate_execution_approval(row):
+    """Return whether a model signal is eligible for live execution and why.
+
+    This separates forecasting from execution. Large apparent edges in nearly
+    resolved or extremely one-sided markets remain visible for research but are
+    blocked from automatic/live execution.
+    """
     signal = str(row.get("Signal", ""))
     edge = _safe_float(row.get("Edge %"), 0.0)
     entry_price = _safe_float(row.get("Entry Price %"), 0.0)
     days_remaining = _safe_float(row.get("Days"), 0.0)
-    model_yes = _safe_float(row.get("Calibrated Prob %", row.get("Final Prob %")), 0.0)
+    model_yes = _safe_float(row.get("Final Prob %"), 0.0)
+
     if signal == "BUY YES":
         selected_model_probability = model_yes
     elif signal == "BUY NO":
         selected_model_probability = 100.0 - model_yes
     else:
         return False, "No BUY signal", 0.0
+
     reasons = []
     if edge < MIN_ACTIONABLE_EDGE:
         reasons.append(f"edge below {MIN_ACTIONABLE_EDGE:.0f}%")
@@ -191,11 +88,136 @@ def evaluate_execution_approval(row):
     if entry_price > MAX_TRADABLE_ENTRY_PRICE_PCT:
         reasons.append(f"entry price above {MAX_TRADABLE_ENTRY_PRICE_PCT:.0f}%")
     if selected_model_probability < MIN_SELECTED_MODEL_PROB_PCT:
-        reasons.append(f"selected-outcome model probability below {MIN_SELECTED_MODEL_PROB_PCT:.0f}%")
+        reasons.append(
+            f"selected-outcome model probability below {MIN_SELECTED_MODEL_PROB_PCT:.0f}%"
+        )
     if days_remaining < MIN_TRADING_DAYS_REMAINING:
         reasons.append("too little trading time remaining")
+
     approved = not reasons
     return approved, ("Approved" if approved else "; ".join(reasons)), selected_model_probability
+
+
+def _asset_class_from_ticker(ticker):
+    ticker = str(ticker or "").upper().strip()
+    if ticker.endswith("-USD"):
+        return "Crypto"
+    if ticker.endswith("=F"):
+        return "Commodity"
+    if ticker.startswith("^"):
+        return "Index"
+    if ticker.endswith("=X"):
+        return "FX"
+    return "Stock / ETF"
+
+
+def _trade_return(row):
+    size = _safe_float(row.get("Executed Amount pUSD"), 0.0)
+    if size <= 0:
+        size = _safe_float(row.get("Position Size $"), 0.0)
+    pnl = _safe_float(row.get("PnL"), 0.0)
+    return pnl / size if size > 0 else np.nan
+
+
+def _max_drawdown_from_pnl(closed):
+    if closed.empty:
+        return 0.0, pd.Series(dtype=float)
+    pnl = pd.to_numeric(closed["PnL"], errors="coerce").fillna(0.0)
+    equity = STARTING_BANKROLL + pnl.cumsum()
+    running_peak = equity.cummax()
+    drawdown = (equity - running_peak) / running_peak.replace(0, np.nan)
+    return abs(float(drawdown.min())) if len(drawdown) else 0.0, equity
+
+
+def calculate_competition_metrics(journal):
+    """Calculate competition metrics from the permanent journal.
+
+    Sharpe and Sortino use resolved trade-level returns. Calmar uses realized
+    cumulative return divided by realized maximum drawdown. Open-position
+    mark-to-market is not included because the journal does not contain live
+    position values.
+    """
+    if journal is None or journal.empty:
+        return {
+            "executed": pd.DataFrame(), "closed": pd.DataFrame(), "open": pd.DataFrame(),
+            "trade_count": 0, "closed_count": 0, "open_count": 0,
+            "total_pnl": 0.0, "realized_bankroll": STARTING_BANKROLL,
+            "win_rate": np.nan, "sharpe": np.nan, "sortino": np.nan,
+            "calmar": np.nan, "max_drawdown": 0.0, "equity": pd.Series(dtype=float),
+            "days_elapsed": 0, "days_remaining": COMPETITION_DAYS,
+            "required_weekly_pace": REQUIRED_COMPLETED_TRADES / (COMPETITION_DAYS / 7),
+        }
+
+    df = journal.copy()
+    order_ids = df.get("MCP Order ID", pd.Series(index=df.index, dtype=object)).astype(str).str.strip()
+    statuses = df.get("Execution Status", pd.Series(index=df.index, dtype=object)).astype(str).str.lower()
+    executed_mask = order_ids.ne("") & ~statuses.str.contains("error|failed|rejected|cancel", regex=True, na=False)
+    executed = df.loc[executed_mask].copy()
+    if "MCP Order ID" in executed.columns:
+        executed = executed.drop_duplicates(subset=["MCP Order ID"], keep="last")
+
+    closed = executed[executed.get("Status", "").astype(str).str.lower().eq("closed")].copy()
+    open_trades = executed[~executed.index.isin(closed.index)].copy()
+    closed["Trade Return"] = closed.apply(_trade_return, axis=1) if not closed.empty else pd.Series(dtype=float)
+    returns = pd.to_numeric(closed.get("Trade Return"), errors="coerce").dropna()
+
+    total_pnl = pd.to_numeric(closed.get("PnL"), errors="coerce").fillna(0.0).sum() if not closed.empty else 0.0
+    wins = int((pd.to_numeric(closed.get("PnL"), errors="coerce").fillna(0.0) > 0).sum()) if not closed.empty else 0
+    win_rate = wins / len(closed) if len(closed) else np.nan
+
+    sharpe = np.nan
+    sortino = np.nan
+    if len(returns) >= 2 and returns.std(ddof=1) > 0:
+        sharpe = float(returns.mean() / returns.std(ddof=1) * np.sqrt(len(returns)))
+    downside = returns[returns < 0]
+    if len(returns) >= 2 and len(downside) >= 2 and downside.std(ddof=1) > 0:
+        sortino = float(returns.mean() / downside.std(ddof=1) * np.sqrt(len(returns)))
+
+    max_drawdown, equity = _max_drawdown_from_pnl(closed)
+    realized_return = total_pnl / STARTING_BANKROLL
+    calmar = realized_return / max_drawdown if max_drawdown > 0 else np.nan
+
+    saved_dates = pd.to_datetime(executed.get("Date Saved"), errors="coerce") if not executed.empty else pd.Series(dtype="datetime64[ns]")
+    first_date = saved_dates.dropna().min() if not saved_dates.dropna().empty else pd.NaT
+    today = pd.Timestamp.now().normalize()
+    days_elapsed = max(1, int((today - first_date.normalize()).days) + 1) if pd.notna(first_date) else 0
+    days_remaining = max(COMPETITION_DAYS - days_elapsed, 0)
+    trades_remaining = max(REQUIRED_COMPLETED_TRADES - len(executed), 0)
+    weeks_remaining = max(days_remaining / 7, 1 / 7)
+
+    return {
+        "executed": executed, "closed": closed, "open": open_trades,
+        "trade_count": len(executed), "closed_count": len(closed), "open_count": len(open_trades),
+        "total_pnl": float(total_pnl), "realized_bankroll": STARTING_BANKROLL + float(total_pnl),
+        "win_rate": win_rate, "sharpe": sharpe, "sortino": sortino,
+        "calmar": calmar, "max_drawdown": max_drawdown, "equity": equity,
+        "days_elapsed": days_elapsed, "days_remaining": days_remaining,
+        "trades_remaining": trades_remaining,
+        "required_weekly_pace": trades_remaining / weeks_remaining if trades_remaining else 0.0,
+    }
+
+
+def _metric_text(value, percent=False):
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return f"{value * 100:.1f}%" if percent else f"{value:.2f}"
+
+
+def _band_table(df, value_column, bins, labels):
+    if df.empty or value_column not in df.columns:
+        return pd.DataFrame()
+    work = df.copy()
+    work[value_column] = pd.to_numeric(work[value_column], errors="coerce")
+    work["Band"] = pd.cut(work[value_column], bins=bins, labels=labels, include_lowest=True, right=False)
+    work["Win"] = pd.to_numeric(work["PnL"], errors="coerce").fillna(0) > 0
+    grouped = work.dropna(subset=["Band"]).groupby("Band", observed=False).agg(
+        Trades=("Win", "size"),
+        Win_Rate=("Win", "mean"),
+        Average_PnL=("PnL", "mean"),
+    ).reset_index()
+    grouped["Win Rate"] = (grouped.pop("Win_Rate") * 100).round(1)
+    grouped["Average PnL"] = pd.to_numeric(grouped.pop("Average_PnL"), errors="coerce").round(3)
+    return grouped
 
 
 class MCPTradingClient:
@@ -211,6 +233,11 @@ class MCPTradingClient:
         self.password = str(cfg.get("password", ""))
         self.live_enabled = bool(cfg.get("live_trading_enabled", False))
         self.max_order_amount = float(cfg.get("max_order_amount", 1.0))
+        self.auto_trading_enabled = bool(cfg.get("auto_trading_enabled", False))
+        self.auto_max_trades_per_day = int(cfg.get("auto_max_trades_per_day", DEFAULT_AUTO_MAX_TRADES_PER_DAY))
+        self.auto_max_trades_per_cycle = int(cfg.get("auto_max_trades_per_cycle", DEFAULT_AUTO_MAX_TRADES_PER_CYCLE))
+        self.auto_max_open_trades = int(cfg.get("auto_max_open_trades", DEFAULT_AUTO_MAX_OPEN_TRADES))
+        self.auto_min_balance = float(cfg.get("auto_min_balance", DEFAULT_AUTO_MIN_BALANCE))
         self.timeout = 20
 
         if not self.base_url or not self.email or not self.password:
@@ -223,25 +250,50 @@ class MCPTradingClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
-        response = requests.request(
-            method,
-            f"{self.base_url}{path}",
-            headers=headers,
-            params=params,
-            json=json_body,
-            timeout=self.timeout,
-        )
+        # Retry transient upstream failures for safe, read-only GET requests.
+        # POST orders are never retried here because that could duplicate a trade.
+        max_attempts = 4 if str(method).upper() == "GET" else 1
+        response = None
+        payload = None
 
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {"detail": response.text or "Non-JSON response"}
+        for attempt in range(max_attempts):
+            try:
+                response = requests.request(
+                    method,
+                    f"{self.base_url}{path}",
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as error:
+                if attempt + 1 < max_attempts:
+                    time.sleep(1.5 * (2 ** attempt))
+                    continue
+                raise RuntimeError(f"MCP request failed: {error}") from error
 
-        if not response.ok:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {"detail": response.text or "Non-JSON response"}
+
+            if response.ok:
+                return payload
+
+            if (
+                str(method).upper() == "GET"
+                and response.status_code in {429, 502, 503, 504}
+                and attempt + 1 < max_attempts
+            ):
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+
             detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
             raise RuntimeError(f"MCP API {response.status_code}: {detail}")
 
-        return payload
+        detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        status = response.status_code if response is not None else "unknown"
+        raise RuntimeError(f"MCP API {status}: {detail}")
 
     def login(self):
         payload = self._request(
@@ -256,6 +308,31 @@ class MCPTradingClient:
 
     def balance(self, token):
         return self._request("GET", "/v1/balance", token=token)
+
+    def list_markets(self, token, *, limit=100, offset=0, active=True, closed=False,
+                     order="endDate", ascending=True, tag=None, keyword=None):
+        """Browse or search MCP markets using the enhanced discovery endpoint.
+
+        MCP does not allow keyword to be combined with tag, offset, order, or
+        ascending, so this helper builds one valid query mode at a time.
+        """
+        params = {
+            "limit": int(limit),
+            "active": str(bool(active)).lower(),
+            "closed": str(bool(closed)).lower(),
+        }
+        if keyword:
+            params["keyword"] = str(keyword)
+        else:
+            params.update({
+                "offset": int(offset),
+                "order": str(order),
+                "ascending": str(bool(ascending)).lower(),
+            })
+            if tag:
+                params["tag"] = str(tag)
+
+        return self._request("GET", "/v1/markets", token=token, params=params)
 
     def price_estimate(self, token, token_id, side, amount):
         return self._request(
@@ -311,6 +388,48 @@ def token_for_signal(row):
     raise RuntimeError("The selected market is not an actionable BUY signal.")
 
 
+def place_fok_with_liquidity_retry(client, token, token_id, amount):
+    """
+    Submit a FOK order with bounded retries for transient liquidity failures.
+
+    We deliberately do NOT increase the price or amount here: the MCP endpoint
+    exposes a market FOK order, so changing either without a fresh edge calculation
+    could destroy the model's edge. Each retry re-requests the FOK estimate.
+    """
+    last_error = None
+    estimate = None
+
+    for attempt in range(FOK_LIQUIDITY_RETRIES):
+        if attempt:
+            time.sleep(FOK_LIQUIDITY_RETRY_DELAY_SEC)
+
+        estimate = client.price_estimate(token, token_id, "buy", amount)
+
+        try:
+            response = client.place_market_order(token, token_id, "buy", amount)
+            return response, estimate
+        except RuntimeError as error:
+            last_error = error
+            message = str(error).lower()
+
+            is_liquidity_failure = (
+                "422" in message
+                and (
+                    "fully filled" in message
+                    or "fill" in message
+                    or "fok" in message
+                    or "no match" in message
+                )
+            )
+
+            if not is_liquidity_failure or attempt == FOK_LIQUIDITY_RETRIES - 1:
+                raise
+
+    raise RuntimeError(
+        f"FOK order failed after {FOK_LIQUIDITY_RETRIES} liquidity retries: {last_error}"
+    )
+
+
 class MCPQuantEngine:
     def get_prices(self, ticker, period="5y"):
         data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
@@ -330,12 +449,33 @@ class MCPQuantEngine:
 
         return np.sqrt(variance) * np.sqrt(252)
 
+    def get_ohlc(self, ticker, period="5y", interval="1d", start=None, end=None):
+        kwargs = {
+            "auto_adjust": True,
+            "progress": False,
+            "interval": interval,
+        }
+        if start is not None:
+            kwargs["start"] = start
+            if end is not None:
+                kwargs["end"] = end
+        else:
+            kwargs["period"] = period
+
+        data = yf.download(ticker, **kwargs)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        return data.dropna(how="all")
+
     def ewma_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
 
-        sigma = vol * np.sqrt(max(float(days), 1 / 390) / 252)
+        # Preserve fractional trading days. A market with only a few hours left
+        # must not be treated as though it has a full day to move.
+        horizon_days = max(float(days), 1 / 390)
+        sigma = vol * np.sqrt(horizon_days / 252)
         z = np.log(target / current) / sigma
 
         if direction == "above":
@@ -348,6 +488,9 @@ class MCPQuantEngine:
         current = close.iloc[-1]
 
         required_return = target / current - 1
+        # Daily historical data cannot be shifted by a fraction. Use the next
+        # full trading day as the nearest empirical comparison while EWMA uses
+        # the exact fractional horizon.
         historical_days = max(int(np.ceil(float(days))), 1)
         future_returns = (close.shift(-historical_days) / close - 1).dropna()
 
@@ -356,46 +499,56 @@ class MCPQuantEngine:
 
         return (future_returns <= required_return).mean() * 100
 
-    def get_ohlc(self, ticker, period="5y", interval="1d"):
-        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        return data.dropna(how="all")
-
     def ewma_barrier_probability(self, ticker, target, days, direction):
+        """Approximate first-passage probability for touching a barrier before expiry."""
         close = self.get_prices(ticker, "1y")
         current = float(close.iloc[-1])
+
+        # If the current price is already beyond the barrier, the touch condition
+        # has necessarily been met at the present instant.
         if direction == "above" and current >= float(target):
             return 100.0
         if direction == "below" and current <= float(target):
             return 100.0
+
         vol = float(self.ewma_volatility(close))
         horizon_days = max(float(days), 1 / 390)
         sigma_t = vol * np.sqrt(horizon_days / 252)
         if not np.isfinite(sigma_t) or sigma_t <= 0:
             return 0.0
+
         log_distance = abs(np.log(float(target) / current))
         probability = 2 * (1 - norm.cdf(log_distance / sigma_t))
         return float(np.clip(probability * 100, 0.0, 100.0))
 
     def historical_barrier_probability(self, ticker, target, days, direction, lookback=756):
+        """Empirical frequency of touching an equivalent barrier within the horizon."""
         ohlc = self.get_ohlc(ticker, period="5y", interval="1d").tail(lookback)
-        if ohlc.empty or not {"Close", "High", "Low"}.issubset(ohlc.columns):
+        required = {"Close", "High", "Low"}
+        if ohlc.empty or not required.issubset(set(ohlc.columns)):
             return np.nan
+
         current = float(ohlc["Close"].dropna().iloc[-1])
         target_ratio = float(target) / current
         horizon = max(int(np.ceil(float(days))), 1)
         hits = []
+
         for i in range(0, len(ohlc) - horizon):
             start_price = float(ohlc["Close"].iloc[i])
             if not np.isfinite(start_price) or start_price <= 0:
                 continue
-            window = ohlc.iloc[i + 1:i + horizon + 1]
+            window = ohlc.iloc[i + 1 : i + horizon + 1]
+            if window.empty:
+                continue
+
             if direction == "above":
-                hit = float(window["High"].max()) >= start_price * target_ratio
+                equivalent_barrier = start_price * target_ratio
+                hit = float(window["High"].max()) >= equivalent_barrier
             else:
-                hit = float(window["Low"].min()) <= start_price * target_ratio
+                equivalent_barrier = start_price * target_ratio
+                hit = float(window["Low"].min()) <= equivalent_barrier
             hits.append(bool(hit))
+
         return float(np.mean(hits) * 100) if hits else np.nan
 
     def momentum_score(self, ticker):
@@ -443,14 +596,15 @@ class MCPQuantEngine:
         current = close.iloc[-1]
         vol = self.ewma_volatility(close)
 
-        sigma = vol * np.sqrt(max(float(days), 1 / 390) / 252)
+        horizon_days = max(float(days), 1 / 390)
+        sigma = vol * np.sqrt(horizon_days / 252)
 
         z_low = np.log(lower / current) / sigma
         z_high = np.log(upper / current) / sigma
 
         return (norm.cdf(z_high) - norm.cdf(z_low)) * 100
 
-    def score_market(self, row, calibration_df=None):
+    def score_market(self, row):
         market = row["Market"]
         ticker = row["Ticker"]
         target = row["Target"]
@@ -485,12 +639,8 @@ class MCPQuantEngine:
 
         final = max(0.01, min(99.99, base + mom_adj))
 
-        calibrated_prob, calibration_status = calibrate_probability(
-            final, calibration_df
-        )
-
-        model_yes = calibrated_prob
-        model_no = 100 - calibrated_prob
+        model_yes = final
+        model_no = 100 - final
 
         market_yes = market_probability
         market_no = row["No Prob %"]
@@ -537,7 +687,8 @@ class MCPQuantEngine:
             "Target": target,
             "Upper": upper,
             "Resolution Date": row["Resolution Date"],
-            "Days": days,
+            "Market Start Date": row.get("Market Start Date", ""),
+            "Days": round(days, 4),
             "Type": market_type,
             "Direction": direction,
             "Market Prob %": round(market_yes, 2),
@@ -548,8 +699,6 @@ class MCPQuantEngine:
             "Momentum": momentum,
             "Momentum Adj %": round(mom_adj, 2),
             "Final Prob %": round(final, 2),
-            "Calibrated Prob %": round(calibrated_prob, 2),
-            "Calibration Status": calibration_status,
             "YES Edge %": round(yes_edge, 2),
             "NO Edge %": round(no_edge, 2),
             "Edge %": round(edge, 2),
@@ -557,16 +706,28 @@ class MCPQuantEngine:
             "Entry Side": entry_side,
             "Entry Price %": round(entry_price, 2),
             "Position Size $": size,
+            "Liquidity": row.get("Liquidity", 0),
+            "Barrier Already Hit": bool(row.get("Barrier Already Hit", False)),
             "clobTokenIds": row["clobTokenIds"],
         }
-        approved, reason, selected_prob = evaluate_execution_approval(result)
-        result["Selected Model Prob %"] = round(selected_prob, 2)
+
+        approved, approval_reason, selected_model_probability = evaluate_execution_approval(result)
+        result["Selected Model Prob %"] = round(selected_model_probability, 2)
         result["Execution Approved"] = approved
-        result["Execution Decision"] = reason
-        result["Forecast Confidence"] = forecast_confidence(
-            result["EWMA Prob %"], result["Historical Prob %"], row.get("Liquidity", 0)
-        )
+        result["Execution Decision"] = approval_reason
         return result
+
+
+RESULT_COLUMNS = [
+    "Market ID", "Market", "Ticker", "Current Price", "Target", "Upper",
+    "Resolution Date", "Market Start Date", "Days", "Type", "Direction",
+    "Market Prob %", "No Prob %", "EWMA Prob %", "Historical Prob %",
+    "Base Prob %", "Momentum", "Momentum Adj %", "Final Prob %",
+    "YES Edge %", "NO Edge %", "Edge %", "Signal", "Entry Side",
+    "Entry Price %", "Position Size $", "Liquidity", "Barrier Already Hit",
+    "clobTokenIds", "Selected Model Prob %", "Execution Approved",
+    "Execution Decision",
+]
 
 
 # Reliable aliases are checked first. Unknown assets are resolved dynamically
@@ -609,14 +770,11 @@ PRICE_MARKET_PATTERNS = [
 ]
 
 NON_PRICE_EVENT_WORDS = [
-    "earnings", "revenue", "eps", "market cap", "fully diluted", "fdv",
-    "acquire", "acquisition", "merger", "ipo", "etf approval", "approve",
-    "regulation", "lawsuit", "ceo", "president", "election", "nominee",
-    "fed chair", "interest rate", "cpi", "inflation", "gdp", "unemployment",
-    "tariff", "win", "wins", "champion", "world cup", "ufc", "nba",
-    "nfl", "mlb", "tennis", "reserves", "inventory", "inventories",
-    "production", "output", "transit", "transits", "shipments",
-    "strait of hormuz", "temperature", "rainfall", "kills", "total rounds",
+    "earnings", "revenue", "eps", "market cap", "acquire", "acquisition",
+    "merger", "ipo", "etf approval", "approve", "regulation", "lawsuit",
+    "ceo", "president", "election", "nominee", "fed chair", "interest rate",
+    "cpi", "inflation", "gdp", "unemployment", "tariff", "win", "wins",
+    "champion", "world cup", "ufc", "nba", "nfl", "mlb", "tennis",
 ]
 
 
@@ -632,7 +790,11 @@ def classify_market(market):
         r"\b(?:above|below|over|under)\b", text
     ):
         return "daily_close"
-    if re.search(r"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\b", text) or re.search(r"\((?:high|low)\)", text):
+    # Touch/barrier contracts resolve YES if the level is reached at any point,
+    # not only if the asset finishes beyond the level at expiry.
+    if re.search(r"\b(?:hit|reach|touch|dip to|fall to|rise to|trade as high as|trade as low as)\b", text):
+        return "barrier"
+    if re.search(r"\((?:high|low)\)", text):
         return "barrier"
     if any(re.search(pattern, text) for pattern in PRICE_MARKET_PATTERNS):
         return "price"
@@ -646,56 +808,27 @@ def infer_direction(market):
     return "above"
 
 
-def _parse_number(value):
-    try:
-        return float(str(value).replace(",", ""))
-    except (TypeError, ValueError):
-        return None
-
-
-def extract_price_bounds(market):
-    """Extract contract price levels while ignoring dates and asset-name numbers."""
-    text = str(market or "")
-    number = r"(?:US\$|\$)?\s*(\d[\d,]*(?:\.\d+)?)"
-
-    range_match = re.search(
-        rf"\bbetween\s+{number}\s+(?:and|to|-)\s+{number}",
-        text,
-        flags=re.I,
-    )
-    if range_match:
-        lower = _parse_number(range_match.group(1))
-        upper = _parse_number(range_match.group(2))
-        if lower is not None and upper is not None and 0 < lower < upper:
-            return lower, upper
-
-    trigger_patterns = [
-        rf"\b(?:close|closes|closed|finish|finishes|settle|settles)[^?]*?\b(?:above|below|over|under)\s+{number}",
-        rf"\b(?:above|below|over|under|greater than|less than)\s+{number}",
-        rf"\b(?:reach|hit|touch|dip to|fall to|rise to|trade as high as|trade as low as)\s+(?:\((?:high|low)\)\s*)?{number}",
-        rf"\((?:high|low)\)\s*{number}",
-    ]
-    for pattern in trigger_patterns:
-        match = re.search(pattern, text, flags=re.I)
-        if match:
-            value = _parse_number(match.group(1))
-            if value is not None and value > 0:
-                return value, None
-
-    return None, None
-
-
 def extract_numbers(market):
-    lower, upper = extract_price_bounds(market)
-    return [value for value in (lower, upper) if value is not None]
+    text = str(market or "").replace(",", "")
+    # Prefer explicit prices and large index levels; remove dates and percentages.
+    raw = re.findall(r"(?<![%\w])\$?(\d+(?:\.\d+)?)", text)
+    values = []
+    for item in raw:
+        value = float(item)
+        if 1900 <= value <= 2100:  # likely a year
+            continue
+        values.append(value)
+    return values
 
 
 def extract_target(market):
-    return extract_price_bounds(market)[0]
+    nums = extract_numbers(market)
+    return nums[0] if nums else None
 
 
 def extract_upper(market):
-    return extract_price_bounds(market)[1]
+    nums = extract_numbers(market)
+    return nums[1] if len(nums) > 1 else None
 
 
 def extract_asset_phrase(market):
@@ -746,13 +879,7 @@ def yahoo_symbol_search(query):
 
 
 def find_ticker(market):
-    raw_text = str(market or "")
-    text = raw_text.lower()
-
-    # Explicit SPY contracts reference the ETF price, not the index level.
-    if re.search(r"(?<!\w)spy(?!\w)", text):
-        return "SPY"
-
+    text = str(market or "").lower()
     # Longest aliases first to avoid matching "oil" before "crude oil".
     for key in sorted(ASSET_ALIASES, key=len, reverse=True):
         if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text):
@@ -766,58 +893,72 @@ def find_ticker(market):
     return yahoo_symbol_search(extract_asset_phrase(market))
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def barrier_already_hit(ticker, target, direction, start_date):
+    """Check whether a touch barrier has already been crossed since market inception."""
+    try:
+        if pd.isna(start_date):
+            return False
+        start_ts = pd.Timestamp(start_date)
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize("UTC")
+        else:
+            start_ts = start_ts.tz_convert("UTC")
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+        age_days = max((now_utc - start_ts).total_seconds() / 86400, 0)
+        # Intraday data gives a more precise check for recent markets; daily
+        # high/low data extends the check for longer-lived markets.
+        if age_days <= 7:
+            interval = "5m"
+        elif age_days <= 60:
+            interval = "1h"
+        else:
+            interval = "1d"
+
+        data = yf.download(
+            ticker,
+            start=start_ts.tz_localize(None),
+            end=(now_utc + pd.Timedelta(days=1)).tz_localize(None),
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+        )
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        if data.empty:
+            return False
+
+        if direction == "above":
+            return float(data["High"].max()) >= float(target)
+        return float(data["Low"].min()) <= float(target)
+    except Exception:
+        # A failed historical check must not silently assert that a barrier was hit.
+        return False
+
+
 @st.cache_data(ttl=300)
 def pull_markets():
-    """Paginate the stable Gamma discovery feed and keep supported price markets.
+    """Stable market discovery fallback using Polymarket Gamma.
 
-    Only market retrieval is expanded here. The model, execution, journal, and
-    approval logic remain unchanged.
+    This intentionally restores the last working discovery path while retaining
+    the newer barrier, execution-filter, logging, analytics, and UI-safety logic.
+    It avoids the MCP browse-response mapping issue that caused financial
+    markets to be misclassified or rejected.
     """
     url = "https://gamma-api.polymarket.com/markets"
-    page_size = 100
-    max_pages = 20  # up to 2,000 active markets per scan
-    markets_raw = []
-    seen_ids = set()
-
-    for page_number in range(max_pages):
-        offset = page_number * page_size
-        params = {
-            "closed": "false",
-            "active": "true",
-            "limit": page_size,
-            "offset": offset,
-            "order": "volume",
-            "ascending": "false",
-        }
-
-        response = requests.get(url, params=params, timeout=25)
-        response.raise_for_status()
-        page = response.json()
-
-        if not isinstance(page, list) or not page:
-            break
-
-        new_on_page = 0
-        for market in page:
-            market_id = str(market.get("id", "")).strip()
-            dedupe_key = market_id or str(market.get("conditionId", "")).strip() or str(market.get("question", "")).strip()
-            if not dedupe_key or dedupe_key in seen_ids:
-                continue
-            seen_ids.add(dedupe_key)
-            markets_raw.append(market)
-            new_on_page += 1
-
-        # A short page means the catalogue is exhausted. Also stop if the API
-        # returns a repeated page that adds nothing new.
-        if len(page) < page_size or new_on_page == 0:
-            break
+    params = {
+        "closed": "false",
+        "limit": 1000,
+        "order": "volume",
+        "ascending": "false",
+    }
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    markets_raw = response.json()
 
     rows = []
     for m in markets_raw:
-        # Defensive checks in case Gamma returns stale records despite the query.
-        if bool(m.get("closed", False)) or m.get("active") is False:
-            continue
-
         try:
             outcome_prices = json.loads(m.get("outcomePrices", "[]"))
         except Exception:
@@ -827,18 +968,13 @@ def pull_markets():
         if len(outcome_prices) != 2:
             continue
 
-        try:
-            yes_probability = float(outcome_prices[0]) * 100
-            no_probability = float(outcome_prices[1]) * 100
-        except (TypeError, ValueError):
-            continue
-
         rows.append({
             "Market ID": m.get("id"),
             "Market": m.get("question"),
             "Resolution Date": m.get("endDate"),
-            "Market Prob %": yes_probability,
-            "No Prob %": no_probability,
+            "Market Start Date": m.get("startDate") or m.get("createdAt"),
+            "Market Prob %": float(outcome_prices[0]) * 100,
+            "No Prob %": float(outcome_prices[1]) * 100,
             "Volume": pd.to_numeric(m.get("volumeNum"), errors="coerce"),
             "Liquidity": pd.to_numeric(m.get("liquidityNum"), errors="coerce"),
             "clobTokenIds": m.get("clobTokenIds"),
@@ -848,30 +984,64 @@ def pull_markets():
     if df.empty:
         return df
 
-    df = df.drop_duplicates(subset=["Market ID"], keep="first")
     df["Resolution Date"] = pd.to_datetime(df["Resolution Date"], errors="coerce", utc=True)
-    df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.total_seconds() / 86400
+    df["Market Start Date"] = pd.to_datetime(df["Market Start Date"], errors="coerce", utc=True)
+    now_utc = pd.Timestamp.now(tz="UTC")
+    df["Hours Remaining"] = (
+        df["Resolution Date"] - now_utc
+    ).dt.total_seconds() / 3600
+    # Generic fractional calendar days for screening and non-close markets.
+    df["Days"] = df["Hours Remaining"] / 24
     df["Market Type"] = df["Market"].apply(classify_market)
+
+    # For same-day closing markets, volatility should scale to the fraction of
+    # a 6.5-hour US trading session still remaining, not a rounded calendar day.
+    same_day_close = (
+        df["Market Type"].eq("daily_close")
+        & df["Resolution Date"].dt.date.eq(now_utc.date())
+        & df["Hours Remaining"].ge(0)
+    )
+    df.loc[same_day_close, "Days"] = df.loc[same_day_close, "Hours Remaining"] / 6.5
 
     financial_candidates = df[df["Market Type"].isin(["price", "barrier", "range", "daily_close"])].copy()
     financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
     financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
-    financial_candidates["Upper"] = pd.Series(np.nan, index=financial_candidates.index, dtype="float64")
+    # Only range markets need an upper price. This prevents date numbers such
+    # as the "31" in "July 31" from appearing as a false upper bound.
+    # Create Upper as an explicit float column. Newer pandas versions reject
+    # assigning an object-typed Series into a float column, even when the
+    # values are numeric. Coerce the parsed range bounds before assignment.
+    financial_candidates["Upper"] = pd.Series(
+        np.nan,
+        index=financial_candidates.index,
+        dtype="float64",
+    )
     range_mask = financial_candidates["Market Type"].eq("range")
     if range_mask.any():
         parsed_upper = pd.to_numeric(
             financial_candidates.loc[range_mask, "Market"].apply(extract_upper),
             errors="coerce",
-        )
+        ).astype("float64")
         financial_candidates.loc[range_mask, "Upper"] = parsed_upper.to_numpy()
     financial_candidates["Direction"] = financial_candidates["Market"].apply(infer_direction)
+    financial_candidates["Barrier Already Hit"] = False
+    barrier_mask = financial_candidates["Market Type"].eq("barrier")
+    for idx, barrier_row in financial_candidates.loc[barrier_mask].iterrows():
+        financial_candidates.at[idx, "Barrier Already Hit"] = barrier_already_hit(
+            barrier_row["Ticker"],
+            barrier_row["Target"],
+            barrier_row["Direction"],
+            barrier_row["Market Start Date"],
+        ) if pd.notna(barrier_row["Ticker"]) and pd.notna(barrier_row["Target"]) else False
 
     def rejection_reason(row):
         if pd.isna(row["Resolution Date"]): return "Missing resolution date"
         if pd.isna(row["Ticker"]) or not str(row["Ticker"]).strip(): return "Asset could not be resolved"
         if pd.isna(row["Target"]): return "Target price could not be parsed"
         if row["Market Type"] == "range" and pd.isna(row["Upper"]): return "Upper range could not be parsed"
+        if row.get("Market Type") == "barrier" and bool(row.get("Barrier Already Hit", False)):
+            return "Barrier was already hit before screening"
         if row["Days"] < 0: return "Market already expired"
         if row["Days"] > MAX_DAYS: return f"More than {MAX_DAYS} days to expiry"
         if pd.isna(row["Liquidity"]) or row["Liquidity"] < MIN_LIQUIDITY: return "Insufficient liquidity"
@@ -885,13 +1055,11 @@ def pull_markets():
         "binary_price_markets": len(financial_candidates),
         "eligible_markets": len(eligible),
         "rejected_markets": len(financial_candidates) - len(eligible),
-        "catalogue_markets_fetched": len(markets_raw),
     }
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
-    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
+    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Barrier Already Hit", "Liquidity", "Hours Remaining", "Days"]]
     return eligible
-
 
 def get_news(ticker, limit=5):
     query = ticker.replace("-", " ")
@@ -1020,8 +1188,6 @@ JOURNAL_COLUMNS = [
     "Momentum",
     "Momentum Adj %",
     "Final Prob %",
-    "Calibrated Prob %",
-    "Calibration Status",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
@@ -1029,7 +1195,6 @@ JOURNAL_COLUMNS = [
     "Entry Side",
     "Entry Price %",
     "Position Size $",
-    "Forecast Confidence",
     "clobTokenIds",
     "Execution Token ID",
     "Execution Outcome",
@@ -1058,7 +1223,6 @@ NUMERIC_JOURNAL_COLUMNS = [
     "Momentum",
     "Momentum Adj %",
     "Final Prob %",
-    "Calibrated Prob %",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
@@ -1159,23 +1323,6 @@ def get_journal_worksheet():
     return worksheet
 
 
-def ensure_worksheet_capacity(worksheet, required_row=None, required_cols=None, row_buffer=500):
-    """Expand the worksheet before a write would exceed its grid limits."""
-    target_row = int(required_row or worksheet.row_count)
-    target_cols = int(required_cols or worksheet.col_count)
-
-    new_rows = worksheet.row_count
-    new_cols = worksheet.col_count
-
-    if target_row > worksheet.row_count:
-        new_rows = max(target_row, worksheet.row_count + row_buffer)
-    if target_cols > worksheet.col_count:
-        new_cols = target_cols
-
-    if new_rows != worksheet.row_count or new_cols != worksheet.col_count:
-        worksheet.resize(rows=new_rows, cols=new_cols)
-
-
 def save_to_journal(row, update_existing=False):
     """Save a trade, updating its existing journal row when requested."""
     worksheet = get_journal_worksheet()
@@ -1252,22 +1399,8 @@ def save_to_journal(row, update_existing=False):
     journal_row["PnL"] = journal_row.get("PnL", 0.0)
 
     values = [_clean_sheet_value(journal_row.get(column, "")) for column in headers]
-
-    # Write to the exact next populated row rather than relying on append_row.
-    # This lets us expand the grid first and return the real journal row number.
-    next_row = len(worksheet.get_all_values()) + 1
-    ensure_worksheet_capacity(
-        worksheet,
-        required_row=next_row,
-        required_cols=len(headers),
-    )
-    end_cell = gspread.utils.rowcol_to_a1(next_row, len(headers))
-    worksheet.update(
-        range_name=f"A{next_row}:{end_cell}",
-        values=[values],
-        value_input_option="USER_ENTERED",
-    )
-    return "created", next_row
+    worksheet.append_row(values, value_input_option="USER_ENTERED")
+    return "created", worksheet.row_count
 
 
 def verify_execution_fields(sheet_row_number, expected):
@@ -1458,10 +1591,186 @@ def update_results():
 
     return df, updates
 
-tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
+
+def run_quant_scan():
+    """Run the full market scan and return scored results."""
+    markets_df = pull_markets()
+    engine = MCPQuantEngine()
+    scored = []
+    for _, row in markets_df.iterrows():
+        try:
+            scored.append(engine.score_market(row))
+        except Exception:
+            continue
+    results = pd.DataFrame(scored, columns=RESULT_COLUMNS)
+    if not results.empty:
+        results = results.sort_values("Edge %", ascending=False)
+    return markets_df, results
+
+
+def _executed_market_ids(journal):
+    if journal is None or journal.empty or "Market ID" not in journal.columns:
+        return set()
+    ids = journal["Market ID"].astype(str).str.strip()
+    if "MCP Order ID" in journal.columns:
+        order_ids = journal["MCP Order ID"].astype(str).str.strip()
+        ids = ids[order_ids.ne("")]
+    return set(ids[ids.ne("")])
+
+
+def _executed_today_count(journal):
+    if journal is None or journal.empty or "Date Saved" not in journal.columns:
+        return 0
+    work = journal.copy()
+    dates = pd.to_datetime(work["Date Saved"], errors="coerce")
+    today = pd.Timestamp.now().date()
+    mask = dates.dt.date.eq(today)
+    if "MCP Order ID" in work.columns:
+        mask &= work["MCP Order ID"].astype(str).str.strip().ne("")
+    return int(mask.sum())
+
+
+def auto_execute_approved_trades(results):
+    """Execute new approved signals with strict portfolio and duplicate controls."""
+    client = MCPTradingClient()
+    if not client.auto_trading_enabled:
+        return []
+    if results is None or results.empty:
+        return [{"status": "skipped", "reason": "No scored markets"}]
+
+    approved = results[
+        results.get("Execution Approved", False).fillna(False).astype(bool)
+        & results["Signal"].isin(["BUY YES", "BUY NO"])
+    ].copy()
+    if approved.empty:
+        return [{"status": "skipped", "reason": "No approved trades"}]
+
+    journal = load_journal()
+    existing_market_ids = _executed_market_ids(journal)
+    metrics = calculate_competition_metrics(journal)
+    open_count = int(metrics.get("open_count", 0))
+    today_count = _executed_today_count(journal)
+
+    if today_count >= client.auto_max_trades_per_day:
+        return [{"status": "skipped", "reason": "Daily auto-trade limit reached"}]
+    if open_count >= client.auto_max_open_trades:
+        return [{"status": "skipped", "reason": "Maximum open-trade limit reached"}]
+
+    token = client.login()
+    balance_payload = client.balance(token)
+    balance = _safe_float(balance_payload.get("balance"), 0.0)
+    if balance <= client.auto_min_balance:
+        return [{"status": "skipped", "reason": f"Balance ${balance:.2f} is at/below auto floor"}]
+
+    outcomes = []
+    remaining_daily = client.auto_max_trades_per_day - today_count
+    cycle_limit = min(client.auto_max_trades_per_cycle, remaining_daily)
+
+    for _, candidate in approved.iterrows():
+        if len([x for x in outcomes if x.get("status") == "matched"]) >= cycle_limit:
+            break
+        row = candidate.to_dict()
+        market_id = str(row.get("Market ID", "")).strip()
+        if not market_id or market_id in existing_market_ids:
+            continue
+
+        amount = min(_safe_float(row.get("Position Size $"), 0.0), client.max_order_amount)
+        if amount < 1:
+            outcomes.append({"status": "skipped", "market": row.get("Market"), "reason": "Amount below 1 pUSD"})
+            continue
+        # Reserve fee/headroom and preserve the configured competition floor.
+        if balance - amount * 1.10 < client.auto_min_balance:
+            outcomes.append({"status": "skipped", "market": row.get("Market"), "reason": "Insufficient floor buffer"})
+            continue
+
+        try:
+            token_id, outcome = token_for_signal(row)
+            order_response, estimate = place_fok_with_liquidity_retry(
+                client, token, token_id, amount
+            )
+            status = str(order_response.get("clob_status") or order_response.get("status") or "submitted")
+
+            executed_row = row.copy()
+            executed_row.update({
+                "Execution Token ID": token_id,
+                "Execution Outcome": outcome,
+                "Estimated Fill Price": estimate.get("price", ""),
+                "Executed Amount pUSD": amount,
+                "MCP Order ID": order_response.get("order_id") or order_response.get("id") or "",
+                "CLOB Order ID": order_response.get("clob_order_id", ""),
+                "Execution Status": status,
+                "Execution Response": order_response,
+                "Entry Price %": _safe_float(estimate.get("price"), 0.0) * 100,
+                "Position Size $": amount,
+            })
+            action, row_number = save_to_journal(executed_row, update_existing=True)
+            verify_execution_fields(row_number, {
+                "Execution Token ID": token_id,
+                "Execution Outcome": outcome,
+                "Estimated Fill Price": estimate.get("price", ""),
+                "Executed Amount pUSD": amount,
+                "MCP Order ID": executed_row["MCP Order ID"],
+                "CLOB Order ID": executed_row["CLOB Order ID"],
+                "Execution Status": status,
+                "Execution Response": order_response,
+            })
+            load_journal.clear()
+            existing_market_ids.add(market_id)
+            balance -= amount * 1.10
+            outcomes.append({
+                "status": "matched" if "match" in status.lower() else status,
+                "market": row.get("Market"),
+                "outcome": outcome,
+                "amount": amount,
+                "order_id": executed_row["MCP Order ID"],
+            })
+        except RuntimeError as error:
+            message = str(error)
+            if "422" in message and "no match" in message.lower():
+                outcomes.append({"status": "skipped", "market": row.get("Market"), "reason": "No matchable FOK liquidity"})
+                continue
+            outcomes.append({"status": "error", "market": row.get("Market"), "reason": message})
+        except Exception as error:
+            outcomes.append({"status": "error", "market": row.get("Market"), "reason": str(error)})
+
+    return outcomes or [{"status": "skipped", "reason": "All approved markets were duplicates or unavailable"}]
+
+
+@st.fragment(run_every=AUTO_SCAN_INTERVAL)
+def auto_trading_monitor():
+    """Auto-scan and execute while this Streamlit session remains active."""
+    try:
+        client = MCPTradingClient()
+    except Exception as error:
+        st.error(f"Auto-trading configuration error: {error}")
+        return
+
+    if not client.auto_trading_enabled:
+        st.info("Auto-trading is OFF. Set auto_trading_enabled = true in Streamlit Secrets to enable it.")
+        return
+
+    st.warning(
+        "AUTO-TRADING IS ON. The app scans every 10 minutes while this page/session is active. "
+        "Duplicate markets, daily limits, open-trade limits, price filters and the balance floor remain enforced."
+    )
+    try:
+        markets_df, results = run_quant_scan()
+        st.session_state["markets_df"] = markets_df
+        st.session_state["results"] = results
+        outcomes = auto_execute_approved_trades(results)
+        st.write(f"Last automatic scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        st.dataframe(pd.DataFrame(outcomes), use_container_width=True)
+    except Exception as error:
+        st.error(f"Automatic scan failed safely; no further orders were attempted: {error}")
+
+
+tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Journal", "Competition Tracker", "Research Analytics"])
 
 
 with tab1:
+    st.subheader("Automatic Trading Monitor")
+    auto_trading_monitor()
+    st.markdown("---")
     st.subheader("Run Market Screener")
 
     if st.button("Run MCP Screener", key="run_screener_button"):
@@ -1473,42 +1782,30 @@ with tab1:
         engine = MCPQuantEngine()
         scored = []
 
-        # Use only CLOSED trades with a resolved YES/NO outcome for calibration.
-        # This uses the same definition of a resolved trade as Analytics.
-        # Open trades never train the calibration layer.
-        calibration_journal = load_journal()
-
-        if (
-            not calibration_journal.empty
-            and "Status" in calibration_journal.columns
-            and "Result" in calibration_journal.columns
-        ):
-            status = calibration_journal["Status"].astype(str).str.strip().str.upper()
-            result = calibration_journal["Result"].astype(str).str.strip().str.upper()
-
-            resolved_for_calibration = calibration_journal[
-                status.eq("CLOSED") & result.isin(["YES", "NO"])
-            ].copy()
-        else:
-            resolved_for_calibration = pd.DataFrame()
-
-        # If the journal has closed rows but the calibration set is empty,
-        # surface the actual count in the UI rather than silently reporting
-        # "no resolved trades".
-        st.session_state["calibration_resolved_count"] = len(resolved_for_calibration)
-
         for _, row in markets_df.iterrows():
             try:
-                scored.append(engine.score_market(row, resolved_for_calibration))
+                scored.append(engine.score_market(row))
             except Exception:
                 pass
 
-        results = pd.DataFrame(scored)
+        results = pd.DataFrame(scored, columns=RESULT_COLUMNS)
+
+        # Always replace the previous scan, including when no markets were scored.
         st.session_state["results"] = results
+
+        # Remove stale widget selections and previews from the previous scan.
+        for stale_key in (
+            "explain_trade_selectbox",
+            "save_trade_selectbox",
+            "news_trade_selectbox",
+            "execute_trade_selectbox",
+            "mcp_trade_preview",
+            "confirm_live_mcp_trade",
+        ):
+            st.session_state.pop(stale_key, None)
 
         if len(results) > 0:
             results = results.sort_values("Edge %", ascending=False)
-            st.session_state["results"] = results
             results.to_csv("mcp_dashboard_results.csv", index=False)
 
     if "markets_df" in st.session_state:
@@ -1520,17 +1817,6 @@ with tab1:
         m2.metric("Binary Price Markets", stats.get("binary_price_markets", len(markets_df)))
         m3.metric("Model Eligible", stats.get("eligible_markets", len(markets_df)))
         m4.metric("Rejected", stats.get("rejected_markets", 0))
-
-        calibration_count = st.session_state.get("calibration_resolved_count", 0)
-        if calibration_count < CALIBRATION_MIN_SAMPLES:
-            st.caption(
-                f"Calibration: {calibration_count} resolved trades "
-                f"(activates at {CALIBRATION_MIN_SAMPLES})"
-            )
-        else:
-            st.caption(
-                f"Calibration: ACTIVE — {calibration_count} resolved trades"
-            )
 
         st.subheader("Filtered Markets")
 
@@ -1560,15 +1846,41 @@ with tab1:
     if "results" in st.session_state:
         results = st.session_state["results"]
         if not isinstance(results, pd.DataFrame):
-            results = pd.DataFrame()
+            results = pd.DataFrame(columns=RESULT_COLUMNS)
+        else:
+            results = results.reindex(columns=RESULT_COLUMNS)
 
         st.subheader("Top Trade Candidates")
         st.dataframe(results, use_container_width=True)
 
-        buys = results[results["Signal"].isin(["BUY YES", "BUY NO"]) & results.get("Execution Approved", False).fillna(False).astype(bool)]
+        if results.empty:
+            st.info(
+                "No markets were successfully scored in this scan. This can happen when "
+                "market discovery returns no eligible financial contracts or all price-data "
+                "requests fail temporarily. No trade was attempted."
+            )
 
-        st.subheader("Actionable Trades")
+        model_signals = results[results["Signal"].isin(["BUY YES", "BUY NO"])].copy()
+        buys = model_signals[model_signals["Execution Approved"].fillna(False).astype(bool)].copy()
+        watchlist = model_signals[~model_signals["Execution Approved"].fillna(False).astype(bool)].copy()
+
+        st.subheader("Approved Actionable Trades")
+        st.caption(
+            "Only these trades can be sent to MCP. Approval requires sufficient edge, "
+            "a 15%-85% entry price, at least 55% model probability for the selected outcome, "
+            "and enough time remaining."
+        )
         st.dataframe(buys, use_container_width=True)
+
+        if not watchlist.empty:
+            with st.expander("Model signals not approved for execution"):
+                st.dataframe(
+                    watchlist[[
+                        "Market", "Signal", "Edge %", "Entry Price %",
+                        "Selected Model Prob %", "Days", "Execution Decision"
+                    ]],
+                    use_container_width=True,
+                )
 
         st.markdown("---")
         st.subheader("📰 News Validation")
@@ -1606,98 +1918,62 @@ with tab1:
         st.markdown("---")
         st.subheader("🔍 Explain Model")
 
-        market_options = results["Market"].dropna().astype(str).drop_duplicates().tolist() if not results.empty and "Market" in results.columns else []
-        if not market_options:
-            st.info("No scored trades are available to explain.")
-            explain = None
-        else:
+        market_options = (
+            results["Market"].dropna().astype(str).drop_duplicates().tolist()
+            if not results.empty and "Market" in results.columns
+            else []
+        )
+
+        if market_options:
             selected_trade = st.selectbox(
                 "Select a trade to explain",
                 market_options,
                 key="explain_trade_selectbox",
             )
-            matching = results[results["Market"].astype(str) == str(selected_trade)]
-            explain = matching.iloc[0] if not matching.empty else None
 
-        if explain is not None:
-            c1, c2, c3 = st.columns(3)
-    
-            c1.metric("Current Price", explain["Current Price"])
-            c1.metric("Market Probability", f"{explain['Market Prob %']}%")
-    
-            c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
-            c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
-    
-            c3.metric("Final Probability", f"{explain['Final Prob %']}%")
-            c3.metric("Edge", f"{explain['Edge %']}%")
-    
-            st.markdown("### Model Components")
-    
-            st.write(f"**Market Type:** {explain['Type']}")
-            st.write(f"**Direction:** {explain['Direction']}")
-            st.write(f"**Target:** {explain['Target']}")
-            st.write(f"**Upper Bound:** {explain['Upper']}")
-            st.write(f"**Days to Expiry:** {explain['Days']}")
-            st.write(f"**Momentum Score:** {explain['Momentum']}")
-            st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
-            st.write(f"**Raw Model YES Probability:** {explain['Final Prob %']}%")
-            st.write(f"**Calibrated YES Probability:** {explain.get('Calibrated Prob %', explain['Final Prob %'])}%")
-            st.write(f"**YES Edge:** {explain['YES Edge %']}%")
-            st.write(f"**NO Edge:** {explain['NO Edge %']}%")
-            st.write(f"**Signal:** {explain['Signal']}")
-            st.write(f"**Entry Side:** {explain['Entry Side']}")
-            st.write(f"**Entry Price:** {explain['Entry Price %']}%")
-            st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+            matching_rows = results[results["Market"].astype(str) == str(selected_trade)]
+            if not matching_rows.empty:
+                explain = matching_rows.iloc[0]
 
+                c1, c2, c3 = st.columns(3)
 
-            st.markdown("### Superforecasting Review")
-            historical_prob = _safe_float(explain.get("Historical Prob %"))
-            ewma_prob = _safe_float(explain.get("EWMA Prob %"))
-            market_prob = _safe_float(explain.get("Market Prob %"))
-            final_prob = _safe_float(explain.get("Final Prob %"))
-            calibrated_prob = _safe_float(explain.get("Calibrated Prob %", final_prob))
-            confidence = str(explain.get("Forecast Confidence", "Low"))
-            disagreement = abs(ewma_prob - historical_prob)
+                c1.metric("Current Price", explain["Current Price"])
+                c1.metric("Market Probability", f"{explain['Market Prob %']}%")
 
-            sf1, sf2, sf3, sf4 = st.columns(4)
-            sf1.metric("Outside view", f"{historical_prob:.2f}%")
-            sf2.metric("Current-data view", f"{ewma_prob:.2f}%")
-            sf3.metric("Polymarket benchmark", f"{market_prob:.2f}%")
-            sf4.metric("Confidence", confidence)
+                c2.metric("EWMA Probability", f"{explain['EWMA Prob %']}%")
+                c2.metric("Historical Probability", f"{explain['Historical Prob %']}%")
 
-            reasoning = []
-            if calibrated_prob > market_prob:
-                reasoning.append(
-                    f"The calibrated model assigns YES {calibrated_prob - market_prob:.2f} percentage points more probability than the market."
-                )
-            elif calibrated_prob < market_prob:
-                reasoning.append(
-                    f"The calibrated model assigns YES {market_prob - calibrated_prob:.2f} percentage points less probability than the market."
-                )
+                c3.metric("Final Probability", f"{explain['Final Prob %']}%")
+                c3.metric("Edge", f"{explain['Edge %']}%")
+
+                st.markdown("### Model Components")
+
+                st.write(f"**Market Type:** {explain['Type']}")
+                st.write(f"**Direction:** {explain['Direction']}")
+                st.write(f"**Target:** {explain['Target']}")
+                st.write(f"**Upper Bound:** {explain['Upper']}")
+                st.write(f"**Model Horizon (trading days):** {explain['Days']}")
+                st.write(f"**Momentum Score:** {explain['Momentum']}")
+                st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
+                st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
+                st.write(f"**YES Edge:** {explain['YES Edge %']}%")
+                st.write(f"**NO Edge:** {explain['NO Edge %']}%")
+                st.write(f"**Signal:** {explain['Signal']}")
+                st.write(f"**Entry Side:** {explain['Entry Side']}")
+                st.write(f"**Entry Price:** {explain['Entry Price %']}%")
+                st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
+
+                if explain["Signal"] == "BUY YES":
+                    st.success("✅ YES is underpriced based on the model probability.")
+                elif explain["Signal"] == "BUY NO":
+                    st.error("❌ NO is underpriced based on the model probability.")
+                else:
+                    st.info("⚪ The model does not see enough edge to trade.")
             else:
-                reasoning.append("The model and market assign the same YES probability.")
-            reasoning.append(
-                f"The historical base rate is {historical_prob:.2f}% and the current-volatility estimate is {ewma_prob:.2f}%."
-            )
-            if disagreement > 30:
-                reasoning.append("The outside and current-data views disagree substantially, so confidence is reduced.")
-            elif disagreement > 15:
-                reasoning.append("The two model views disagree moderately, so the forecast should be monitored closely.")
-            else:
-                reasoning.append("The two model views are broadly aligned.")
-            reasoning.append(
-                "Treat this as a dated probability estimate: update it when meaningful evidence changes and score it after resolution."
-            )
-            for item in reasoning:
-                st.write(f"• {item}")
-    
-            if explain["Signal"] == "BUY YES":
-                st.success("✅ YES is underpriced based on the model probability.")
-            elif explain["Signal"] == "BUY NO":
-                st.error("❌ NO is underpriced based on the model probability.")
-            else:
-                st.info("⚪ The model does not see enough edge to trade.")
-    
+                st.warning("The selected trade is no longer available. Run the screener again.")
+        else:
+            st.info("No scored trades are available to explain.")
+
         st.markdown("---")
         st.subheader("Execute Model Trade through MCP")
         st.caption(
@@ -1752,31 +2028,11 @@ with tab1:
                     preview = st.session_state.get("mcp_trade_preview")
                     if preview and preview.get("market") == selected_execute:
                         estimate_price = float(preview["estimate"].get("price", 0) or 0)
-                        (
-                            fresh_approved,
-                            fresh_reason,
-                            fresh_selected_prob,
-                            fresh_edge,
-                        ) = evaluate_execution_price(execute_row, estimate_price)
-
-                        st.success(
-                            f"Fresh estimated execution price: ${estimate_price:.4f} per share"
-                        )
-                        ec1, ec2, ec3 = st.columns(3)
-                        ec1.metric("Model Probability", f"{fresh_selected_prob:.2f}%")
-                        ec2.metric("Fresh Executable Edge", f"{fresh_edge:.2f}%")
-                        ec3.metric("Minimum Required Edge", f"{MIN_ACTIONABLE_EDGE:.0f}%")
-
-                        if fresh_approved:
-                            st.success(f"✅ {fresh_reason}")
-                        else:
-                            st.error(f"❌ Trade blocked: {fresh_reason}")
-
+                        st.success(f"Fresh estimated execution price: ${estimate_price:.4f} per share")
                         st.json(preview["estimate"])
 
                         confirm = st.checkbox(
                             f"I confirm this live BUY {preview_outcome} order for ${capped_amount:.2f} pUSD.",
-                            disabled=not fresh_approved,
                             key="confirm_live_mcp_trade",
                         )
 
@@ -1787,32 +2043,8 @@ with tab1:
                         ):
                             # Re-login and re-estimate immediately before execution so stale session data is not used.
                             token = client.login()
-                            fresh_estimate = client.price_estimate(
-                                token, preview_token_id, "buy", capped_amount
-                            )
-
-                            (
-                                final_approved,
-                                final_reason,
-                                final_selected_prob,
-                                final_edge,
-                            ) = evaluate_execution_price(
-                                execute_row,
-                                fresh_estimate.get("price", 0),
-                            )
-
-                            if not final_approved:
-                                st.error(
-                                    "❌ Trade stopped before submission because the fresh "
-                                    f"execution price no longer meets the rule: {final_reason}"
-                                )
-                                st.session_state.pop("mcp_trade_preview", None)
-                                st.stop()
-
-                            # Order placement is the critical step. Once this succeeds, a later
-                            # journal failure must never be reported as a failed trade.
-                            order_response = client.place_market_order(
-                                token, preview_token_id, "buy", capped_amount
+                            order_response, fresh_estimate = place_fok_with_liquidity_retry(
+                                client, token, preview_token_id, capped_amount
                             )
 
                             executed_row = execute_row.copy()
@@ -1823,14 +2055,9 @@ with tab1:
                             executed_row["MCP Order ID"] = (
                                 order_response.get("order_id")
                                 or order_response.get("id")
-                                or order_response.get("taker_order_id")
                                 or ""
                             )
-                            executed_row["CLOB Order ID"] = (
-                                order_response.get("clob_order_id")
-                                or order_response.get("taker_order_id")
-                                or ""
-                            )
+                            executed_row["CLOB Order ID"] = order_response.get("clob_order_id", "")
                             executed_row["Execution Status"] = (
                                 order_response.get("clob_status")
                                 or order_response.get("status")
@@ -1842,61 +2069,41 @@ with tab1:
                             )
                             executed_row["Position Size $"] = capped_amount
 
-                            st.success("✅ Trade order was accepted by MCP.")
-                            r1, r2, r3, r4 = st.columns(4)
-                            r1.metric("Outcome", preview_outcome)
-                            r2.metric("Amount", f"${capped_amount:.2f}")
-                            r3.metric(
-                                "Estimated Price",
-                                f"${float(fresh_estimate.get('price', 0) or 0):.4f}",
+                            journal_action, journal_row_number = save_to_journal(
+                                executed_row,
+                                update_existing=True,
                             )
-                            r4.metric("Status", executed_row["Execution Status"])
-                            if executed_row["MCP Order ID"]:
-                                st.caption(f"MCP Order ID: {executed_row['MCP Order ID']}")
-                            if executed_row["CLOB Order ID"]:
-                                st.caption(f"CLOB Order ID: {executed_row['CLOB Order ID']}")
-                            st.json(order_response)
-
-                            # Journal persistence is non-critical. Report it separately so a
-                            # Sheets problem cannot create uncertainty or trigger a duplicate order.
-                            try:
-                                journal_action, journal_row_number = save_to_journal(
-                                    executed_row,
-                                    update_existing=True,
-                                )
-                                verify_execution_fields(
-                                    journal_row_number,
-                                    {
-                                        "Execution Token ID": preview_token_id,
-                                        "Execution Outcome": preview_outcome,
-                                        "Estimated Fill Price": fresh_estimate.get("price", ""),
-                                        "Executed Amount pUSD": capped_amount,
-                                        "MCP Order ID": executed_row["MCP Order ID"],
-                                        "CLOB Order ID": executed_row["CLOB Order ID"],
-                                        "Execution Status": executed_row["Execution Status"],
-                                        "Execution Response": order_response,
-                                    },
-                                )
-                                load_journal.clear()
-                                if journal_action == "updated":
-                                    st.success("📒 Existing Google Sheets journal row updated.")
-                                else:
-                                    st.success("📒 New Google Sheets journal row created.")
-                            except Exception as journal_error:
-                                st.warning(
-                                    "⚠️ The trade was submitted successfully, but the Google Sheets "
-                                    f"journal could not be updated: {journal_error}"
-                                )
-                                st.info(
-                                    "Do not submit this trade again. Verify it in MCP Trade History "
-                                    "and repair the journal separately."
-                                )
-
+                            verify_execution_fields(
+                                journal_row_number,
+                                {
+                                    "Execution Token ID": preview_token_id,
+                                    "Execution Outcome": preview_outcome,
+                                    "Estimated Fill Price": fresh_estimate.get("price", ""),
+                                    "Executed Amount pUSD": capped_amount,
+                                    "MCP Order ID": executed_row["MCP Order ID"],
+                                    "CLOB Order ID": executed_row["CLOB Order ID"],
+                                    "Execution Status": executed_row["Execution Status"],
+                                    "Execution Response": order_response,
+                                },
+                            )
+                            load_journal.clear()
                             st.session_state.pop("mcp_trade_preview", None)
+                            if journal_action == "updated":
+                                st.success(
+                                    "Model trade executed through MCP and the existing Google Sheets row was updated."
+                                )
+                            else:
+                                st.success(
+                                    "Model trade executed through MCP and a new Google Sheets row was created."
+                                )
+                            st.json(order_response)
             except Exception as error:
                 message = str(error)
                 if "422" in message and "no match" in message.lower():
-                    st.warning("Trade unavailable: no matchable FOK liquidity. No order was placed.")
+                    st.warning(
+                        "Trade unavailable: MCP found no matchable liquidity for the requested "
+                        "FOK amount. No order was placed. Refresh the screener or try again later."
+                    )
                 else:
                     st.error(f"MCP execution setup error: {error}")
         else:
@@ -1905,33 +2112,36 @@ with tab1:
         st.markdown("---")
         st.subheader("Save Trade to Journal")
 
-        save_options = results["Market"].dropna().astype(str).drop_duplicates().tolist() if not results.empty and "Market" in results.columns else []
+        save_options = (
+            results["Market"].dropna().astype(str).drop_duplicates().tolist()
+            if not results.empty and "Market" in results.columns
+            else []
+        )
+
         if save_options:
             selected_save = st.selectbox(
                 "Select trade to save",
                 save_options,
                 key="save_trade_selectbox",
             )
+
+            if st.button("Save Selected Trade", key="save_trade_button"):
+                matching_rows = results[results["Market"].astype(str) == str(selected_save)]
+                if matching_rows.empty:
+                    st.warning("The selected trade is no longer available. Run the screener again.")
+                else:
+                    row = matching_rows.iloc[0].to_dict()
+                    try:
+                        journal_action, _ = save_to_journal(row, update_existing=True)
+                        load_journal.clear()
+                        if journal_action == "updated":
+                            st.success("The existing Google Sheets trade row was refreshed.")
+                        else:
+                            st.success("Trade saved permanently to Google Sheets.")
+                    except Exception as error:
+                        st.error(f"Trade could not be saved: {error}")
         else:
-            selected_save = None
             st.info("No scored trades are available to save.")
-
-        if selected_save and st.button("Save Selected Trade", key="save_trade_button"):
-            matching = results[results["Market"].astype(str) == str(selected_save)]
-            if matching.empty:
-                st.warning("The selected trade is no longer available. Run the screener again.")
-            else:
-                row = matching.iloc[0].to_dict()
-
-                try:
-                    journal_action, _ = save_to_journal(row, update_existing=True)
-                    load_journal.clear()
-                    if journal_action == "updated":
-                        st.success("The existing Google Sheets trade row was refreshed.")
-                    else:
-                        st.success("Trade saved permanently to Google Sheets.")
-                except Exception as error:
-                    st.error(f"Trade could not be saved: {error}")
 
 
 with tab2:
@@ -1954,126 +2164,134 @@ with tab2:
 
 
 with tab3:
-    st.subheader("Analytics")
+    st.subheader("MCP Competition Performance Tracker")
+    st.caption(
+        "Counts unique MCP orders. Sharpe, Sortino and Calmar are based on resolved trade results in the journal. "
+        "Open-position mark-to-market is not included in these calculated ratios."
+    )
 
     journal = load_journal()
+    metrics = calculate_competition_metrics(journal)
 
-    if len(journal) > 0:
-        if "Status" in journal.columns:
-            closed = journal[journal["Status"] == "Closed"]
-            open_trades = journal[journal["Status"] != "Closed"]
+    live_cash = np.nan
+    try:
+        client = MCPTradingClient()
+        token = client.login()
+        live_cash = _safe_float(client.balance(token).get("balance"), np.nan)
+    except Exception as error:
+        st.warning(f"Live MCP cash balance could not be loaded: {error}")
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Completed Trades", f"{metrics['trade_count']} / {REQUIRED_COMPLETED_TRADES}")
+    p2.metric("Days", f"{metrics['days_elapsed']} / {COMPETITION_DAYS}")
+    p3.metric("Trades Remaining", metrics.get("trades_remaining", REQUIRED_COMPLETED_TRADES))
+    p4.metric("Required Weekly Pace", f"{metrics['required_weekly_pace']:.1f}")
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("MCP Cash Balance", "N/A" if not np.isfinite(live_cash) else f"${live_cash:.2f}")
+    b2.metric("Realized Bankroll", f"${metrics['realized_bankroll']:.2f}")
+    b3.metric("Realized P&L", f"${metrics['total_pnl']:.2f}")
+    floor_buffer = live_cash - MARK_TO_MARKET_FLOOR if np.isfinite(live_cash) else np.nan
+    b4.metric("Cash Buffer Above $70", "N/A" if not np.isfinite(floor_buffer) else f"${floor_buffer:.2f}")
+
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Win Rate", _metric_text(metrics['win_rate'], percent=True))
+    r2.metric("Sharpe", _metric_text(metrics['sharpe']))
+    r3.metric("Sortino", _metric_text(metrics['sortino']))
+    r4.metric("Calmar", _metric_text(metrics['calmar']))
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Realized Max Drawdown", _metric_text(metrics['max_drawdown'], percent=True))
+    d2.metric("Resolved Trades", metrics['closed_count'])
+    d3.metric("Open Executed Trades", metrics['open_count'])
+
+    if np.isfinite(live_cash):
+        if live_cash <= MARK_TO_MARKET_FLOOR:
+            st.error("The MCP cash balance is at or below the $70 risk floor. Stop new orders and review exposure.")
+        elif live_cash < 80:
+            st.warning("The cash balance is within $10 of the $70 floor. Keep sizing conservative.")
         else:
-            closed = pd.DataFrame()
-            open_trades = journal
+            st.success("The current cash balance remains above the competition floor.")
 
-        total_pnl = closed["PnL"].sum() if len(closed) > 0 else 0
-        bankroll = STARTING_BANKROLL + total_pnl
+    progress = min(metrics['trade_count'] / REQUIRED_COMPLETED_TRADES, 1.0)
+    st.progress(progress, text=f"Trade requirement progress: {metrics['trade_count']} of {REQUIRED_COMPLETED_TRADES}")
 
-        buy_count = journal[journal["Signal"].isin(["BUY YES", "BUY NO"])].shape[0]
-        avg_edge = journal["Edge %"].mean()
+    if len(metrics['equity']) > 0:
+        equity_chart = pd.DataFrame({"Realized Equity": metrics['equity'].values})
+        equity_chart.index = range(1, len(equity_chart) + 1)
+        equity_chart.index.name = "Resolved Trade"
+        st.subheader("Realized Equity Curve")
+        st.line_chart(equity_chart)
 
-        wins = closed[closed["PnL"] > 0].shape[0] if len(closed) > 0 else 0
-        win_rate = (wins / len(closed) * 100) if len(closed) > 0 else 0
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric("Bankroll", f"${round(bankroll, 2)}")
-        c2.metric("Total PnL", f"${round(total_pnl, 2)}")
-        c3.metric("Closed Trades", len(closed))
-        c4.metric("Win Rate", f"{round(win_rate, 2)}%")
-
-        c5, c6, c7 = st.columns(3)
-
-        c5.metric("Open Trades", len(open_trades))
-        c6.metric("Buy Signals", buy_count)
-        c7.metric("Avg Edge", round(avg_edge, 2))
-
-        st.subheader("Edge Distribution")
-        st.bar_chart(journal["Edge %"])
-
-        if len(closed) > 0:
-            resolved_count = int(
-                closed["Result"].astype(str).str.upper().isin(["YES", "NO"]).sum()
-            )
-            if resolved_count < CALIBRATION_MIN_SAMPLES:
-                st.caption(
-                    f"Calibration: {resolved_count} resolved trades "
-                    f"(activates at {CALIBRATION_MIN_SAMPLES})"
-                )
-            else:
-                st.caption(
-                    f"Calibration: ACTIVE — {resolved_count} resolved trades"
-                )
-
-            st.subheader("PnL by Trade")
-            st.bar_chart(closed["PnL"])
-
-            resolved = closed[closed["Result"].astype(str).str.upper().isin(["YES", "NO"])].copy()
-            if not resolved.empty:
-                resolved["Outcome YES"] = resolved["Result"].astype(str).str.upper().eq("YES")
-                resolved["Raw Model Brier"] = resolved.apply(
-                    lambda row: brier_score(row.get("Final Prob %", 0), row["Outcome YES"]), axis=1
-                )
-                resolved["Calibrated Model Brier"] = resolved.apply(
-                    lambda row: brier_score(
-                        row.get("Calibrated Prob %", row.get("Final Prob %", 0)),
-                        row["Outcome YES"],
-                    ),
-                    axis=1,
-                )
-                resolved["Model Brier"] = resolved["Calibrated Model Brier"]
-                resolved["Market Brier"] = resolved.apply(
-                    lambda row: brier_score(row.get("Market Prob %", 0), row["Outcome YES"]), axis=1
-                )
-
-                st.subheader("Forecast Accuracy")
-                b1, b2, b3 = st.columns(3)
-                raw_brier = resolved["Raw Model Brier"].mean()
-                calibrated_brier = resolved["Calibrated Model Brier"].mean()
-                market_brier = resolved["Market Brier"].mean()
-
-                b1.metric("Raw Model Brier", f"{raw_brier:.4f}")
-                b2.metric("Calibrated Brier", f"{calibrated_brier:.4f}")
-                b3.metric("Market Brier", f"{market_brier:.4f}")
-
-                comparison = (
-                    "Better"
-                    if calibrated_brier < market_brier
-                    else "Worse"
-                )
-                st.caption(
-                    f"Calibrated Model vs Market: {comparison}. "
-                    "Lower Brier is better."
-                )
-                st.caption("Lower is better: 0 is perfect and 1 is the worst possible binary Brier score.")
-
-                resolved["Final Prob %"] = pd.to_numeric(resolved["Final Prob %"], errors="coerce")
-                if "Calibrated Prob %" in resolved.columns:
-                    resolved["Calibrated Prob %"] = pd.to_numeric(
-                        resolved["Calibrated Prob %"], errors="coerce"
-                    )
-                else:
-                    resolved["Calibrated Prob %"] = resolved["Final Prob %"]
-                resolved = resolved[resolved["Final Prob %"].notna()].copy()
-                resolved["Probability Band"] = pd.cut(
-                    resolved["Final Prob %"],
-                    bins=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
-                    include_lowest=True,
-                )
-                calibration = (
-                    resolved.groupby("Probability Band", observed=False)
-                    .agg(
-                        Forecasts=("Market ID", "count"),
-                        Average_Model_Probability=("Final Prob %", "mean"),
-                        Actual_YES_Rate=("Outcome YES", "mean"),
-                    )
-                    .reset_index()
-                )
-                calibration["Actual_YES_Rate"] *= 100
-                calibration = calibration[calibration["Forecasts"] > 0]
-                st.subheader("Calibration by Probability Band")
-                st.dataframe(calibration, use_container_width=True)
-            else:
-                st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
+    executed = metrics['executed']
+    if not executed.empty:
+        display_cols = [c for c in [
+            "Date Saved", "Market", "Ticker", "Signal", "Edge %", "Final Prob %",
+            "Executed Amount pUSD", "Execution Status", "Status", "Result", "PnL", "MCP Order ID"
+        ] if c in executed.columns]
+        st.subheader("Competition Trade Ledger")
+        st.dataframe(executed[display_cols], use_container_width=True)
     else:
-        st.info("No analytics available yet.")
+        st.info("No unique MCP executions have been recorded yet.")
+
+
+with tab4:
+    st.subheader("Research Analytics")
+    st.caption("Use these tables after enough trades resolve. Very small samples can be misleading.")
+
+    journal = load_journal()
+    metrics = calculate_competition_metrics(journal)
+    closed = metrics['closed'].copy()
+
+    if not closed.empty:
+        closed["Asset Class"] = closed.get("Ticker", "").apply(_asset_class_from_ticker)
+        closed["Win"] = pd.to_numeric(closed["PnL"], errors="coerce").fillna(0) > 0
+        closed["Trade Return"] = closed.apply(_trade_return, axis=1)
+
+        st.subheader("Probability Calibration")
+        calibration = _band_table(
+            closed, "Final Prob %",
+            bins=[0, 60, 70, 80, 90, 95, 101],
+            labels=["<60", "60–69", "70–79", "80–89", "90–94", "95–100"],
+        )
+        if not calibration.empty:
+            st.dataframe(calibration, use_container_width=True)
+
+        st.subheader("Edge Validation")
+        edge_table = _band_table(
+            closed, "Edge %",
+            bins=[0, 5, 10, 15, 20, 1000],
+            labels=["<5", "5–9.9", "10–14.9", "15–19.9", "20+"],
+        )
+        if not edge_table.empty:
+            st.dataframe(edge_table, use_container_width=True)
+
+        st.subheader("Performance by Asset Class")
+        by_asset = closed.groupby("Asset Class").agg(
+            Trades=("Win", "size"),
+            Win_Rate=("Win", "mean"),
+            Total_PnL=("PnL", "sum"),
+            Average_Return=("Trade Return", "mean"),
+        ).reset_index()
+        by_asset["Win Rate"] = (by_asset.pop("Win_Rate") * 100).round(1)
+        by_asset["Total PnL"] = by_asset.pop("Total_PnL").round(3)
+        by_asset["Average Return %"] = (by_asset.pop("Average_Return") * 100).round(1)
+        st.dataframe(by_asset, use_container_width=True)
+
+        type_col = "Type" if "Type" in closed.columns else "Market Type"
+        if type_col in closed.columns:
+            st.subheader("Performance by Market Type")
+            by_type = closed.groupby(type_col).agg(
+                Trades=("Win", "size"),
+                Win_Rate=("Win", "mean"),
+                Total_PnL=("PnL", "sum"),
+            ).reset_index()
+            by_type["Win Rate"] = (by_type.pop("Win_Rate") * 100).round(1)
+            by_type["Total PnL"] = by_type.pop("Total_PnL").round(3)
+            st.dataframe(by_type, use_container_width=True)
+
+        st.subheader("Position Sizing Review")
+        sizing_cols = [c for c in ["Market", "Edge %", "Final Prob %", "Executed Amount pUSD", "PnL", "Trade Return"] if c in closed.columns]
+        st.dataframe(closed[sizing_cols], use_container_width=True)
+    else:
+        st.info("Research analytics will appear after executed trades resolve and the results are updated.")
