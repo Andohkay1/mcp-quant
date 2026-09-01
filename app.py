@@ -552,6 +552,16 @@ class MCPQuantEngine:
             "Final Prob %": round(final, 2),
             "Calibrated Prob %": round(calibrated_prob, 2),
             "Calibration Status": calibration_status,
+            "News Updated Prob %": round(final, 2),
+            "News Update %": 0.0,
+            "News Evidence Count": 0,
+            "News Summary": "Not yet checked",
+            "News-Adjusted YES Edge %": round(yes_edge, 2),
+            "News-Adjusted NO Edge %": round(no_edge, 2),
+            "News-Adjusted Edge %": round(edge, 2),
+            "News-Adjusted Signal": signal,
+            "News-Adjusted Entry Side": entry_side,
+            "News-Adjusted Entry Price %": round(entry_price, 2),
             "YES Edge %": round(yes_edge, 2),
             "NO Edge %": round(no_edge, 2),
             "Edge %": round(edge, 2),
@@ -916,9 +926,43 @@ def pull_markets():
     return eligible
 
 
-def get_news(ticker, limit=5):
-    query = ticker.replace("-", " ")
+# -----------------------------------------------------------------------------
+# Evidence / news update layer
+# -----------------------------------------------------------------------------
+# The classifier is intentionally transparent and conservative.  It does not
+# pretend that a headline is a fully calibrated likelihood ratio.  Instead it
+# classifies the direction of the evidence and maps that strength to a small
+# LR band.  The Bayesian calculation then converts that LR into a small change
+# in the probability.  This keeps news from overpowering the quantitative model.
+NEWS_MAX_TOTAL_SHIFT = 5.0
+NEWS_MAX_SINGLE_SHIFT = 2.0
+NEWS_MIN_RELEVANCE = 0.20
+NEWS_NEUTRAL_SCORE = 1
 
+NEWS_POSITIVE_TERMS = {
+    "surge": 2.0, "surges": 2.0, "soar": 2.0, "soars": 2.0,
+    "rally": 1.5, "rallies": 1.5, "bullish": 1.5, "upgrade": 1.5,
+    "upgraded": 1.5, "beat": 1.5, "beats": 1.5, "strong": 1.0,
+    "growth": 1.0, "gains": 1.0, "gain": 1.0, "positive": 1.0,
+    "record": 1.0, "approval": 1.0, "approved": 1.0, "adoption": 1.0,
+    "outperform": 1.5, "outperforms": 1.5, "rebound": 1.0,
+}
+
+NEWS_NEGATIVE_TERMS = {
+    "crash": 2.0, "crashes": 2.0, "plunge": 2.0, "plunges": 2.0,
+    "selloff": 1.5, "bearish": 1.5, "downgrade": 1.5,
+    "downgraded": 1.5, "miss": 1.5, "misses": 1.5, "weak": 1.0,
+    "decline": 1.0, "declines": 1.0, "loss": 1.0, "losses": 1.0,
+    "negative": 1.0, "lawsuit": 1.0, "fraud": 2.0, "default": 2.0,
+    "hack": 1.5, "hacked": 1.5, "bankruptcy": 2.0, "recession": 1.5,
+    "cut": 1.0, "cuts": 1.0, "warning": 1.0, "risk": 0.5,
+}
+
+NEWS_NEGATIONS = {"not", "no", "without", "unlikely", "fails", "failed"}
+
+
+def get_news(ticker, limit=8):
+    query = ticker.replace("-", " ")
     url = (
         "https://news.google.com/rss/search?"
         f"q={query}+finance+stock+crypto&hl=en-US&gl=US&ceid=US:en"
@@ -927,30 +971,209 @@ def get_news(ticker, limit=5):
     try:
         r = requests.get(url, timeout=10)
         root = ET.fromstring(r.content)
-
         news = []
-
         for item in root.findall(".//item")[:limit]:
-            news.append(
-                {
-                    "Title": item.find("title").text,
-                    "Date": item.find("pubDate").text,
-                    "Link": item.find("link").text,
-                }
-            )
-
+            title_node = item.find("title")
+            date_node = item.find("pubDate")
+            link_node = item.find("link")
+            news.append({
+                "Title": title_node.text if title_node is not None else "",
+                "Date": date_node.text if date_node is not None else "",
+                "Link": link_node.text if link_node is not None else "",
+            })
         return pd.DataFrame(news)
-
     except Exception as e:
-        return pd.DataFrame(
-            [
-                {
-                    "Title": f"News fetch failed: {e}",
-                    "Date": "",
-                    "Link": "",
-                }
-            ]
+        return pd.DataFrame([{"Title": f"News fetch failed: {e}", "Date": "", "Link": ""}])
+
+
+def _headline_sentiment(title):
+    """Return a transparent headline sentiment score in roughly [-1, 1]."""
+    words = re.findall(r"[a-zA-Z]+", str(title).lower())
+    if not words:
+        return 0.0
+
+    positive = 0.0
+    negative = 0.0
+    for i, word in enumerate(words):
+        multiplier = -1.0 if i > 0 and words[i - 1] in NEWS_NEGATIONS else 1.0
+        positive += NEWS_POSITIVE_TERMS.get(word, 0.0) * (multiplier if multiplier > 0 else 0.5)
+        negative += NEWS_NEGATIVE_TERMS.get(word, 0.0) * (multiplier if multiplier > 0 else 0.5)
+
+    raw = positive - negative
+    return float(np.clip(raw / 4.0, -1.0, 1.0))
+
+
+def _news_relevance(title, ticker):
+    """Estimate whether a headline is relevant to the traded asset."""
+    title_lower = str(title).lower()
+    symbol = str(ticker).lower().replace("=f", "").replace("-usd", "")
+    aliases = {
+        "btc": ["bitcoin", "btc"], "eth": ["ethereum", "ether", "eth"],
+        "gc": ["gold", "xau", "gc"], "si": ["silver", "xag", "si"],
+        "ng": ["natural gas", "gas", "ng"], "cl": ["oil", "crude", "wti", "cl"],
+    }
+    terms = aliases.get(symbol, [symbol])
+    direct = any(term in title_lower for term in terms if term)
+    finance_terms = any(x in title_lower for x in [
+        "price", "market", "trading", "shares", "stock", "crypto",
+        "forecast", "futures", "investor", "rate", "fed", "inflation"
+    ])
+    if direct and finance_terms:
+        return 1.0
+    if direct:
+        return 0.75
+    if finance_terms:
+        return 0.35
+    return 0.20
+
+
+def classify_news_evidence(title, ticker, direction, market_type, current_price, target, upper=None):
+    """Classify headline evidence relative to the YES outcome of the contract."""
+    sentiment = _headline_sentiment(title)
+    relevance = _news_relevance(title, ticker)
+
+    if relevance < NEWS_MIN_RELEVANCE or abs(sentiment) < 0.20:
+        evidence = "Neutral"
+        yes_score = 0.0
+    elif market_type == "range":
+        # For a range contract, strong directional news is usually evidence
+        # against remaining inside the range; neutral news supports the range.
+        yes_score = -abs(sentiment)
+        evidence = "Negative"
+    elif direction == "above":
+        yes_score = sentiment
+        evidence = "Positive" if sentiment > 0 else "Negative"
+    else:
+        # For a below/dip contract, bearish news supports YES.
+        yes_score = -sentiment
+        evidence = "Positive" if sentiment < 0 else "Negative"
+
+    # Relevance attenuates the evidence rather than creating a large jump.
+    yes_score *= relevance
+    strength = float(np.clip(abs(yes_score), 0.0, 1.0))
+
+    if strength < 0.20:
+        evidence = "Neutral"
+        yes_score = 0.0
+        strength = 0.0
+
+    # Heuristic likelihood ratios.  These are deliberately narrow because the
+    # headline classifier is not yet trained on resolved news/outcome pairs.
+    if evidence == "Positive":
+        lr = 1.0 + 0.10 * strength
+    elif evidence == "Negative":
+        lr = 1.0 - 0.10 * strength
+    else:
+        lr = 1.0
+
+    return {
+        "Evidence": evidence,
+        "Sentiment": round(sentiment, 3),
+        "Relevance": round(relevance, 3),
+        "Strength": round(strength, 3),
+        "Likelihood Ratio": round(lr, 5),
+    }
+
+
+def bayesian_update_probability(prior_probability_pct, likelihood_ratio):
+    """Posterior odds = prior odds * likelihood ratio."""
+    prior = float(np.clip(prior_probability_pct, 0.01, 99.99)) / 100.0
+    lr = float(max(likelihood_ratio, 1e-9))
+    prior_odds = prior / (1.0 - prior)
+    posterior_odds = prior_odds * lr
+    posterior = posterior_odds / (1.0 + posterior_odds)
+    return float(np.clip(posterior * 100.0, 1.0, 99.0))
+
+
+def apply_news_update(row, news_df):
+    """Apply small Bayesian evidence updates to one model forecast."""
+    result = row.copy()
+    prior = _safe_float(result.get("Final Prob %"), 50.0)
+    current = prior
+    total_shift = 0.0
+    evidence_rows = []
+
+    if news_df is None or news_df.empty or "Title" not in news_df.columns:
+        result["News Updated Prob %"] = round(prior, 2)
+        result["News Update %"] = 0.0
+        result["News Evidence Count"] = 0
+        result["News Summary"] = "No usable news"
+        return result
+
+    for _, news in news_df.iterrows():
+        title = str(news.get("Title", "")).strip()
+        if not title or title.lower().startswith("news fetch failed"):
+            continue
+
+        evidence = classify_news_evidence(
+            title=title,
+            ticker=result.get("Ticker", ""),
+            direction=result.get("Direction", "above"),
+            market_type=result.get("Type", "price"),
+            current_price=result.get("Current Price", 0),
+            target=result.get("Target", 0),
+            upper=result.get("Upper"),
         )
+
+        if evidence["Evidence"] == "Neutral":
+            continue
+
+        posterior = bayesian_update_probability(current, evidence["Likelihood Ratio"])
+        raw_shift = posterior - current
+        shift = float(np.clip(raw_shift, -NEWS_MAX_SINGLE_SHIFT, NEWS_MAX_SINGLE_SHIFT))
+
+        # Cap the total effect of the news batch so headlines cannot overwhelm
+        # the quantitative forecast.
+        remaining = NEWS_MAX_TOTAL_SHIFT - abs(total_shift)
+        if remaining <= 0:
+            break
+        if abs(shift) > remaining:
+            shift = np.sign(shift) * remaining
+
+        current += shift
+        total_shift += shift
+        evidence_rows.append(
+            f"{evidence['Evidence']} {shift:+.2f}pp: {title[:120]}"
+        )
+
+    current = float(np.clip(current, 1.0, 99.0))
+    result["News Updated Prob %"] = round(current, 2)
+    result["News Update %"] = round(current - prior, 2)
+    result["News Evidence Count"] = len(evidence_rows)
+    result["News Summary"] = " | ".join(evidence_rows) if evidence_rows else "No directional evidence"
+
+    # Recalculate the market edge and execution decision using the updated
+    # probability.  Calibration remains a separate historical layer.
+    model_yes = current
+    model_no = 100.0 - current
+    market_yes = _safe_float(result.get("Market Prob %"), 0.0)
+    market_no = _safe_float(result.get("No Prob %"), 0.0)
+    yes_edge = model_yes - market_yes
+    no_edge = model_no - market_no
+
+    if yes_edge > BUY_THRESHOLD:
+        signal = "BUY YES"
+        edge = yes_edge
+        entry_side = "YES"
+        entry_price = market_yes
+    elif no_edge > BUY_THRESHOLD:
+        signal = "BUY NO"
+        edge = no_edge
+        entry_side = "NO"
+        entry_price = market_no
+    else:
+        signal = "PASS"
+        edge = max(yes_edge, no_edge)
+        entry_side = ""
+        entry_price = 0.0
+
+    result["News-Adjusted YES Edge %"] = round(yes_edge, 2)
+    result["News-Adjusted NO Edge %"] = round(no_edge, 2)
+    result["News-Adjusted Edge %"] = round(edge, 2)
+    result["News-Adjusted Signal"] = signal
+    result["News-Adjusted Entry Side"] = entry_side
+    result["News-Adjusted Entry Price %"] = round(entry_price, 2)
+    return result
 
 
 def fetch_market_by_id(market_id):
@@ -1045,6 +1268,16 @@ JOURNAL_COLUMNS = [
     "Final Prob %",
     "Calibrated Prob %",
     "Calibration Status",
+    "News Updated Prob %",
+    "News Update %",
+    "News Evidence Count",
+    "News Summary",
+    "News-Adjusted YES Edge %",
+    "News-Adjusted NO Edge %",
+    "News-Adjusted Edge %",
+    "News-Adjusted Signal",
+    "News-Adjusted Entry Side",
+    "News-Adjusted Entry Price %",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
@@ -1082,6 +1315,13 @@ NUMERIC_JOURNAL_COLUMNS = [
     "Momentum Adj %",
     "Final Prob %",
     "Calibrated Prob %",
+    "News Updated Prob %",
+    "News Update %",
+    "News Evidence Count",
+    "News-Adjusted YES Edge %",
+    "News-Adjusted NO Edge %",
+    "News-Adjusted Edge %",
+    "News-Adjusted Entry Price %",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
@@ -1594,7 +1834,13 @@ with tab1:
         st.dataframe(buys, use_container_width=True)
 
         st.markdown("---")
-        st.subheader("📰 News Validation")
+        st.subheader("📰 News Evidence / Bayesian Update")
+        st.caption(
+            "News is now evidence, not a manual override. Headlines are classified "
+            "as positive, neutral, or negative for the YES outcome, then converted "
+            "to a narrow likelihood ratio. The Bayesian update is capped at ±5pp "
+            "per news batch and ±2pp per headline."
+        )
 
         if len(buys) > 0:
             selected_news_trade = st.selectbox(
@@ -1606,25 +1852,72 @@ with tab1:
             news_row = buys[buys["Market"] == selected_news_trade].iloc[0]
             ticker_for_news = news_row["Ticker"]
 
-            if st.button("Get News", key="get_news_button"):
+            if st.button("Get & Analyze News", key="get_news_button"):
                 news_df = get_news(ticker_for_news)
+                st.session_state["news_df"] = news_df
+                st.session_state["news_market"] = selected_news_trade
 
-                st.dataframe(news_df, use_container_width=True)
+            news_df = st.session_state.get("news_df")
+            if (
+                isinstance(news_df, pd.DataFrame)
+                and not news_df.empty
+                and st.session_state.get("news_market") == selected_news_trade
+            ):
+                analyzed_news = news_df.copy()
+                classifications = []
+                for _, item in analyzed_news.iterrows():
+                    classifications.append(
+                        classify_news_evidence(
+                            title=item.get("Title", ""),
+                            ticker=news_row.get("Ticker", ""),
+                            direction=news_row.get("Direction", "above"),
+                            market_type=news_row.get("Type", "price"),
+                            current_price=news_row.get("Current Price", 0),
+                            target=news_row.get("Target", 0),
+                            upper=news_row.get("Upper"),
+                        )
+                    )
+                analyzed_news["Evidence"] = [x["Evidence"] for x in classifications]
+                analyzed_news["Sentiment"] = [x["Sentiment"] for x in classifications]
+                analyzed_news["Relevance"] = [x["Relevance"] for x in classifications]
+                analyzed_news["Likelihood Ratio"] = [x["Likelihood Ratio"] for x in classifications]
+                st.dataframe(analyzed_news, use_container_width=True)
+
+                updated_row = apply_news_update(news_row, news_df)
+                n1, n2, n3, n4 = st.columns(4)
+                n1.metric("Before News", f"{float(news_row['Final Prob %']):.2f}%")
+                n2.metric("News Update", f"{float(updated_row['News Update %']):+.2f}pp")
+                n3.metric("After News", f"{float(updated_row['News Updated Prob %']):.2f}%")
+                n4.metric("News Evidence", int(updated_row["News Evidence Count"]))
+
+                if st.button("Apply News Update", key="apply_news_button"):
+                    updated_results = st.session_state["results"].copy()
+                    mask = updated_results["Market"].astype(str).eq(str(selected_news_trade))
+                    for column, value in updated_row.items():
+                        if column in updated_results.columns:
+                            updated_results.loc[mask, column] = value
+                    st.session_state["results"] = updated_results
+                    results = updated_results
+                    st.success(
+                        f"News evidence applied: probability moved from "
+                        f"{float(news_row['Final Prob %']):.2f}% to "
+                        f"{float(updated_row['News Updated Prob %']):.2f}%."
+                    )
 
                 st.info(
-                    "Use news as validation only. News should confirm or reject "
-                    "the model signal, not create a trade by itself."
+                    "Important: the likelihood ratios are conservative heuristics until "
+                    "we have enough resolved news/outcome pairs to learn them empirically. "
+                    "The news layer can move the forecast, but cannot create an unlimited jump."
                 )
-
-                verdict = st.radio(
-                    "Manual News Verdict",
-                    ["Positive", "Neutral", "Negative"],
-                    key="manual_news_verdict",
-                )
-
-                st.write(f"News Verdict: **{verdict}**")
         else:
             st.info("No actionable trades. News check skipped.")
+
+        # Rebuild actionable trades after any news update in this run.
+        results = st.session_state.get("results", results)
+        buys = results[
+            results["Signal"].isin(["BUY YES", "BUY NO"])
+            & results.get("Execution Approved", False).fillna(False).astype(bool)
+        ]
 
         st.markdown("---")
         st.subheader("🔍 Explain Model")
@@ -1665,6 +1958,10 @@ with tab1:
             st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
             st.write(f"**Raw Model YES Probability:** {explain['Final Prob %']}%")
             st.write(f"**Calibrated YES Probability:** {explain.get('Calibrated Prob %', explain['Final Prob %'])}%")
+            st.write(f"**News-Updated Probability:** {explain.get('News Updated Prob %', explain['Final Prob %'])}%")
+            st.write(f"**News Update:** {explain.get('News Update %', 0):+.2f} percentage points")
+            st.write(f"**News Evidence Count:** {explain.get('News Evidence Count', 0)}")
+            st.write(f"**News Summary:** {explain.get('News Summary', 'Not yet checked')}")
             st.write(f"**YES Edge:** {explain['YES Edge %']}%")
             st.write(f"**NO Edge:** {explain['NO Edge %']}%")
             st.write(f"**Signal:** {explain['Signal']}")
@@ -1714,6 +2011,9 @@ with tab1:
                 reasoning.append("The two model views disagree moderately, so the forecast should be monitored closely.")
             else:
                 reasoning.append("The two model views are broadly aligned.")
+            reasoning.append(
+                f"News evidence has moved the probability by {float(explain.get('News Update %', 0) or 0):+.2f} percentage points; the update is capped to prevent headlines from overpowering the quantitative model."
+            )
             reasoning.append(
                 "Treat this as a dated probability estimate: update it when meaningful evidence changes and score it after resolution."
             )
