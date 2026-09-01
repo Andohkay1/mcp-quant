@@ -127,6 +127,42 @@ def _max_drawdown_from_pnl(closed):
     return abs(float(drawdown.min())) if len(drawdown) else 0.0, equity
 
 
+
+def calculate_brier_metrics(journal):
+    """Calculate raw/calibrated/market Brier scores from resolved journal forecasts."""
+    if journal is None or journal.empty or "Result" not in journal.columns:
+        return {"raw": None, "calibrated": None, "market": None, "resolved": 0}
+
+    df = journal.copy()
+    result = df["Result"].astype(str).str.upper().str.strip()
+    resolved = result.isin(["YES", "NO"])
+    df = df.loc[resolved].copy()
+    if df.empty:
+        return {"raw": None, "calibrated": None, "market": None, "resolved": 0}
+
+    y = (df["Result"].astype(str).str.upper().str.strip() == "YES").astype(float)
+
+    def numeric(name):
+        return pd.to_numeric(df.get(name, pd.Series(index=df.index)), errors="coerce")
+
+    raw = numeric("Final Prob %")
+    calibrated = numeric("Calibrated Prob %")
+    market = numeric("Market Price %")
+
+    def score(prob):
+        mask = prob.notna() & y.notna()
+        if not mask.any():
+            return None
+        p01 = prob.loc[mask] / 100.0
+        return float(((p01 - y.loc[mask]) ** 2).mean())
+
+    return {
+        "raw": score(raw),
+        "calibrated": score(calibrated),
+        "market": score(market),
+        "resolved": int(len(df)),
+    }
+
 def calculate_competition_metrics(journal):
     """Calculate competition metrics from the permanent journal.
 
@@ -231,7 +267,7 @@ class MCPTradingClient:
         self.password = str(cfg.get("password", ""))
         self.live_enabled = bool(cfg.get("live_trading_enabled", False))
         self.max_order_amount = float(cfg.get("max_order_amount", 1.0))
-        self.auto_trading_enabled = bool(cfg.get("auto_trading_enabled", False))
+        self.auto_trading_enabled = False  # Manual MCP execution only
         self.auto_max_trades_per_day = int(cfg.get("auto_max_trades_per_day", DEFAULT_AUTO_MAX_TRADES_PER_DAY))
         self.auto_max_trades_per_cycle = int(cfg.get("auto_max_trades_per_cycle", DEFAULT_AUTO_MAX_TRADES_PER_CYCLE))
         self.auto_max_open_trades = int(cfg.get("auto_max_open_trades", DEFAULT_AUTO_MAX_OPEN_TRADES))
@@ -1758,6 +1794,29 @@ def auto_trading_monitor():
         st.dataframe(pd.DataFrame(outcomes), use_container_width=True)
     except Exception as error:
         st.error(f"Automatic scan failed safely; no further orders were attempted: {error}")
+
+
+
+st.markdown("---")
+st.subheader("Forecast Accuracy")
+brier = calculate_brier_metrics(load_journal())
+
+if brier["resolved"] == 0:
+    st.info("Brier score will appear after the first resolved forecast.")
+else:
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Raw Model Brier", "N/A" if brier["raw"] is None else f"{brier['raw']:.4f}")
+    b2.metric("Calibrated Brier", "N/A" if brier["calibrated"] is None else f"{brier['calibrated']:.4f}")
+    b3.metric("Market Brier", "N/A" if brier["market"] is None else f"{brier['market']:.4f}")
+
+    if brier["raw"] is not None and brier["market"] is not None:
+        comparison = "Better" if brier["raw"] < brier["market"] else "Worse"
+        b4.metric("Model vs Market", comparison)
+
+    st.caption(
+        f"Brier uses {brier['resolved']} resolved forecasts. "
+        "Lower is better; 0 is perfect and 1 is worst."
+    )
 
 
 tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Journal", "Competition Tracker", "Research Analytics"])
