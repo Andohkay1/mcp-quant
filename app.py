@@ -274,21 +274,19 @@ def calibrate_probability(raw_probability_pct, resolved_df, min_samples=CALIBRAT
 
 def evaluate_execution_price(model_row, estimated_price_decimal):
     """
-    Re-check the trade using the fresh MCP/FOK executable price estimate.
-    This prevents a signal from being executed after its edge has disappeared.
+    Re-check the trade using the RAW quantitative model and the fresh MCP/FOK
+    executable price estimate. Calibration and Bayesian values remain
+    experimental fields only and cannot authorize a live order.
     """
     signal = str(model_row.get("Signal", ""))
-    calibrated_prob = _safe_float(
-        model_row.get("Bayesian Prob %", model_row.get("Calibrated Prob %", model_row.get("Final Prob %"))),
-        0.0,
-    )
+    raw_prob = _safe_float(model_row.get("Final Prob %"), 0.0)
 
     if signal == "BUY YES":
-        selected_probability = calibrated_prob
+        selected_probability = raw_prob
     elif signal == "BUY NO":
-        selected_probability = 100.0 - calibrated_prob
+        selected_probability = 100.0 - raw_prob
     else:
-        return False, "No BUY signal", 0.0, 0.0
+        return False, "No RAW BUY signal", 0.0, 0.0
 
     entry_price_pct = _safe_float(estimated_price_decimal, 0.0) * 100.0
     fresh_edge = selected_probability - entry_price_pct
@@ -323,13 +321,12 @@ def evaluate_execution_price(model_row, estimated_price_decimal):
 
 
 def evaluate_execution_approval(row):
+    """Approve LIVE execution using RAW model probability only."""
     signal = str(row.get("Signal", ""))
     edge = _safe_float(row.get("Edge %"), 0.0)
     entry_price = _safe_float(row.get("Entry Price %"), 0.0)
     days_remaining = _safe_float(row.get("Days"), 0.0)
-    model_yes = _safe_float(
-        row.get("Bayesian Prob %", row.get("Calibrated Prob %", row.get("Final Prob %"))), 0.0
-    )
+    model_yes = _safe_float(row.get("Final Prob %"), 0.0)
     if signal == "BUY YES":
         selected_model_probability = model_yes
     elif signal == "BUY NO":
@@ -642,9 +639,9 @@ class MCPQuantEngine:
             final, calibration_df
         )
 
-        # Bayesian current-information layer: the calibrated quantitative
-        # probability is the prior. Only fresh external information is allowed
-        # to update it; existing model inputs are not reused.
+        # Bayesian current-information layer remains active as an EXPERIMENT.
+        # It is recorded alongside the raw/calibrated forecasts, but it does
+        # not determine the live signal or authorize execution.
         bayesian_prob, bayes_lr, bayes_adjustment, bayes_status, bayes_count = (
             bayesian_current_information_update(
                 calibrated_prob, ticker, direction, market_type
@@ -653,28 +650,51 @@ class MCPQuantEngine:
             else (calibrated_prob, 1.0, 0.0, "Not evaluated (not near trade threshold)", 0)
         )
 
-        model_yes = bayesian_prob
-        model_no = 100 - bayesian_prob
-
         market_yes = market_probability
         market_no = row["No Prob %"]
 
-        yes_edge = model_yes - market_yes
-        no_edge = model_no - market_no
-
-        if yes_edge > BUY_THRESHOLD:
+        # ---- RAW LIVE MODEL ----
+        raw_yes_edge = final - market_yes
+        raw_no_edge = (100.0 - final) - market_no
+        if raw_yes_edge > BUY_THRESHOLD:
             signal = "BUY YES"
-            edge = yes_edge
-        elif no_edge > BUY_THRESHOLD:
+            edge = raw_yes_edge
+        elif raw_no_edge > BUY_THRESHOLD:
             signal = "BUY NO"
-            edge = no_edge
+            edge = raw_no_edge
         else:
             signal = "PASS"
-            edge = max(yes_edge, no_edge)
+            edge = max(raw_yes_edge, raw_no_edge)
 
+        # ---- CALIBRATED EXPERIMENT ----
+        cal_yes_edge = calibrated_prob - market_yes
+        cal_no_edge = (100.0 - calibrated_prob) - market_no
+        if cal_yes_edge > BUY_THRESHOLD:
+            calibrated_signal = "BUY YES"
+            calibrated_edge = cal_yes_edge
+        elif cal_no_edge > BUY_THRESHOLD:
+            calibrated_signal = "BUY NO"
+            calibrated_edge = cal_no_edge
+        else:
+            calibrated_signal = "PASS"
+            calibrated_edge = max(cal_yes_edge, cal_no_edge)
+
+        # ---- BAYESIAN EXPERIMENT ----
+        bayes_yes_edge = bayesian_prob - market_yes
+        bayes_no_edge = (100.0 - bayesian_prob) - market_no
+        if bayes_yes_edge > BUY_THRESHOLD:
+            bayesian_signal = "BUY YES"
+            bayesian_edge = bayes_yes_edge
+        elif bayes_no_edge > BUY_THRESHOLD:
+            bayesian_signal = "BUY NO"
+            bayesian_edge = bayes_no_edge
+        else:
+            bayesian_signal = "PASS"
+            bayesian_edge = max(bayes_yes_edge, bayes_no_edge)
+
+        # LIVE sizing is based only on RAW edge.
         size = 0
         abs_edge = abs(edge)
-
         if signal != "PASS":
             if BUY_THRESHOLD < abs_edge < 8:
                 size = 2
@@ -692,6 +712,24 @@ class MCPQuantEngine:
         else:
             entry_side = ""
             entry_price = 0
+
+        # Experiment entry details are recorded for later A/B analysis.
+        calibrated_entry_side = (
+            "YES" if calibrated_signal == "BUY YES"
+            else "NO" if calibrated_signal == "BUY NO" else ""
+        )
+        calibrated_entry_price = (
+            market_yes if calibrated_signal == "BUY YES"
+            else market_no if calibrated_signal == "BUY NO" else 0
+        )
+        bayesian_entry_side = (
+            "YES" if bayesian_signal == "BUY YES"
+            else "NO" if bayesian_signal == "BUY NO" else ""
+        )
+        bayesian_entry_price = (
+            market_yes if bayesian_signal == "BUY YES"
+            else market_no if bayesian_signal == "BUY NO" else 0
+        )
 
         result = {
             "Market ID": row["Market ID"],
@@ -720,13 +758,37 @@ class MCPQuantEngine:
             "Current Info Count": int(bayes_count),
             "Current Info Status": bayes_status,
             "Calibration Status": calibration_status,
-            "YES Edge %": round(yes_edge, 2),
-            "NO Edge %": round(no_edge, 2),
+            # RAW is the live trading model.
+            "YES Edge %": round(raw_yes_edge, 2),
+            "NO Edge %": round(raw_no_edge, 2),
             "Edge %": round(edge, 2),
             "Signal": signal,
             "Entry Side": entry_side,
             "Entry Price %": round(entry_price, 2),
             "Position Size $": size,
+
+            # Calibration/Bayesian are retained strictly as experiments.
+            "Raw YES Edge %": round(raw_yes_edge, 2),
+            "Raw NO Edge %": round(raw_no_edge, 2),
+            "Raw Edge %": round(edge, 2),
+            "Raw Signal": signal,
+            "Raw Entry Side": entry_side,
+            "Raw Entry Price %": round(entry_price, 2),
+            "Raw Selected Model Prob %": round(
+                final if signal == "BUY YES" else 100.0 - final if signal == "BUY NO" else max(final, 100.0-final), 2
+            ),
+            "Calibrated YES Edge %": round(cal_yes_edge, 2),
+            "Calibrated NO Edge %": round(cal_no_edge, 2),
+            "Calibrated Edge %": round(calibrated_edge, 2),
+            "Calibrated Signal": calibrated_signal,
+            "Calibrated Entry Side": calibrated_entry_side,
+            "Calibrated Entry Price %": round(calibrated_entry_price, 2),
+            "Bayesian YES Edge %": round(bayes_yes_edge, 2),
+            "Bayesian NO Edge %": round(bayes_no_edge, 2),
+            "Bayesian Edge %": round(bayesian_edge, 2),
+            "Bayesian Signal": bayesian_signal,
+            "Bayesian Entry Side": bayesian_entry_side,
+            "Bayesian Entry Price %": round(bayesian_entry_price, 2),
             "clobTokenIds": row["clobTokenIds"],
         }
         approved, reason, selected_prob = evaluate_execution_approval(result)
@@ -1234,6 +1296,25 @@ JOURNAL_COLUMNS = [
     "NO Edge %",
     "Edge %",
     "Signal",
+    "Raw YES Edge %",
+    "Raw NO Edge %",
+    "Raw Edge %",
+    "Raw Signal",
+    "Raw Entry Side",
+    "Raw Entry Price %",
+    "Raw Selected Model Prob %",
+    "Calibrated YES Edge %",
+    "Calibrated NO Edge %",
+    "Calibrated Edge %",
+    "Calibrated Signal",
+    "Calibrated Entry Side",
+    "Calibrated Entry Price %",
+    "Bayesian YES Edge %",
+    "Bayesian NO Edge %",
+    "Bayesian Edge %",
+    "Bayesian Signal",
+    "Bayesian Entry Side",
+    "Bayesian Entry Price %",
     "Entry Side",
     "Entry Price %",
     "Position Size $",
@@ -1275,6 +1356,19 @@ NUMERIC_JOURNAL_COLUMNS = [
     "YES Edge %",
     "NO Edge %",
     "Edge %",
+    "Raw YES Edge %",
+    "Raw NO Edge %",
+    "Raw Edge %",
+    "Raw Entry Price %",
+    "Raw Selected Model Prob %",
+    "Calibrated YES Edge %",
+    "Calibrated NO Edge %",
+    "Calibrated Edge %",
+    "Calibrated Entry Price %",
+    "Bayesian YES Edge %",
+    "Bayesian NO Edge %",
+    "Bayesian Edge %",
+    "Bayesian Entry Price %",
     "Entry Price %",
     "Position Size $",
     "Estimated Fill Price",
@@ -1859,11 +1953,20 @@ with tab1:
             st.write(f"**Bayesian Likelihood Ratio:** {explain.get('Bayesian LR', 1.0)}")
             st.write(f"**Bayesian Adjustment:** {explain.get('Bayesian Adjustment %', 0.0)}%")
             st.write(f"**Current Information:** {explain.get('Current Info Status', 'None')}" )
+            st.markdown("### Experiment — not used for live execution")
+            st.write(
+                f"**Calibrated:** {explain.get('Calibrated Signal', 'PASS')} "
+                f"| Edge {float(explain.get('Calibrated Edge %', 0) or 0):.2f}%"
+            )
+            st.write(
+                f"**Bayesian:** {explain.get('Bayesian Signal', 'PASS')} "
+                f"| Edge {float(explain.get('Bayesian Edge %', 0) or 0):.2f}%"
+            )
             st.write(f"**YES Edge:** {explain['YES Edge %']}%")
             st.write(f"**NO Edge:** {explain['NO Edge %']}%")
-            st.write(f"**Signal:** {explain['Signal']}")
-            st.write(f"**Entry Side:** {explain['Entry Side']}")
-            st.write(f"**Entry Price:** {explain['Entry Price %']}%")
+            st.write(f"**LIVE RAW Signal:** {explain['Signal']}")
+            st.write(f"**LIVE RAW Entry Side:** {explain['Entry Side']}")
+            st.write(f"**LIVE RAW Entry Price:** {explain['Entry Price %']}%")
             st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
 
 
