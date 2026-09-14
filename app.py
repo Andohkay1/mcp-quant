@@ -386,17 +386,81 @@ def _journal_date_saved_et(value):
     except Exception: return pd.NaT
 
 
+def _extract_available_balance(payload):
+    """Safely extract an available cash balance from common MCP response shapes.
+
+    If the API shape is unknown, return None so auto-trading fails closed.
+    """
+    preferred_keys = {
+        "available_balance", "availablebalance", "available",
+        "cash", "balance", "pusd", "p_usd", "usd_balance"
+    }
+
+    def walk(value, depth=0):
+        if depth > 4:
+            return None
+        if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                number = float(value.replace("$", "").replace(",", "").strip())
+                return number if np.isfinite(number) else None
+            except Exception:
+                return None
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if normalized in preferred_keys:
+                    found = walk(child, depth + 1)
+                    if found is not None:
+                        return found
+            for child in value.values():
+                found = walk(child, depth + 1)
+                if found is not None:
+                    return found
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                found = walk(child, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(payload)
+
+
+def _row_was_executed(row):
+    """Identify an actual submitted/executed trade, not a saved screener candidate."""
+    id_fields = ["MCP Order ID", "CLOB Order ID", "Execution Token ID"]
+    if any(str(row.get(field, "")).strip() for field in id_fields):
+        return True
+    amount = _safe_float(row.get("Executed Amount pUSD"), 0.0)
+    status = str(row.get("Execution Status", "")).strip().lower()
+    return amount > 0 and status not in {"", "not executed", "rejected", "failed"}
+
+
 def get_auto_trade_counts(journal, now_et=None):
+    """Return (auto trades today, all currently open executed trades)."""
     now_et = now_et or datetime.now(ET)
-    if journal is None or journal.empty: return 0, 0
-    mode = journal.get("Execution Mode", pd.Series("", index=journal.index)).astype(str).str.upper()
-    auto = journal[mode.eq("AUTO")]
-    if auto.empty: today = 0
+    if journal is None or journal.empty:
+        return 0, 0
+
+    executed_mask = journal.apply(_row_was_executed, axis=1)
+    executed = journal[executed_mask].copy()
+
+    if executed.empty:
+        return 0, 0
+
+    mode = executed.get("Execution Mode", pd.Series("", index=executed.index)).astype(str).str.upper()
+    auto = executed[mode.eq("AUTO")]
+    if auto.empty:
+        today = 0
     else:
         saved = auto.get("Date Saved", pd.Series("", index=auto.index)).apply(_journal_date_saved_et)
         today = int((saved.dt.date == now_et.date()).sum())
-    status = journal.get("Status", pd.Series("Open", index=journal.index)).astype(str).str.upper()
-    return today, int((status != "CLOSED").sum())
+
+    status = executed.get("Status", pd.Series("Open", index=executed.index)).astype(str).str.upper()
+    open_count = int((status != "CLOSED").sum())
+    return today, open_count
 
 
 def build_scored_markets(markets_df):
@@ -414,6 +478,12 @@ def build_scored_markets(markets_df):
 
 
 def execute_auto_trade(candidate):
+    # Re-check the overnight resolution gate immediately before execution.
+    now = datetime.now(timezone.utc)
+    allowed, gate_reason = overnight_resolution_allowed(candidate, now)
+    if not allowed:
+        return False, f"Overnight resolution gate blocked trade: {gate_reason}"
+
     client = MCPTradingClient(); token_id, outcome = token_for_signal(candidate)
     amount = min(float(candidate.get("Position Size $", 0) or 0), client.max_order_amount)
     if amount < 1: return False, "Amount below 1 pUSD minimum."
@@ -436,23 +506,32 @@ def execute_auto_trade(candidate):
         "Execution Response": order, "Entry Price %": final_price*100,
         "Position Size $": amount, "Execution Mode": "AUTO"})
     try:
-        action, row_number = save_to_journal(row, update_existing=True)
+        action, row_number = save_to_journal(row, update_existing=False)
         verify_execution_fields(row_number, {k: row[k] for k in ["Execution Token ID","Execution Outcome","Estimated Fill Price","Executed Amount pUSD","MCP Order ID","CLOB Order ID","Execution Status","Execution Response"]})
         load_journal.clear()
     except Exception as e:
-        return True, f"Trade submitted successfully, but journal update failed: {e}. Do not retry."
+        st.session_state["auto_trading_halt"] = True
+        return True, f"Trade submitted successfully, but journal update failed: {e}. AUTO trading has been halted to prevent a duplicate. Do not retry."
     return True, f"AUTO {outcome} executed for ${amount:.2f} at {final_price:.4f}; edge {edge:.2f}%, model probability {selected_prob:.2f}%."
 
 
 def run_auto_trader_once():
+    if st.session_state.get("auto_trading_halt", False):
+        return {"status": "blocked", "message": "Auto-trading is halted for this session after a journal/execution safety error."}
     now = datetime.now(timezone.utc)
     if not is_overnight_window_et(now): return {"status":"idle","message":"Auto-trading is active only from 12:00–04:00 ET."}
     journal = load_journal().copy(); today, open_count = get_auto_trade_counts(journal, now.astimezone(ET))
     if today >= DEFAULT_AUTO_MAX_TRADES_PER_DAY: return {"status":"blocked","message":f"Daily auto-trade limit reached ({today}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY})."}
     if open_count >= DEFAULT_AUTO_MAX_OPEN_TRADES: return {"status":"blocked","message":f"Open-trade limit reached ({open_count}/{DEFAULT_AUTO_MAX_OPEN_TRADES})."}
-    client = MCPTradingClient(); balance_data = client.balance(client.login())
-    balance = float(balance_data.get("balance", balance_data.get("available_balance", 0)) or 0)
-    if balance < DEFAULT_AUTO_MIN_BALANCE: return {"status":"blocked","message":f"Balance ${balance:.2f} is below ${DEFAULT_AUTO_MIN_BALANCE:.2f} minimum."}
+    client = MCPTradingClient()
+    if not client.live_enabled:
+        return {"status":"blocked", "message":"Live MCP trading is disabled in Streamlit Secrets."}
+    balance_data = client.balance(client.login())
+    balance = _extract_available_balance(balance_data)
+    if balance is None:
+        return {"status":"blocked", "message":"Could not safely determine the available MCP balance; auto-trading was blocked."}
+    if balance < DEFAULT_AUTO_MIN_BALANCE:
+        return {"status":"blocked", "message":f"Balance ${balance:.2f} is below ${DEFAULT_AUTO_MIN_BALANCE:.2f} minimum."}
     results = build_scored_markets(pull_markets())
     if results.empty: return {"status":"idle","message":"No eligible markets were scored."}
     candidates = results[results["Signal"].isin(["BUY YES","BUY NO"]) & results["Execution Approved"].fillna(False).astype(bool)].copy()
@@ -1001,29 +1080,26 @@ def is_overnight_window_et(dt=None):
 
 
 def overnight_resolution_allowed(row, now_utc=None):
-    """Allow overnight automation only when resolution is less than 2 days away.
-
-    This is an additional automatic-trading gate. Existing edge, price, model
-    probability, and execution-price safeguards must still pass separately.
-    """
+    """Return (allowed, reason) for the overnight resolution gate."""
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
 
     if not is_overnight_window_et(now_utc):
-        return True
+        return True, "Outside overnight window"
 
     resolution = pd.to_datetime(
         row.get("Resolution Date"), utc=True, errors="coerce"
     )
     if pd.isna(resolution):
-        return False
+        return False, "Missing resolution date"
 
     days_remaining = (
         resolution - pd.Timestamp(now_utc)
     ).total_seconds() / 86400.0
-    return 0 < days_remaining < OVERNIGHT_MAX_DAYS_REMAINING
+    allowed = 0 < days_remaining < OVERNIGHT_MAX_DAYS_REMAINING
+    return allowed, f"{days_remaining:.2f} days remaining"
 
 
 def classify_market(market):
