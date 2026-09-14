@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from scipy.stats import norm
 from sklearn.linear_model import LogisticRegression
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 
@@ -37,6 +38,18 @@ CALIBRATION_BLEND = 0.75
 CALIBRATION_MAX_SHIFT = 15.0
 SUPERFORECAST_EXTREME_PROB = 95.0
 SUPERFORECAST_MIN_PROB = 5.0
+
+# Automatic-trading safeguards. These are intended for the auto-execution layer;
+# manual screening/execution remains unchanged unless explicitly gated there.
+OVERNIGHT_START_HOUR_ET = 0
+OVERNIGHT_END_HOUR_ET = 4
+OVERNIGHT_MAX_DAYS_REMAINING = 2.0
+DEFAULT_AUTO_MAX_TRADES_PER_DAY = 6
+DEFAULT_AUTO_MAX_TRADES_PER_CYCLE = 1
+DEFAULT_AUTO_MAX_OPEN_TRADES = 8
+DEFAULT_AUTO_MIN_BALANCE = 75.0
+AUTO_SCAN_INTERVAL_MINUTES = 10
+ET = ZoneInfo("America/New_York")
 
 # Bayesian current-information layer. The quantitative model/calibration remains
 # the prior. Only genuinely recent external information is allowed to update it.
@@ -346,6 +359,110 @@ def evaluate_execution_approval(row):
         reasons.append("too little trading time remaining")
     approved = not reasons
     return approved, ("Approved" if approved else "; ".join(reasons)), selected_model_probability
+
+
+def is_overnight_window_et(now_utc=None):
+    if now_utc is None: now_utc = datetime.now(timezone.utc)
+    if isinstance(now_utc, pd.Timestamp): now_utc = now_utc.to_pydatetime()
+    if now_utc.tzinfo is None: now_utc = now_utc.replace(tzinfo=timezone.utc)
+    local = now_utc.astimezone(ET)
+    return OVERNIGHT_START_HOUR_ET <= local.hour < OVERNIGHT_END_HOUR_ET
+
+
+def overnight_resolution_allowed(row, now_utc=None):
+    if now_utc is None: now_utc = datetime.now(timezone.utc)
+    if not is_overnight_window_et(now_utc): return True, "Outside overnight window"
+    resolution = pd.to_datetime(row.get("Resolution Date"), utc=True, errors="coerce")
+    if pd.isna(resolution): return False, "Missing resolution date"
+    days_remaining = (resolution - pd.Timestamp(now_utc)).total_seconds() / 86400.0
+    return (0 < days_remaining < OVERNIGHT_MAX_DAYS_REMAINING, f"{days_remaining:.2f} days remaining")
+
+
+def _journal_date_saved_et(value):
+    if value is None or str(value).strip() == "": return pd.NaT
+    try:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        return pd.NaT if pd.isna(ts) else ts.tz_convert(ET)
+    except Exception: return pd.NaT
+
+
+def get_auto_trade_counts(journal, now_et=None):
+    now_et = now_et or datetime.now(ET)
+    if journal is None or journal.empty: return 0, 0
+    mode = journal.get("Execution Mode", pd.Series("", index=journal.index)).astype(str).str.upper()
+    auto = journal[mode.eq("AUTO")]
+    if auto.empty: today = 0
+    else:
+        saved = auto.get("Date Saved", pd.Series("", index=auto.index)).apply(_journal_date_saved_et)
+        today = int((saved.dt.date == now_et.date()).sum())
+    status = journal.get("Status", pd.Series("Open", index=journal.index)).astype(str).str.upper()
+    return today, int((status != "CLOSED").sum())
+
+
+def build_scored_markets(markets_df):
+    if markets_df is None or markets_df.empty: return pd.DataFrame()
+    calibration = load_journal()
+    if not calibration.empty and "Status" in calibration.columns and "Result" in calibration.columns:
+        stt = calibration["Status"].astype(str).str.upper(); res = calibration["Result"].astype(str).str.upper()
+        calibration = calibration[stt.eq("CLOSED") & res.isin(["YES", "NO"])].copy()
+    else: calibration = pd.DataFrame()
+    engine = MCPQuantEngine(); scored=[]
+    for _, row in markets_df.iterrows():
+        try: scored.append(engine.score_market(row, calibration))
+        except Exception: continue
+    return pd.DataFrame(scored).sort_values("Edge %", ascending=False).reset_index(drop=True) if scored else pd.DataFrame()
+
+
+def execute_auto_trade(candidate):
+    client = MCPTradingClient(); token_id, outcome = token_for_signal(candidate)
+    amount = min(float(candidate.get("Position Size $", 0) or 0), client.max_order_amount)
+    if amount < 1: return False, "Amount below 1 pUSD minimum."
+    token = client.login()
+    estimate = client.price_estimate(token, token_id, "buy", amount)
+    approved, reason, _, _ = evaluate_execution_price(candidate, float(estimate.get("price", 0) or 0))
+    if not approved: return False, f"Fresh FOK check blocked trade: {reason}"
+    token = client.login()
+    fresh = client.price_estimate(token, token_id, "buy", amount)
+    final_price = float(fresh.get("price", 0) or 0)
+    approved, reason, selected_prob, edge = evaluate_execution_price(candidate, final_price)
+    if not approved: return False, f"Final FOK check blocked trade: {reason}"
+    order = client.place_market_order(token, token_id, "buy", amount)
+    row = candidate.copy(); row.update({
+        "Execution Token ID": token_id, "Execution Outcome": outcome,
+        "Estimated Fill Price": final_price, "Executed Amount pUSD": amount,
+        "MCP Order ID": order.get("order_id") or order.get("id") or order.get("taker_order_id") or "",
+        "CLOB Order ID": order.get("clob_order_id") or order.get("taker_order_id") or "",
+        "Execution Status": order.get("clob_status") or order.get("status") or "Submitted",
+        "Execution Response": order, "Entry Price %": final_price*100,
+        "Position Size $": amount, "Execution Mode": "AUTO"})
+    try:
+        action, row_number = save_to_journal(row, update_existing=True)
+        verify_execution_fields(row_number, {k: row[k] for k in ["Execution Token ID","Execution Outcome","Estimated Fill Price","Executed Amount pUSD","MCP Order ID","CLOB Order ID","Execution Status","Execution Response"]})
+        load_journal.clear()
+    except Exception as e:
+        return True, f"Trade submitted successfully, but journal update failed: {e}. Do not retry."
+    return True, f"AUTO {outcome} executed for ${amount:.2f} at {final_price:.4f}; edge {edge:.2f}%, model probability {selected_prob:.2f}%."
+
+
+def run_auto_trader_once():
+    now = datetime.now(timezone.utc)
+    if not is_overnight_window_et(now): return {"status":"idle","message":"Auto-trading is active only from 12:00–04:00 ET."}
+    journal = load_journal().copy(); today, open_count = get_auto_trade_counts(journal, now.astimezone(ET))
+    if today >= DEFAULT_AUTO_MAX_TRADES_PER_DAY: return {"status":"blocked","message":f"Daily auto-trade limit reached ({today}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY})."}
+    if open_count >= DEFAULT_AUTO_MAX_OPEN_TRADES: return {"status":"blocked","message":f"Open-trade limit reached ({open_count}/{DEFAULT_AUTO_MAX_OPEN_TRADES})."}
+    client = MCPTradingClient(); balance_data = client.balance(client.login())
+    balance = float(balance_data.get("balance", balance_data.get("available_balance", 0)) or 0)
+    if balance < DEFAULT_AUTO_MIN_BALANCE: return {"status":"blocked","message":f"Balance ${balance:.2f} is below ${DEFAULT_AUTO_MIN_BALANCE:.2f} minimum."}
+    results = build_scored_markets(pull_markets())
+    if results.empty: return {"status":"idle","message":"No eligible markets were scored."}
+    candidates = results[results["Signal"].isin(["BUY YES","BUY NO"]) & results["Execution Approved"].fillna(False).astype(bool)].copy()
+    existing = set(journal.get("Market ID", pd.Series(dtype=str)).astype(str).str.strip())
+    for _, r in candidates.iterrows():
+        allowed, _ = overnight_resolution_allowed(r, now)
+        if allowed and str(r.get("Market ID","")).strip() not in existing:
+            ok, msg = execute_auto_trade(r.to_dict())
+            return {"status":"executed" if ok else "blocked","message":msg,"market":r.get("Market","")}
+    return {"status":"idle","message":"No qualifying overnight candidate passed all safeguards."}
 
 
 class MCPTradingClient:
@@ -862,8 +979,8 @@ PRICE_MARKET_PATTERNS = [
 ]
 
 NON_PRICE_EVENT_WORDS = [
-    "earnings", "revenue", "eps", "market cap", "fully diluted", "fdv",
-    "acquire", "acquisition", "merger", "ipo", "etf approval", "approve",
+    "earnings", "revenue", "eps", "market cap", "market capitalization", "valuation", "enterprise value", "fully diluted", "fully diluted valuation", "fdv",
+    "acquire", "acquisition", "merger", "ipo", "funding", "financing", "etf approval", "approve",
     "regulation", "lawsuit", "ceo", "president", "election", "nominee",
     "fed chair", "interest rate", "cpi", "inflation", "gdp", "unemployment",
     "tariff", "win", "wins", "champion", "world cup", "ufc", "nba",
@@ -871,6 +988,42 @@ NON_PRICE_EVENT_WORDS = [
     "production", "output", "transit", "transits", "shipments",
     "strait of hormuz", "temperature", "rainfall", "kills", "total rounds",
 ]
+
+
+def is_overnight_window_et(dt=None):
+    """Return True during the 12:00 AM–4:00 AM Eastern automatic-trading window."""
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_et = dt.astimezone(ET)
+    return OVERNIGHT_START_HOUR_ET <= dt_et.hour < OVERNIGHT_END_HOUR_ET
+
+
+def overnight_resolution_allowed(row, now_utc=None):
+    """Allow overnight automation only when resolution is less than 2 days away.
+
+    This is an additional automatic-trading gate. Existing edge, price, model
+    probability, and execution-price safeguards must still pass separately.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    if not is_overnight_window_et(now_utc):
+        return True
+
+    resolution = pd.to_datetime(
+        row.get("Resolution Date"), utc=True, errors="coerce"
+    )
+    if pd.isna(resolution):
+        return False
+
+    days_remaining = (
+        resolution - pd.Timestamp(now_utc)
+    ).total_seconds() / 86400.0
+    return 0 < days_remaining < OVERNIGHT_MAX_DAYS_REMAINING
 
 
 def classify_market(market):
@@ -1106,7 +1259,14 @@ def pull_markets():
     df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.total_seconds() / 86400
     df["Market Type"] = df["Market"].apply(classify_market)
 
+    # Defensive exclusion: valuation/event concepts must never enter the financial
+    # price-market pipeline, even if their wording otherwise resembles a barrier.
     financial_candidates = df[df["Market Type"].isin(["price", "barrier", "range", "daily_close"])].copy()
+    financial_candidates = financial_candidates[
+        ~financial_candidates["Market"].astype(str).str.lower().apply(
+            lambda text: any(word in text for word in NON_PRICE_EVENT_WORDS)
+        )
+    ].copy()
     financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
     financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
@@ -1328,6 +1488,7 @@ JOURNAL_COLUMNS = [
     "CLOB Order ID",
     "Execution Status",
     "Execution Response",
+    "Execution Mode",
     "Date Saved",
     "Status",
     "Result",
@@ -1769,6 +1930,23 @@ tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
 
 with tab1:
+    st.subheader("🤖 Automatic Overnight Trading")
+    st.caption("Auto scans every 10 minutes. It can execute at most 1 trade per cycle and 6 auto trades per ET day. Auto execution is allowed only from 12:00–04:00 ET and only when resolution is under 2 days. All existing execution safeguards remain active.")
+    auto_enabled = st.toggle("Enable automatic overnight trading", value=False, key="auto_trading_enabled", help="Requires live_trading_enabled=true in Streamlit Secrets.")
+    aj = load_journal(); ac, oc = get_auto_trade_counts(aj, datetime.now(ET))
+    a1,a2,a3,a4=st.columns(4); a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S")); a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}"); a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}"); a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
+    if auto_enabled:
+        @st.fragment(run_every=f"{AUTO_SCAN_INTERVAL_MINUTES}m")
+        def automatic_trading_loop():
+            try:
+                result=run_auto_trader_once()
+                if result["status"]=="executed": st.success("🤖 "+result["message"])
+                elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
+                else: st.info("ℹ️ "+result["message"])
+            except Exception as e: st.error(f"Automatic trading cycle failed safely: {e}")
+        automatic_trading_loop()
+    else: st.info("Automatic trading is OFF.")
+    st.markdown("---")
     st.subheader("Run Market Screener")
 
     if st.button("Run MCP Screener", key="run_screener_button"):
@@ -2167,6 +2345,7 @@ with tab1:
                                 float(fresh_estimate.get("price", 0) or 0) * 100
                             )
                             executed_row["Position Size $"] = capped_amount
+                            executed_row["Execution Mode"] = "MANUAL"
 
                             st.success("✅ Trade order was accepted by MCP.")
                             r1, r2, r3, r4 = st.columns(4)
