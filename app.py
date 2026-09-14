@@ -379,11 +379,29 @@ def overnight_resolution_allowed(row, now_utc=None):
 
 
 def _journal_date_saved_et(value):
-    if value is None or str(value).strip() == "": return pd.NaT
+    """Parse journal timestamps as ET; preserve explicit timezone information."""
+    if value is None or str(value).strip() == "":
+        return pd.NaT
     try:
-        ts = pd.to_datetime(value, errors="coerce", utc=True)
-        return pd.NaT if pd.isna(ts) else ts.tz_convert(ET)
-    except Exception: return pd.NaT
+        raw = str(value).strip()
+        has_explicit_tz = bool(
+            re.search(r"(?:Z|[+-]\\d{2}:?\\d{2}|\\bET\\b)$", raw, flags=re.I)
+        )
+        if raw.upper().endswith(" ET"):
+            raw = raw[:-3].strip()
+            ts = pd.to_datetime(raw, errors="coerce")
+            if pd.isna(ts):
+                return pd.NaT
+            return ts.tz_localize(ET)
+        if has_explicit_tz:
+            ts = pd.to_datetime(raw, errors="coerce", utc=True)
+            return pd.NaT if pd.isna(ts) else ts.tz_convert(ET)
+        ts = pd.to_datetime(raw, errors="coerce")
+        if pd.isna(ts):
+            return pd.NaT
+        return ts.tz_localize(ET)
+    except Exception:
+        return pd.NaT
 
 
 def _extract_available_balance(payload):
@@ -1770,7 +1788,7 @@ def save_to_journal(row, update_existing=False):
                 journal_row[field] = existing_record.get(field, "")
 
         if not journal_row.get("Date Saved"):
-            journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            journal_row["Date Saved"] = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
         if not journal_row.get("Status"):
             journal_row["Status"] = "Open"
         if journal_row.get("Result") is None:
@@ -1790,7 +1808,7 @@ def save_to_journal(row, update_existing=False):
         )
         return "updated", existing_row_number
 
-    journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    journal_row["Date Saved"] = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
     journal_row["Status"] = journal_row.get("Status") or "Open"
     journal_row["Result"] = journal_row.get("Result", "")
     journal_row["PnL"] = journal_row.get("PnL", 0.0)
