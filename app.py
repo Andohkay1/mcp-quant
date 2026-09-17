@@ -1,3 +1,12 @@
+import os
+
+# Keep numerical libraries from creating large native thread pools on Streamlit Cloud.
+# This is a resource-safety setting only; it does not change the trading model.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -1460,6 +1469,7 @@ def pull_markets():
     return eligible
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def get_news(ticker, limit=BAYESIAN_NEWS_LIMIT):
     """Fetch recent public information only; stale headlines are excluded."""
     query = quote_plus(str(ticker).replace("-", " "))
@@ -2006,7 +2016,7 @@ def verify_execution_fields(sheet_row_number, expected):
     return saved
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_journal():
     """Load the permanent journal from Google Sheets."""
     try:
@@ -2015,8 +2025,8 @@ def load_journal():
             expected_headers=worksheet.row_values(1),
             default_blank="",
         )
-    except Exception as error:
-        st.error(f"Could not load the trading journal: {error}")
+    except Exception:
+        # Cached functions should not emit Streamlit UI elements. Fail closed.
         return pd.DataFrame(columns=JOURNAL_COLUMNS)
 
     if not records:
@@ -2169,14 +2179,27 @@ with tab1:
     if auto_enabled:
         @st.fragment(run_every=f"{AUTO_SCAN_INTERVAL_MINUTES}m")
         def automatic_trading_loop():
+            # Prevent overlapping fragment executions from running two scans/orders
+            # at the same time after a rerun or temporary server pressure.
+            if st.session_state.get("auto_cycle_running", False):
+                st.info("ℹ️ Previous automatic cycle is still running; this cycle was skipped.")
+                return
+            st.session_state["auto_cycle_running"] = True
             try:
-                result=run_auto_trader_once()
-                if result["status"]=="executed": st.success("🤖 "+result["message"])
-                elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
-                else: st.info("ℹ️ "+result["message"])
-            except Exception as e: st.error(f"Automatic trading cycle failed safely: {e}")
+                result = run_auto_trader_once()
+                if result["status"] == "executed":
+                    st.success("🤖 " + result["message"])
+                elif result["status"] == "blocked":
+                    st.warning("🛑 " + result["message"])
+                else:
+                    st.info("ℹ️ " + result["message"])
+            except Exception as e:
+                st.error(f"Automatic trading cycle failed safely: {e}")
+            finally:
+                st.session_state["auto_cycle_running"] = False
         automatic_trading_loop()
-    else: st.info("Automatic trading is OFF.")
+    else:
+        st.info("Automatic trading is OFF.")
     st.markdown("---")
     st.subheader("Run Market Screener")
 
@@ -2304,6 +2327,8 @@ with tab1:
         # raise KeyError and take down the dashboard. Missing execution approval
         # is treated as False (fail closed).
         if results.empty or "Signal" not in results.columns:
+            # A partial/empty scan can still be displayed, but it can never
+            # become an actionable trade.
             buys = pd.DataFrame(columns=results.columns)
         else:
             execution_approved = (
@@ -2877,3 +2902,4 @@ with tab3:
                 st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
     else:
         st.info("No analytics available yet.")
+
