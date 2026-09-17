@@ -7,11 +7,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from scipy.stats import norm
-from sklearn.linear_model import LogisticRegression
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus
+from datetime import datetime
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -33,32 +29,6 @@ MIN_TRADABLE_ENTRY_PRICE_PCT = 15.0
 MAX_TRADABLE_ENTRY_PRICE_PCT = 85.0
 MIN_SELECTED_MODEL_PROB_PCT = 55.0
 MIN_TRADING_DAYS_REMAINING = 0.01
-CALIBRATION_MIN_SAMPLES = 30
-CALIBRATION_BLEND = 0.75
-CALIBRATION_MAX_SHIFT = 15.0
-SUPERFORECAST_EXTREME_PROB = 95.0
-SUPERFORECAST_MIN_PROB = 5.0
-
-# Automatic-trading safeguards. These are intended for the auto-execution layer;
-# manual screening/execution remains unchanged unless explicitly gated there.
-OVERNIGHT_START_HOUR_ET = 0
-OVERNIGHT_END_HOUR_ET = 4
-OVERNIGHT_MAX_DAYS_REMAINING = 2.0
-DEFAULT_AUTO_MAX_TRADES_PER_DAY = 6
-DEFAULT_AUTO_MAX_TRADES_PER_CYCLE = 1
-DEFAULT_AUTO_MAX_OPEN_TRADES = 8
-DEFAULT_AUTO_MIN_BALANCE = 75.0
-AUTO_SCAN_INTERVAL_MINUTES = 10
-ET = ZoneInfo("America/New_York")
-
-# Bayesian current-information layer. The quantitative model/calibration remains
-# the prior. Only genuinely recent external information is allowed to update it.
-BAYESIAN_NEWS_MAX_AGE_HOURS = 72
-BAYESIAN_NEWS_FULL_WEIGHT_HOURS = 6
-BAYESIAN_NEWS_HIGH_WEIGHT_HOURS = 24
-BAYESIAN_NEWS_REDUCED_WEIGHT_HOURS = 48
-BAYESIAN_MAX_LOG_LR = float(np.log(1.15))  # conservative total update cap
-BAYESIAN_NEWS_LIMIT = 12
 
 
 def _safe_float(value, default=0.0):
@@ -87,254 +57,7 @@ def brier_score(probability_pct, outcome_yes):
     return float((probability - outcome) ** 2)
 
 
-
-POSITIVE_INFO_WORDS = {
-    "beat", "beats", "surge", "surges", "jump", "jumps", "rally", "rallies",
-    "growth", "grows", "strong", "stronger", "upgrade", "upgraded", "raises",
-    "raised", "profit", "profits", "record", "bullish", "approval", "approved",
-    "deal", "contract", "partnership", "launch", "wins", "winner", "demand",
-}
-NEGATIVE_INFO_WORDS = {
-    "miss", "misses", "drop", "drops", "fall", "falls", "decline", "declines",
-    "weak", "weaker", "downgrade", "downgraded", "cuts", "cut", "loss", "losses",
-    "bearish", "lawsuit", "probe", "investigation", "warning", "recall", "delay",
-    "delays", "layoffs", "fraud", "risk", "risks", "slump", "plunge", "plunges",
-}
-STRONG_INFO_WORDS = {
-    "bankruptcy", "bankrupt", "default", "fraud", "recall", "lawsuit", "investigation",
-    "approval", "approved", "rejection", "rejected", "earnings", "guidance", "acquisition",
-    "merger", "contract", "regulatory", "regulator",
-}
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "as",
-    "is", "are", "was", "were", "by", "from", "at", "after", "before", "says", "said",
-    "stock", "shares", "market", "price", "company", "inc", "corp", "co",
-}
-
-
-def _news_age_hours(date_text):
-    try:
-        dt = parsedate_to_datetime(str(date_text))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0)
-    except Exception:
-        return None
-
-
-def _news_weight(age_hours):
-    if age_hours is None or age_hours > BAYESIAN_NEWS_MAX_AGE_HOURS:
-        return 0.0
-    if age_hours <= BAYESIAN_NEWS_FULL_WEIGHT_HOURS:
-        return 1.0
-    if age_hours <= BAYESIAN_NEWS_HIGH_WEIGHT_HOURS:
-        return 0.75
-    if age_hours <= BAYESIAN_NEWS_REDUCED_WEIGHT_HOURS:
-        return 0.50
-    return 0.25
-
-
-def _headline_sentiment(title):
-    words = re.findall(r"[a-z]+", str(title).lower())
-    pos = sum(w in POSITIVE_INFO_WORDS for w in words)
-    neg = sum(w in NEGATIVE_INFO_WORDS for w in words)
-    strong = sum(w in STRONG_INFO_WORDS for w in words)
-    if pos == neg:
-        return 0, 0.0, "Neutral"
-    direction = 1 if pos > neg else -1
-    strength = min(2.0, 0.5 + 0.5 * abs(pos - neg) + 0.5 * strong)
-    label = "Positive" if direction > 0 else "Negative"
-    return direction, strength, label
-
-
-def _information_support_for_hypothesis(sentiment_direction, market_direction, market_type):
-    """Map asset sentiment to support/oppose for the YES hypothesis."""
-    if sentiment_direction == 0:
-        return 0
-    if market_type == "range":
-        # Directional news generally raises the chance of leaving a range.
-        return -1
-    if market_direction == "above":
-        return sentiment_direction
-    if market_direction == "below":
-        return -sentiment_direction
-    return 0
-
-
-def bayesian_current_information_update(prior_probability_pct, ticker, direction, market_type):
-    """Update the calibrated prior using only recent external information.
-
-    Bayes is applied in odds form:
-        posterior_odds = prior_odds * likelihood_ratio
-    The likelihood ratio is conservative and derived only from fresh, directional
-    external headlines. Existing quantitative inputs are deliberately not reused.
-    """
-    prior = float(np.clip(_safe_float(prior_probability_pct, 50.0), 0.01, 99.99))
-    news = get_news(ticker, limit=BAYESIAN_NEWS_LIMIT)
-    if news is None or news.empty:
-        return prior, 1.0, 0.0, "No recent information", 0
-
-    log_lr_total = 0.0
-    used = 0
-    seen = set()
-    evidence_labels = []
-
-    for _, item in news.iterrows():
-        title = str(item.get("Title", "")).strip()
-        key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-
-        age = _news_age_hours(item.get("Date", ""))
-        weight = _news_weight(age)
-        if weight <= 0:
-            continue
-
-        sentiment, strength, sentiment_label = _headline_sentiment(title)
-        support = _information_support_for_hypothesis(sentiment, direction, market_type)
-        if support == 0:
-            continue
-
-        # 1.04 is weak evidence, 1.08 moderate, 1.12 strong before freshness.
-        base_log_lr = np.log(1.04 + min(strength, 2.0) * 0.04)
-        contribution = support * base_log_lr * weight
-        log_lr_total += contribution
-        used += 1
-        evidence_labels.append(f"{sentiment_label} ({age:.1f}h)")
-
-        # Avoid letting a cluster of headlines overwhelm the quantitative prior.
-        if abs(log_lr_total) >= BAYESIAN_MAX_LOG_LR:
-            log_lr_total = float(np.clip(log_lr_total, -BAYESIAN_MAX_LOG_LR, BAYESIAN_MAX_LOG_LR))
-            break
-
-    log_lr_total = float(np.clip(log_lr_total, -BAYESIAN_MAX_LOG_LR, BAYESIAN_MAX_LOG_LR))
-    lr = float(np.exp(log_lr_total))
-    prior_odds = prior / (100.0 - prior)
-    posterior_odds = prior_odds * lr
-    posterior = 100.0 * posterior_odds / (1.0 + posterior_odds)
-    adjustment = posterior - prior
-
-    if used == 0:
-        status = "No qualifying recent information"
-    else:
-        status = "; ".join(evidence_labels[:4])
-        if len(evidence_labels) > 4:
-            status += f" +{len(evidence_labels)-4} more"
-
-    return float(np.clip(posterior, 0.01, 99.99)), lr, adjustment, status, used
-
-
-def calibrate_probability(raw_probability_pct, resolved_df, min_samples=CALIBRATION_MIN_SAMPLES):
-    """
-    Calibrate the existing model probability using resolved historical trades.
-
-    The original model probability is preserved. Calibration is deliberately
-    conservative: it requires a minimum sample, shrinks the regression output
-    toward the raw probability, and caps the adjustment size.
-    """
-    raw = float(np.clip(_safe_float(raw_probability_pct, 50.0), 0.01, 99.99))
-
-    if resolved_df is None or resolved_df.empty:
-        return raw, "RAW (0 resolved)"
-
-    data = resolved_df.copy()
-    required = {"Final Prob %", "Result"}
-    if not required.issubset(data.columns):
-        return raw, "RAW (missing calibration columns)"
-
-    data["Final Prob %"] = pd.to_numeric(data["Final Prob %"], errors="coerce")
-    data["Outcome"] = (
-        data["Result"].astype(str).str.strip().str.upper().map({"YES": 1, "NO": 0})
-    )
-    data = data.dropna(subset=["Final Prob %", "Outcome"])
-    data = data[data["Final Prob %"].between(0, 100)]
-
-    if len(data) < min_samples:
-        return raw, f"RAW (<{min_samples} resolved)"
-
-    if data["Outcome"].nunique() < 2:
-        return raw, "RAW (one outcome only)"
-
-    try:
-        X = (data[["Final Prob %"]].to_numpy(dtype=float) / 100.0)
-        y = data["Outcome"].to_numpy(dtype=int)
-
-        model = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
-        model.fit(X, y)
-
-        regression_probability = float(
-            model.predict_proba(np.array([[raw / 100.0]]))[0, 1] * 100.0
-        )
-
-        # Conservative shrinkage prevents a small live sample from moving
-        # probabilities too aggressively.
-        calibrated = (
-            CALIBRATION_BLEND * regression_probability
-            + (1.0 - CALIBRATION_BLEND) * raw
-        )
-
-        shift = calibrated - raw
-        if abs(shift) > CALIBRATION_MAX_SHIFT:
-            calibrated = raw + np.sign(shift) * CALIBRATION_MAX_SHIFT
-
-        calibrated = float(np.clip(calibrated, 1.0, 99.0))
-        return calibrated, f"CALIBRATED ({len(data)} resolved)"
-
-    except Exception as error:
-        return raw, f"RAW (calibration error: {type(error).__name__})"
-
-
-def evaluate_execution_price(model_row, estimated_price_decimal):
-    """
-    Re-check the trade using the RAW quantitative model and the fresh MCP/FOK
-    executable price estimate. Calibration and Bayesian values remain
-    experimental fields only and cannot authorize a live order.
-    """
-    signal = str(model_row.get("Signal", ""))
-    raw_prob = _safe_float(model_row.get("Final Prob %"), 0.0)
-
-    if signal == "BUY YES":
-        selected_probability = raw_prob
-    elif signal == "BUY NO":
-        selected_probability = 100.0 - raw_prob
-    else:
-        return False, "No RAW BUY signal", 0.0, 0.0
-
-    entry_price_pct = _safe_float(estimated_price_decimal, 0.0) * 100.0
-    fresh_edge = selected_probability - entry_price_pct
-
-    reasons = []
-    if fresh_edge < MIN_ACTIONABLE_EDGE:
-        reasons.append(
-            f"fresh executable edge below {MIN_ACTIONABLE_EDGE:.0f}% "
-            f"({fresh_edge:.2f}%)"
-        )
-    if entry_price_pct < MIN_TRADABLE_ENTRY_PRICE_PCT:
-        reasons.append(
-            f"fresh entry price below {MIN_TRADABLE_ENTRY_PRICE_PCT:.0f}%"
-        )
-    if entry_price_pct > MAX_TRADABLE_ENTRY_PRICE_PCT:
-        reasons.append(
-            f"fresh entry price above {MAX_TRADABLE_ENTRY_PRICE_PCT:.0f}%"
-        )
-    if selected_probability < MIN_SELECTED_MODEL_PROB_PCT:
-        reasons.append(
-            f"selected-outcome model probability below "
-            f"{MIN_SELECTED_MODEL_PROB_PCT:.0f}%"
-        )
-
-    approved = not reasons
-    return (
-        approved,
-        "Approved at fresh executable price" if approved else "; ".join(reasons),
-        selected_probability,
-        fresh_edge,
-    )
-
-
 def evaluate_execution_approval(row):
-    """Approve LIVE execution using RAW model probability only."""
     signal = str(row.get("Signal", ""))
     edge = _safe_float(row.get("Edge %"), 0.0)
     entry_price = _safe_float(row.get("Entry Price %"), 0.0)
@@ -359,250 +82,6 @@ def evaluate_execution_approval(row):
         reasons.append("too little trading time remaining")
     approved = not reasons
     return approved, ("Approved" if approved else "; ".join(reasons)), selected_model_probability
-
-
-def is_overnight_window_et(now_utc=None):
-    if now_utc is None: now_utc = datetime.now(timezone.utc)
-    if isinstance(now_utc, pd.Timestamp): now_utc = now_utc.to_pydatetime()
-    if now_utc.tzinfo is None: now_utc = now_utc.replace(tzinfo=timezone.utc)
-    local = now_utc.astimezone(ET)
-    return OVERNIGHT_START_HOUR_ET <= local.hour < OVERNIGHT_END_HOUR_ET
-
-
-def overnight_resolution_allowed(row, now_utc=None):
-    if now_utc is None: now_utc = datetime.now(timezone.utc)
-    if not is_overnight_window_et(now_utc): return True, "Outside overnight window"
-    resolution = pd.to_datetime(row.get("Resolution Date"), utc=True, errors="coerce")
-    if pd.isna(resolution): return False, "Missing resolution date"
-    days_remaining = (resolution - pd.Timestamp(now_utc)).total_seconds() / 86400.0
-    return (0 < days_remaining < OVERNIGHT_MAX_DAYS_REMAINING, f"{days_remaining:.2f} days remaining")
-
-
-def _journal_date_saved_et(value):
-    """Parse journal timestamps as ET; preserve explicit timezone information."""
-    if value is None or str(value).strip() == "":
-        return pd.NaT
-    try:
-        raw = str(value).strip()
-        has_explicit_tz = bool(
-            re.search(r"(?:Z|[+-]\\d{2}:?\\d{2}|\\bET\\b)$", raw, flags=re.I)
-        )
-        if raw.upper().endswith(" ET"):
-            raw = raw[:-3].strip()
-            ts = pd.to_datetime(raw, errors="coerce")
-            if pd.isna(ts):
-                return pd.NaT
-            return ts.tz_localize(ET)
-        if has_explicit_tz:
-            ts = pd.to_datetime(raw, errors="coerce", utc=True)
-            return pd.NaT if pd.isna(ts) else ts.tz_convert(ET)
-        ts = pd.to_datetime(raw, errors="coerce")
-        if pd.isna(ts):
-            return pd.NaT
-        return ts.tz_localize(ET)
-    except Exception:
-        return pd.NaT
-
-
-def _extract_available_balance(payload):
-    """Safely extract an available cash balance from common MCP response shapes.
-
-    If the API shape is unknown, return None so auto-trading fails closed.
-    """
-    preferred_keys = {
-        "available_balance", "availablebalance", "available",
-        "cash", "balance", "pusd", "p_usd", "usd_balance"
-    }
-
-    def walk(value, depth=0):
-        if depth > 4:
-            return None
-        if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                number = float(value.replace("$", "").replace(",", "").strip())
-                return number if np.isfinite(number) else None
-            except Exception:
-                return None
-        if isinstance(value, dict):
-            for key, child in value.items():
-                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-                if normalized in preferred_keys:
-                    found = walk(child, depth + 1)
-                    if found is not None:
-                        return found
-            for child in value.values():
-                found = walk(child, depth + 1)
-                if found is not None:
-                    return found
-        if isinstance(value, (list, tuple)):
-            for child in value:
-                found = walk(child, depth + 1)
-                if found is not None:
-                    return found
-        return None
-
-    return walk(payload)
-
-
-def _row_was_executed(row):
-    """Identify an actual submitted/executed trade, not a saved screener candidate."""
-    id_fields = ["MCP Order ID", "CLOB Order ID", "Execution Token ID"]
-    if any(str(row.get(field, "")).strip() for field in id_fields):
-        return True
-    amount = _safe_float(row.get("Executed Amount pUSD"), 0.0)
-    status = str(row.get("Execution Status", "")).strip().lower()
-    return amount > 0 and status not in {"", "not executed", "rejected", "failed"}
-
-
-def get_auto_trade_counts(journal, now_et=None):
-    """Return (auto trades today, all currently open executed trades)."""
-    now_et = now_et or datetime.now(ET)
-    if journal is None or journal.empty:
-        return 0, 0
-
-    executed_mask = journal.apply(_row_was_executed, axis=1)
-    executed = journal[executed_mask].copy()
-
-    if executed.empty:
-        return 0, 0
-
-    mode = executed.get("Execution Mode", pd.Series("", index=executed.index)).astype(str).str.upper()
-    auto = executed[mode.eq("AUTO")]
-    if auto.empty:
-        today = 0
-    else:
-        saved = auto.get("Date Saved", pd.Series("", index=auto.index)).apply(_journal_date_saved_et)
-        today = int((saved.dt.date == now_et.date()).sum())
-
-    status = executed.get("Status", pd.Series("Open", index=executed.index)).astype(str).str.upper()
-    open_count = int((status != "CLOSED").sum())
-    return today, open_count
-
-
-def build_scored_markets(markets_df):
-    """Score eligible markets without allowing one bad market to crash the scan.
-
-    Scoring errors are recorded in session state so they are visible for debugging
-    instead of being silently discarded. A market that cannot be scored is never
-    passed to the execution layer.
-    """
-    if markets_df is None or markets_df.empty:
-        st.session_state["score_errors"] = pd.DataFrame(
-            columns=["Market ID", "Market", "Ticker", "Error"]
-        )
-        return pd.DataFrame()
-
-    calibration = load_journal()
-    if not calibration.empty and "Status" in calibration.columns and "Result" in calibration.columns:
-        stt = calibration["Status"].astype(str).str.upper()
-        res = calibration["Result"].astype(str).str.upper()
-        calibration = calibration[stt.eq("CLOSED") & res.isin(["YES", "NO"])].copy()
-    else:
-        calibration = pd.DataFrame()
-
-    engine = MCPQuantEngine()
-    scored = []
-    errors = []
-
-    for _, row in markets_df.iterrows():
-        try:
-            scored.append(engine.score_market(row, calibration))
-        except Exception as exc:
-            errors.append({
-                "Market ID": row.get("Market ID", ""),
-                "Market": row.get("Market", ""),
-                "Ticker": row.get("Ticker", ""),
-                "Error": f"{type(exc).__name__}: {exc}",
-            })
-
-    st.session_state["score_errors"] = pd.DataFrame(
-        errors, columns=["Market ID", "Market", "Ticker", "Error"]
-    )
-
-    if not scored:
-        return pd.DataFrame()
-
-    results = pd.DataFrame(scored)
-    if "Edge %" in results.columns:
-        results = results.sort_values("Edge %", ascending=False)
-    return results.reset_index(drop=True)
-
-
-def execute_auto_trade(candidate):
-    # Re-check the overnight resolution gate immediately before execution.
-    now = datetime.now(timezone.utc)
-    allowed, gate_reason = overnight_resolution_allowed(candidate, now)
-    if not allowed:
-        return False, f"Overnight resolution gate blocked trade: {gate_reason}"
-
-    client = MCPTradingClient(); token_id, outcome = token_for_signal(candidate)
-    amount = min(float(candidate.get("Position Size $", 0) or 0), client.max_order_amount)
-    if amount < 1: return False, "Amount below 1 pUSD minimum."
-    token = client.login()
-    estimate = client.price_estimate(token, token_id, "buy", amount)
-    approved, reason, _, _ = evaluate_execution_price(candidate, float(estimate.get("price", 0) or 0))
-    if not approved: return False, f"Fresh FOK check blocked trade: {reason}"
-    token = client.login()
-    fresh = client.price_estimate(token, token_id, "buy", amount)
-    final_price = float(fresh.get("price", 0) or 0)
-    approved, reason, selected_prob, edge = evaluate_execution_price(candidate, final_price)
-    if not approved: return False, f"Final FOK check blocked trade: {reason}"
-    order = client.place_market_order(token, token_id, "buy", amount)
-    row = candidate.copy(); row.update({
-        "Execution Token ID": token_id, "Execution Outcome": outcome,
-        "Estimated Fill Price": final_price, "Executed Amount pUSD": amount,
-        "MCP Order ID": order.get("order_id") or order.get("id") or order.get("taker_order_id") or "",
-        "CLOB Order ID": order.get("clob_order_id") or order.get("taker_order_id") or "",
-        "Execution Status": order.get("clob_status") or order.get("status") or "Submitted",
-        "Execution Response": order, "Entry Price %": final_price*100,
-        "Position Size $": amount, "Execution Mode": "AUTO"})
-    try:
-        action, row_number = save_to_journal(row, update_existing=False)
-        verify_execution_fields(row_number, {k: row[k] for k in ["Execution Token ID","Execution Outcome","Estimated Fill Price","Executed Amount pUSD","MCP Order ID","CLOB Order ID","Execution Status","Execution Response"]})
-        load_journal.clear()
-    except Exception as e:
-        st.session_state["auto_trading_halt"] = True
-        return True, f"Trade submitted successfully, but journal update failed: {e}. AUTO trading has been halted to prevent a duplicate. Do not retry."
-    return True, f"AUTO {outcome} executed for ${amount:.2f} at {final_price:.4f}; edge {edge:.2f}%, model probability {selected_prob:.2f}%."
-
-
-def run_auto_trader_once():
-    if st.session_state.get("auto_trading_halt", False):
-        return {"status": "blocked", "message": "Auto-trading is halted for this session after a journal/execution safety error."}
-    now = datetime.now(timezone.utc)
-    if not is_overnight_window_et(now): return {"status":"idle","message":"Auto-trading is active only from 12:00–04:00 ET."}
-    journal = load_journal().copy()
-    today, open_count = get_auto_trade_counts(journal, now.astimezone(ET))
-    st.session_state["journal_df"] = journal.copy()
-    st.session_state["auto_counts"] = (today, open_count)
-    if today >= DEFAULT_AUTO_MAX_TRADES_PER_DAY: return {"status":"blocked","message":f"Daily auto-trade limit reached ({today}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY})."}
-    if open_count >= DEFAULT_AUTO_MAX_OPEN_TRADES: return {"status":"blocked","message":f"Open-trade limit reached ({open_count}/{DEFAULT_AUTO_MAX_OPEN_TRADES})."}
-    client = MCPTradingClient()
-    if not client.live_enabled:
-        return {"status":"blocked", "message":"Live MCP trading is disabled in Streamlit Secrets."}
-    balance_data = client.balance(client.login())
-    balance = _extract_available_balance(balance_data)
-    if balance is None:
-        return {"status":"blocked", "message":"Could not safely determine the available MCP balance; auto-trading was blocked."}
-    if balance < DEFAULT_AUTO_MIN_BALANCE:
-        return {"status":"blocked", "message":f"Balance ${balance:.2f} is below ${DEFAULT_AUTO_MIN_BALANCE:.2f} minimum."}
-    results = build_scored_markets(pull_markets())
-    if results.empty: return {"status":"idle","message":"No eligible markets were scored."}
-    if "Signal" not in results.columns or "Execution Approved" not in results.columns:
-        return {"status": "blocked", "message": "Scoring output is missing required execution columns; auto-trading was blocked safely."}
-    candidates = results[
-        results["Signal"].isin(["BUY YES", "BUY NO"])
-        & results["Execution Approved"].fillna(False).astype(bool)
-    ].copy()
-    existing = set(journal.get("Market ID", pd.Series(dtype=str)).astype(str).str.strip())
-    for _, r in candidates.iterrows():
-        allowed, _ = overnight_resolution_allowed(r, now)
-        if allowed and str(r.get("Market ID","")).strip() not in existing:
-            ok, msg = execute_auto_trade(r.to_dict())
-            return {"status":"executed" if ok else "blocked","message":msg,"market":r.get("Market","")}
-    return {"status":"idle","message":"No qualifying overnight candidate passed all safeguards."}
 
 
 class MCPTradingClient:
@@ -719,23 +198,14 @@ def token_for_signal(row):
 
 
 class MCPQuantEngine:
-    def __init__(self):
-        self._price_cache = {}
-        self._ohlc_cache = {}
-
     def get_prices(self, ticker, period="5y"):
-        key = (str(ticker).upper(), str(period))
-        if key in self._price_cache:
-            return self._price_cache[key].copy()
-        data = yf.download(ticker, period=period, auto_adjust=True, progress=False, threads=False)
+        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
         close = data["Close"]
 
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
 
-        close = close.dropna()
-        self._price_cache[key] = close.copy()
-        return close.copy()
+        return close.dropna()
 
     def ewma_volatility(self, close):
         returns = np.log(close / close.shift(1)).dropna()
@@ -773,15 +243,10 @@ class MCPQuantEngine:
         return (future_returns <= required_return).mean() * 100
 
     def get_ohlc(self, ticker, period="5y", interval="1d"):
-        key = (str(ticker).upper(), str(period), str(interval))
-        if key in self._ohlc_cache:
-            return self._ohlc_cache[key].copy()
-        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
+        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
-        data = data.dropna(how="all")
-        self._ohlc_cache[key] = data.copy()
-        return data.copy()
+        return data.dropna(how="all")
 
     def ewma_barrier_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
@@ -871,7 +336,7 @@ class MCPQuantEngine:
 
         return (norm.cdf(z_high) - norm.cdf(z_low)) * 100
 
-    def score_market(self, row, calibration_df=None):
+    def score_market(self, row):
         market = row["Market"]
         ticker = row["Ticker"]
         target = row["Target"]
@@ -906,66 +371,28 @@ class MCPQuantEngine:
 
         final = max(0.01, min(99.99, base + mom_adj))
 
-        calibrated_prob, calibration_status = calibrate_probability(
-            final, calibration_df
-        )
-
-        # Bayesian current-information layer remains active as an EXPERIMENT.
-        # It is recorded alongside the raw/calibrated forecasts, but it does
-        # not determine the live signal or authorize execution.
-        bayesian_prob, bayes_lr, bayes_adjustment, bayes_status, bayes_count = (
-            bayesian_current_information_update(
-                calibrated_prob, ticker, direction, market_type
-            )
-            if abs(calibrated_prob - market_probability) >= (BUY_THRESHOLD - 3)
-            else (calibrated_prob, 1.0, 0.0, "Not evaluated (not near trade threshold)", 0)
-        )
+        model_yes = final
+        model_no = 100 - final
 
         market_yes = market_probability
         market_no = row["No Prob %"]
 
-        # ---- RAW LIVE MODEL ----
-        raw_yes_edge = final - market_yes
-        raw_no_edge = (100.0 - final) - market_no
-        if raw_yes_edge > BUY_THRESHOLD:
+        yes_edge = model_yes - market_yes
+        no_edge = model_no - market_no
+
+        if yes_edge > BUY_THRESHOLD:
             signal = "BUY YES"
-            edge = raw_yes_edge
-        elif raw_no_edge > BUY_THRESHOLD:
+            edge = yes_edge
+        elif no_edge > BUY_THRESHOLD:
             signal = "BUY NO"
-            edge = raw_no_edge
+            edge = no_edge
         else:
             signal = "PASS"
-            edge = max(raw_yes_edge, raw_no_edge)
+            edge = max(yes_edge, no_edge)
 
-        # ---- CALIBRATED EXPERIMENT ----
-        cal_yes_edge = calibrated_prob - market_yes
-        cal_no_edge = (100.0 - calibrated_prob) - market_no
-        if cal_yes_edge > BUY_THRESHOLD:
-            calibrated_signal = "BUY YES"
-            calibrated_edge = cal_yes_edge
-        elif cal_no_edge > BUY_THRESHOLD:
-            calibrated_signal = "BUY NO"
-            calibrated_edge = cal_no_edge
-        else:
-            calibrated_signal = "PASS"
-            calibrated_edge = max(cal_yes_edge, cal_no_edge)
-
-        # ---- BAYESIAN EXPERIMENT ----
-        bayes_yes_edge = bayesian_prob - market_yes
-        bayes_no_edge = (100.0 - bayesian_prob) - market_no
-        if bayes_yes_edge > BUY_THRESHOLD:
-            bayesian_signal = "BUY YES"
-            bayesian_edge = bayes_yes_edge
-        elif bayes_no_edge > BUY_THRESHOLD:
-            bayesian_signal = "BUY NO"
-            bayesian_edge = bayes_no_edge
-        else:
-            bayesian_signal = "PASS"
-            bayesian_edge = max(bayes_yes_edge, bayes_no_edge)
-
-        # LIVE sizing is based only on RAW edge.
         size = 0
         abs_edge = abs(edge)
+
         if signal != "PASS":
             if BUY_THRESHOLD < abs_edge < 8:
                 size = 2
@@ -983,24 +410,6 @@ class MCPQuantEngine:
         else:
             entry_side = ""
             entry_price = 0
-
-        # Experiment entry details are recorded for later A/B analysis.
-        calibrated_entry_side = (
-            "YES" if calibrated_signal == "BUY YES"
-            else "NO" if calibrated_signal == "BUY NO" else ""
-        )
-        calibrated_entry_price = (
-            market_yes if calibrated_signal == "BUY YES"
-            else market_no if calibrated_signal == "BUY NO" else 0
-        )
-        bayesian_entry_side = (
-            "YES" if bayesian_signal == "BUY YES"
-            else "NO" if bayesian_signal == "BUY NO" else ""
-        )
-        bayesian_entry_price = (
-            market_yes if bayesian_signal == "BUY YES"
-            else market_no if bayesian_signal == "BUY NO" else 0
-        )
 
         result = {
             "Market ID": row["Market ID"],
@@ -1021,45 +430,13 @@ class MCPQuantEngine:
             "Momentum": momentum,
             "Momentum Adj %": round(mom_adj, 2),
             "Final Prob %": round(final, 2),
-            "Calibrated Prob %": round(calibrated_prob, 2),
-            "Prior Prob %": round(calibrated_prob, 2),
-            "Bayesian Prob %": round(bayesian_prob, 2),
-            "Bayesian LR": round(bayes_lr, 5),
-            "Bayesian Adjustment %": round(bayes_adjustment, 2),
-            "Current Info Count": int(bayes_count),
-            "Current Info Status": bayes_status,
-            "Calibration Status": calibration_status,
-            # RAW is the live trading model.
-            "YES Edge %": round(raw_yes_edge, 2),
-            "NO Edge %": round(raw_no_edge, 2),
+            "YES Edge %": round(yes_edge, 2),
+            "NO Edge %": round(no_edge, 2),
             "Edge %": round(edge, 2),
             "Signal": signal,
             "Entry Side": entry_side,
             "Entry Price %": round(entry_price, 2),
             "Position Size $": size,
-
-            # Calibration/Bayesian are retained strictly as experiments.
-            "Raw YES Edge %": round(raw_yes_edge, 2),
-            "Raw NO Edge %": round(raw_no_edge, 2),
-            "Raw Edge %": round(edge, 2),
-            "Raw Signal": signal,
-            "Raw Entry Side": entry_side,
-            "Raw Entry Price %": round(entry_price, 2),
-            "Raw Selected Model Prob %": round(
-                final if signal == "BUY YES" else 100.0 - final if signal == "BUY NO" else max(final, 100.0-final), 2
-            ),
-            "Calibrated YES Edge %": round(cal_yes_edge, 2),
-            "Calibrated NO Edge %": round(cal_no_edge, 2),
-            "Calibrated Edge %": round(calibrated_edge, 2),
-            "Calibrated Signal": calibrated_signal,
-            "Calibrated Entry Side": calibrated_entry_side,
-            "Calibrated Entry Price %": round(calibrated_entry_price, 2),
-            "Bayesian YES Edge %": round(bayes_yes_edge, 2),
-            "Bayesian NO Edge %": round(bayes_no_edge, 2),
-            "Bayesian Edge %": round(bayesian_edge, 2),
-            "Bayesian Signal": bayesian_signal,
-            "Bayesian Entry Side": bayesian_entry_side,
-            "Bayesian Entry Price %": round(bayesian_entry_price, 2),
             "clobTokenIds": row["clobTokenIds"],
         }
         approved, reason, selected_prob = evaluate_execution_approval(result)
@@ -1068,27 +445,6 @@ class MCPQuantEngine:
         result["Execution Decision"] = reason
         result["Forecast Confidence"] = forecast_confidence(
             result["EWMA Prob %"], result["Historical Prob %"], row.get("Liquidity", 0)
-        )
-
-        # Superforecasting discipline: extreme probabilities deserve explicit
-        # review until the model has enough resolved observations. This does
-        # not alter the model probability or execution approval by itself.
-        review_reasons = []
-        raw_prob = _safe_float(result.get("Final Prob %"), 50.0)
-        if raw_prob >= SUPERFORECAST_EXTREME_PROB:
-            review_reasons.append(
-                f"Extreme YES probability ({raw_prob:.2f}%)"
-            )
-        elif raw_prob <= SUPERFORECAST_MIN_PROB:
-            review_reasons.append(
-                f"Extreme YES probability ({raw_prob:.2f}%)"
-            )
-
-        if calibration_status.startswith("RAW") and review_reasons:
-            review_reasons.append("manual review until calibration is active")
-
-        result["Superforecasting Review"] = (
-            " | ".join(review_reasons) if review_reasons else "Normal review"
         )
         return result
 
@@ -1133,8 +489,8 @@ PRICE_MARKET_PATTERNS = [
 ]
 
 NON_PRICE_EVENT_WORDS = [
-    "earnings", "revenue", "eps", "market cap", "market capitalization", "valuation", "enterprise value", "fully diluted", "fully diluted valuation", "fdv",
-    "acquire", "acquisition", "merger", "ipo", "funding", "financing", "etf approval", "approve",
+    "earnings", "revenue", "eps", "market cap", "fully diluted", "fdv",
+    "acquire", "acquisition", "merger", "ipo", "etf approval", "approve",
     "regulation", "lawsuit", "ceo", "president", "election", "nominee",
     "fed chair", "interest rate", "cpi", "inflation", "gdp", "unemployment",
     "tariff", "win", "wins", "champion", "world cup", "ufc", "nba",
@@ -1142,39 +498,6 @@ NON_PRICE_EVENT_WORDS = [
     "production", "output", "transit", "transits", "shipments",
     "strait of hormuz", "temperature", "rainfall", "kills", "total rounds",
 ]
-
-
-def is_overnight_window_et(dt=None):
-    """Return True during the 12:00 AM–4:00 AM Eastern automatic-trading window."""
-    if dt is None:
-        dt = datetime.now(timezone.utc)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    dt_et = dt.astimezone(ET)
-    return OVERNIGHT_START_HOUR_ET <= dt_et.hour < OVERNIGHT_END_HOUR_ET
-
-
-def overnight_resolution_allowed(row, now_utc=None):
-    """Return (allowed, reason) for the overnight resolution gate."""
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    if now_utc.tzinfo is None:
-        now_utc = now_utc.replace(tzinfo=timezone.utc)
-
-    if not is_overnight_window_et(now_utc):
-        return True, "Outside overnight window"
-
-    resolution = pd.to_datetime(
-        row.get("Resolution Date"), utc=True, errors="coerce"
-    )
-    if pd.isna(resolution):
-        return False, "Missing resolution date"
-
-    days_remaining = (
-        resolution - pd.Timestamp(now_utc)
-    ).total_seconds() / 86400.0
-    allowed = 0 < days_remaining < OVERNIGHT_MAX_DAYS_REMAINING
-    return allowed, f"{days_remaining:.2f} days remaining"
 
 
 def classify_market(market):
@@ -1410,14 +733,7 @@ def pull_markets():
     df["Days"] = (df["Resolution Date"] - pd.Timestamp.now(tz="UTC")).dt.total_seconds() / 86400
     df["Market Type"] = df["Market"].apply(classify_market)
 
-    # Defensive exclusion: valuation/event concepts must never enter the financial
-    # price-market pipeline, even if their wording otherwise resembles a barrier.
     financial_candidates = df[df["Market Type"].isin(["price", "barrier", "range", "daily_close"])].copy()
-    financial_candidates = financial_candidates[
-        ~financial_candidates["Market"].astype(str).str.lower().apply(
-            lambda text: any(word in text for word in NON_PRICE_EVENT_WORDS)
-        )
-    ].copy()
     financial_candidates["Asset Phrase"] = financial_candidates["Market"].apply(extract_asset_phrase)
     financial_candidates["Ticker"] = financial_candidates["Market"].apply(find_ticker)
     financial_candidates["Target"] = financial_candidates["Market"].apply(extract_target)
@@ -1451,61 +767,47 @@ def pull_markets():
         "rejected_markets": len(financial_candidates) - len(eligible),
         "catalogue_markets_fetched": len(markets_raw),
     }
-    # Store rejection rows as plain records, not a nested DataFrame. Streamlit
-    # attempts to serialize DataFrame.attrs and nested DataFrames cause repeated
-    # "Could not serialize pd.DataFrame.attrs" warnings.
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
-    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]].to_dict("records")
+    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
     return eligible
 
 
-def get_news(ticker, limit=BAYESIAN_NEWS_LIMIT):
-    """Fetch recent public information only; stale headlines are excluded."""
-    query = quote_plus(str(ticker).replace("-", " "))
+def get_news(ticker, limit=5):
+    query = ticker.replace("-", " ")
+
     url = (
         "https://news.google.com/rss/search?"
-        f"q={query}+finance+stock+crypto+when:3d&hl=en-US&gl=US&ceid=US:en"
+        f"q={query}+finance+stock+crypto&hl=en-US&gl=US&ceid=US:en"
     )
 
     try:
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
+        r = requests.get(url, timeout=10)
         root = ET.fromstring(r.content)
+
         news = []
-        seen = set()
-        for item in root.findall(".//item"):
-            title_node = item.find("title")
-            date_node = item.find("pubDate")
-            link_node = item.find("link")
-            title = title_node.text if title_node is not None else ""
-            date_text = date_node.text if date_node is not None else ""
-            link = link_node.text if link_node is not None else ""
-            age = _news_age_hours(date_text)
-            if age is None or age > BAYESIAN_NEWS_MAX_AGE_HOURS:
-                continue
-            key = re.sub(r"[^a-z0-9]+", " ", str(title).lower()).strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            news.append({
-                "Title": title,
-                "Date": date_text,
-                "Age Hours": round(age, 2),
-                "Link": link,
-            })
-            if len(news) >= limit:
-                break
-        if not news:
-            return pd.DataFrame(columns=["Title", "Date", "Age Hours", "Link"])
-        return pd.DataFrame(news).sort_values("Age Hours", ascending=True).reset_index(drop=True)
+
+        for item in root.findall(".//item")[:limit]:
+            news.append(
+                {
+                    "Title": item.find("title").text,
+                    "Date": item.find("pubDate").text,
+                    "Link": item.find("link").text,
+                }
+            )
+
+        return pd.DataFrame(news)
+
     except Exception as e:
-        return pd.DataFrame([{
-            "Title": f"News fetch failed: {e}",
-            "Date": "",
-            "Age Hours": np.nan,
-            "Link": "",
-        }])
+        return pd.DataFrame(
+            [
+                {
+                    "Title": f"News fetch failed: {e}",
+                    "Date": "",
+                    "Link": "",
+                }
+            ]
+        )
 
 
 def fetch_market_by_id(market_id):
@@ -1598,37 +900,10 @@ JOURNAL_COLUMNS = [
     "Momentum",
     "Momentum Adj %",
     "Final Prob %",
-    "Calibrated Prob %",
-    "Prior Prob %",
-    "Bayesian Prob %",
-    "Bayesian LR",
-    "Bayesian Adjustment %",
-    "Current Info Count",
-    "Current Info Status",
-    "Calibration Status",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
     "Signal",
-    "Raw YES Edge %",
-    "Raw NO Edge %",
-    "Raw Edge %",
-    "Raw Signal",
-    "Raw Entry Side",
-    "Raw Entry Price %",
-    "Raw Selected Model Prob %",
-    "Calibrated YES Edge %",
-    "Calibrated NO Edge %",
-    "Calibrated Edge %",
-    "Calibrated Signal",
-    "Calibrated Entry Side",
-    "Calibrated Entry Price %",
-    "Bayesian YES Edge %",
-    "Bayesian NO Edge %",
-    "Bayesian Edge %",
-    "Bayesian Signal",
-    "Bayesian Entry Side",
-    "Bayesian Entry Price %",
     "Entry Side",
     "Entry Price %",
     "Position Size $",
@@ -1642,7 +917,6 @@ JOURNAL_COLUMNS = [
     "CLOB Order ID",
     "Execution Status",
     "Execution Response",
-    "Execution Mode",
     "Date Saved",
     "Status",
     "Result",
@@ -1662,94 +936,15 @@ NUMERIC_JOURNAL_COLUMNS = [
     "Momentum",
     "Momentum Adj %",
     "Final Prob %",
-    "Calibrated Prob %",
-    "Prior Prob %",
-    "Bayesian Prob %",
-    "Bayesian LR",
-    "Bayesian Adjustment %",
-    "Current Info Count",
     "YES Edge %",
     "NO Edge %",
     "Edge %",
-    "Raw YES Edge %",
-    "Raw NO Edge %",
-    "Raw Edge %",
-    "Raw Entry Price %",
-    "Raw Selected Model Prob %",
-    "Calibrated YES Edge %",
-    "Calibrated NO Edge %",
-    "Calibrated Edge %",
-    "Calibrated Entry Price %",
-    "Bayesian YES Edge %",
-    "Bayesian NO Edge %",
-    "Bayesian Edge %",
-    "Bayesian Entry Price %",
     "Entry Price %",
     "Position Size $",
     "Estimated Fill Price",
     "Executed Amount pUSD",
     "PnL",
 ]
-
-
-def _safe_streamlit_dataframe(df):
-    """Return a display-only DataFrame that is safe for Streamlit/Arrow serialization."""
-    if not isinstance(df, pd.DataFrame):
-        return pd.DataFrame()
-
-    out = df.copy(deep=True)
-    # DataFrame.attrs is not needed for display and can contain non-serializable
-    # objects such as nested DataFrames. Never pass those attrs to Streamlit.
-    out.attrs = {}
-
-    def _display_value(value):
-        if value is None:
-            return ""
-        try:
-            missing = pd.isna(value)
-            if isinstance(missing, (bool, np.bool_)) and bool(missing):
-                return ""
-        except (TypeError, ValueError):
-            pass
-        if isinstance(value, (list, tuple, dict, set)):
-            try:
-                return json.dumps(value, default=str)
-            except Exception:
-                return str(value)
-        if isinstance(value, (pd.Timestamp, datetime, np.datetime64)):
-            return str(value)
-        if isinstance(value, np.generic):
-            try:
-                return value.item()
-            except Exception:
-                return str(value)
-        return value
-
-    for col in out.columns:
-        series = out[col]
-        # Mixed/object columns are the source of the recurring ArrowTypeError
-        # (for example Execution Token ID containing strings and floats).
-        if (
-            pd.api.types.is_object_dtype(series)
-            or pd.api.types.is_string_dtype(series)
-            or pd.api.types.is_categorical_dtype(series)
-            or pd.api.types.is_datetime64_any_dtype(series)
-            or pd.api.types.is_datetime64tz_dtype(series)
-        ):
-            out[col] = series.map(_display_value).astype(str)
-        elif pd.api.types.is_extension_array_dtype(series):
-            # Normalize nullable extension arrays to ordinary Python-friendly
-            # values while preserving numeric columns where possible.
-            if pd.api.types.is_numeric_dtype(series):
-                out[col] = pd.to_numeric(series, errors="coerce")
-            else:
-                out[col] = series.map(_display_value).astype(str)
-
-    # Explicitly normalize the historically problematic execution identifier.
-    if "Execution Token ID" in out.columns:
-        out["Execution Token ID"] = out["Execution Token ID"].map(_display_value).astype(str)
-
-    return out
 
 
 def _clean_sheet_value(value):
@@ -1908,7 +1103,7 @@ def save_to_journal(row, update_existing=False):
                 journal_row[field] = existing_record.get(field, "")
 
         if not journal_row.get("Date Saved"):
-            journal_row["Date Saved"] = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+            journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not journal_row.get("Status"):
             journal_row["Status"] = "Open"
         if journal_row.get("Result") is None:
@@ -1928,7 +1123,7 @@ def save_to_journal(row, update_existing=False):
         )
         return "updated", existing_row_number
 
-    journal_row["Date Saved"] = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    journal_row["Date Saved"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     journal_row["Status"] = journal_row.get("Status") or "Open"
     journal_row["Result"] = journal_row.get("Result", "")
     journal_row["PnL"] = journal_row.get("PnL", 0.0)
@@ -2034,12 +1229,6 @@ def load_journal():
 
     if "PnL" in df.columns:
         df["PnL"] = df["PnL"].fillna(0.0)
-
-    for column in ["clobTokenIds", "Execution Token ID", "Execution Outcome",
-                   "MCP Order ID", "CLOB Order ID", "Execution Status",
-                   "Execution Mode", "Date Saved", "Status", "Result"]:
-        if column in df.columns:
-            df[column] = df[column].fillna("").astype(str)
 
     return df
 
@@ -2150,91 +1339,22 @@ tab1, tab2, tab3 = st.tabs(["Dashboard", "Journal", "Analytics"])
 
 
 with tab1:
-    st.subheader("🤖 Automatic Overnight Trading")
-    st.caption("Auto scans every 10 minutes. It can execute at most 1 trade per cycle and 6 auto trades per ET day. Auto execution is allowed only from 12:00–04:00 ET and only when resolution is under 2 days. All existing execution safeguards remain active.")
-    auto_enabled = st.toggle("Enable automatic overnight trading", value=False, key="auto_trading_enabled", help="Requires live_trading_enabled=true in Streamlit Secrets.")
-    # Do not contact Google Sheets during the normal page render. Streamlit tabs
-    # render eagerly, so an unconditional load here used to block the entire app.
-    ac, oc = st.session_state.get("auto_counts", (0, 0))
-    a1,a2,a3,a4=st.columns(4); a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S")); a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}"); a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}"); a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
-    if st.button("Refresh Journal Stats", key="refresh_journal_stats_button"):
-        try:
-            aj = load_journal().copy()
-            ac, oc = get_auto_trade_counts(aj, datetime.now(ET))
-            st.session_state["auto_counts"] = (ac, oc)
-            st.session_state["journal_df"] = aj
-            st.rerun()
-        except Exception as error:
-            st.error(f"Journal stats could not be refreshed: {error}")
-    if auto_enabled:
-        @st.fragment(run_every=f"{AUTO_SCAN_INTERVAL_MINUTES}m")
-        def automatic_trading_loop():
-            try:
-                result=run_auto_trader_once()
-                if result["status"]=="executed": st.success("🤖 "+result["message"])
-                elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
-                else: st.info("ℹ️ "+result["message"])
-            except Exception as e: st.error(f"Automatic trading cycle failed safely: {e}")
-        automatic_trading_loop()
-    else: st.info("Automatic trading is OFF.")
-    st.markdown("---")
     st.subheader("Run Market Screener")
 
     if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
-        scan_stats = markets_df.attrs.get("scan_stats", {})
-        rejections_raw = markets_df.attrs.get("rejections", [])
-        rejections = pd.DataFrame(rejections_raw) if isinstance(rejections_raw, list) else pd.DataFrame()
-        markets_df = markets_df.copy()
-        markets_df.attrs = {}
         st.session_state["markets_df"] = markets_df
-        st.session_state["scan_stats"] = scan_stats
-        st.session_state["rejections"] = rejections
+        st.session_state["scan_stats"] = markets_df.attrs.get("scan_stats", {})
+        st.session_state["rejections"] = markets_df.attrs.get("rejections", pd.DataFrame())
 
         engine = MCPQuantEngine()
         scored = []
 
-        # Use only CLOSED trades with a resolved YES/NO outcome for calibration.
-        # This uses the same definition of a resolved trade as Analytics.
-        # Open trades never train the calibration layer.
-        calibration_journal = load_journal().copy()
-        st.session_state["journal_df"] = calibration_journal.copy()
-        st.session_state["auto_counts"] = get_auto_trade_counts(calibration_journal, datetime.now(ET))
-
-        if (
-            not calibration_journal.empty
-            and "Status" in calibration_journal.columns
-            and "Result" in calibration_journal.columns
-        ):
-            status = calibration_journal["Status"].astype(str).str.strip().str.upper()
-            result = calibration_journal["Result"].astype(str).str.strip().str.upper()
-
-            resolved_for_calibration = calibration_journal[
-                status.eq("CLOSED") & result.isin(["YES", "NO"])
-            ].copy()
-        else:
-            resolved_for_calibration = pd.DataFrame()
-
-        # If the journal has closed rows but the calibration set is empty,
-        # surface the actual count in the UI rather than silently reporting
-        # "no resolved trades".
-        st.session_state["calibration_resolved_count"] = len(resolved_for_calibration)
-
-        score_errors = []
         for _, row in markets_df.iterrows():
             try:
-                scored.append(engine.score_market(row, resolved_for_calibration))
-            except Exception as exc:
-                score_errors.append({
-                    "Market ID": row.get("Market ID", ""),
-                    "Market": row.get("Market", ""),
-                    "Ticker": row.get("Ticker", ""),
-                    "Error": f"{type(exc).__name__}: {exc}",
-                })
-
-        st.session_state["score_errors"] = pd.DataFrame(
-            score_errors, columns=["Market ID", "Market", "Ticker", "Error"]
-        )
+                scored.append(engine.score_market(row))
+            except Exception:
+                pass
 
         results = pd.DataFrame(scored)
         st.session_state["results"] = results
@@ -2254,43 +1374,30 @@ with tab1:
         m3.metric("Model Eligible", stats.get("eligible_markets", len(markets_df)))
         m4.metric("Rejected", stats.get("rejected_markets", 0))
 
-        calibration_count = st.session_state.get("calibration_resolved_count", 0)
-        if calibration_count < CALIBRATION_MIN_SAMPLES:
-            st.caption(
-                f"Calibration: {calibration_count} resolved trades "
-                f"(activates at {CALIBRATION_MIN_SAMPLES})"
-            )
-        else:
-            st.caption(
-                f"Calibration: ACTIVE — {calibration_count} resolved trades"
-            )
-
         st.subheader("Filtered Markets")
 
         st.dataframe(
-            _safe_streamlit_dataframe(
-                markets_df[
-                    [
-                        "Market",
-                        "Market Type",
-                        "Ticker",
-                        "Target",
-                        "Upper",
-                        "Direction",
-                        "Market Prob %",
-                        "No Prob %",
-                        "Days",
-                        "Liquidity",
-                    ]
+            markets_df[
+                [
+                    "Market",
+                    "Market Type",
+                    "Ticker",
+                    "Target",
+                    "Upper",
+                    "Direction",
+                    "Market Prob %",
+                    "No Prob %",
+                    "Days",
+                    "Liquidity",
                 ]
-            ),
-            width="stretch",
+            ],
+            use_container_width=True,
         )
 
         rejected = st.session_state.get("rejections", pd.DataFrame())
         if isinstance(rejected, pd.DataFrame) and not rejected.empty:
             with st.expander("See rejected binary price markets and reasons"):
-                st.dataframe(_safe_streamlit_dataframe(rejected), width="stretch")
+                st.dataframe(rejected, use_container_width=True)
 
     if "results" in st.session_state:
         results = st.session_state["results"]
@@ -2298,35 +1405,12 @@ with tab1:
             results = pd.DataFrame()
 
         st.subheader("Top Trade Candidates")
-        st.dataframe(_safe_streamlit_dataframe(results), width="stretch")
+        st.dataframe(results, use_container_width=True)
 
-        # Defensive UI handling: an empty/partially-built result frame must not
-        # raise KeyError and take down the dashboard. Missing execution approval
-        # is treated as False (fail closed).
-        if results.empty or "Signal" not in results.columns:
-            buys = pd.DataFrame(columns=results.columns)
-        else:
-            execution_approved = (
-                results["Execution Approved"]
-                if "Execution Approved" in results.columns
-                else pd.Series(False, index=results.index, dtype=bool)
-            )
-            buys = results[
-                results["Signal"].isin(["BUY YES", "BUY NO"])
-                & execution_approved.fillna(False).astype(bool)
-            ].copy()
+        buys = results[results["Signal"].isin(["BUY YES", "BUY NO"]) & results.get("Execution Approved", False).fillna(False).astype(bool)]
 
         st.subheader("Actionable Trades")
-        st.dataframe(_safe_streamlit_dataframe(buys), width="stretch")
-
-        score_errors = st.session_state.get("score_errors", pd.DataFrame())
-        if isinstance(score_errors, pd.DataFrame) and not score_errors.empty:
-            with st.expander(f"Scoring errors ({len(score_errors)}) — diagnostic"):
-                st.caption(
-                    "These markets were skipped because the model could not score them. "
-                    "Skipped markets are never auto-executed."
-                )
-                st.dataframe(_safe_streamlit_dataframe(score_errors), width="stretch")
+        st.dataframe(buys, use_container_width=True)
 
         st.markdown("---")
         st.subheader("📰 News Validation")
@@ -2344,7 +1428,7 @@ with tab1:
             if st.button("Get News", key="get_news_button"):
                 news_df = get_news(ticker_for_news)
 
-                st.dataframe(_safe_streamlit_dataframe(news_df), width="stretch")
+                st.dataframe(news_df, use_container_width=True)
 
                 st.info(
                     "Use news as validation only. News should confirm or reject "
@@ -2398,26 +1482,12 @@ with tab1:
             st.write(f"**Days to Expiry:** {explain['Days']}")
             st.write(f"**Momentum Score:** {explain['Momentum']}")
             st.write(f"**Momentum Adjustment:** {explain['Momentum Adj %']}%")
-            st.write(f"**Raw Model YES Probability:** {explain['Final Prob %']}%")
-            st.write(f"**Calibrated YES Probability (Prior):** {explain.get('Calibrated Prob %', explain['Final Prob %'])}%")
-            st.write(f"**Bayesian YES Probability (Posterior):** {explain.get('Bayesian Prob %', explain.get('Calibrated Prob %', explain['Final Prob %']))}%")
-            st.write(f"**Bayesian Likelihood Ratio:** {explain.get('Bayesian LR', 1.0)}")
-            st.write(f"**Bayesian Adjustment:** {explain.get('Bayesian Adjustment %', 0.0)}%")
-            st.write(f"**Current Information:** {explain.get('Current Info Status', 'None')}" )
-            st.markdown("### Experiment — not used for live execution")
-            st.write(
-                f"**Calibrated:** {explain.get('Calibrated Signal', 'PASS')} "
-                f"| Edge {float(explain.get('Calibrated Edge %', 0) or 0):.2f}%"
-            )
-            st.write(
-                f"**Bayesian:** {explain.get('Bayesian Signal', 'PASS')} "
-                f"| Edge {float(explain.get('Bayesian Edge %', 0) or 0):.2f}%"
-            )
+            st.write(f"**Model YES Probability:** {explain['Final Prob %']}%")
             st.write(f"**YES Edge:** {explain['YES Edge %']}%")
             st.write(f"**NO Edge:** {explain['NO Edge %']}%")
-            st.write(f"**LIVE RAW Signal:** {explain['Signal']}")
-            st.write(f"**LIVE RAW Entry Side:** {explain['Entry Side']}")
-            st.write(f"**LIVE RAW Entry Price:** {explain['Entry Price %']}%")
+            st.write(f"**Signal:** {explain['Signal']}")
+            st.write(f"**Entry Side:** {explain['Entry Side']}")
+            st.write(f"**Entry Price:** {explain['Entry Price %']}%")
             st.write(f"**Suggested Position Size:** ${explain['Position Size $']}")
 
 
@@ -2426,7 +1496,6 @@ with tab1:
             ewma_prob = _safe_float(explain.get("EWMA Prob %"))
             market_prob = _safe_float(explain.get("Market Prob %"))
             final_prob = _safe_float(explain.get("Final Prob %"))
-            calibrated_prob = _safe_float(explain.get("Calibrated Prob %", final_prob))
             confidence = str(explain.get("Forecast Confidence", "Low"))
             disagreement = abs(ewma_prob - historical_prob)
 
@@ -2436,20 +1505,14 @@ with tab1:
             sf3.metric("Polymarket benchmark", f"{market_prob:.2f}%")
             sf4.metric("Confidence", confidence)
 
-            sf_review = str(explain.get("Superforecasting Review", "Normal review"))
-            if sf_review != "Normal review":
-                st.warning(f"⚠️ Superforecasting flag: {sf_review}")
-            else:
-                st.success("✓ No extreme-probability Superforecasting flag.")
-
             reasoning = []
-            if calibrated_prob > market_prob:
+            if final_prob > market_prob:
                 reasoning.append(
-                    f"The calibrated model assigns YES {calibrated_prob - market_prob:.2f} percentage points more probability than the market."
+                    f"The model assigns YES {final_prob - market_prob:.2f} percentage points more probability than the market."
                 )
-            elif calibrated_prob < market_prob:
+            elif final_prob < market_prob:
                 reasoning.append(
-                    f"The calibrated model assigns YES {market_prob - calibrated_prob:.2f} percentage points less probability than the market."
+                    f"The model assigns YES {market_prob - final_prob:.2f} percentage points less probability than the market."
                 )
             else:
                 reasoning.append("The model and market assign the same YES probability.")
@@ -2529,31 +1592,11 @@ with tab1:
                     preview = st.session_state.get("mcp_trade_preview")
                     if preview and preview.get("market") == selected_execute:
                         estimate_price = float(preview["estimate"].get("price", 0) or 0)
-                        (
-                            fresh_approved,
-                            fresh_reason,
-                            fresh_selected_prob,
-                            fresh_edge,
-                        ) = evaluate_execution_price(execute_row, estimate_price)
-
-                        st.success(
-                            f"Fresh estimated execution price: ${estimate_price:.4f} per share"
-                        )
-                        ec1, ec2, ec3 = st.columns(3)
-                        ec1.metric("Model Probability", f"{fresh_selected_prob:.2f}%")
-                        ec2.metric("Fresh Executable Edge", f"{fresh_edge:.2f}%")
-                        ec3.metric("Minimum Required Edge", f"{MIN_ACTIONABLE_EDGE:.0f}%")
-
-                        if fresh_approved:
-                            st.success(f"✅ {fresh_reason}")
-                        else:
-                            st.error(f"❌ Trade blocked: {fresh_reason}")
-
+                        st.success(f"Fresh estimated execution price: ${estimate_price:.4f} per share")
                         st.json(preview["estimate"])
 
                         confirm = st.checkbox(
                             f"I confirm this live BUY {preview_outcome} order for ${capped_amount:.2f} pUSD.",
-                            disabled=not fresh_approved,
                             key="confirm_live_mcp_trade",
                         )
 
@@ -2567,24 +1610,6 @@ with tab1:
                             fresh_estimate = client.price_estimate(
                                 token, preview_token_id, "buy", capped_amount
                             )
-
-                            (
-                                final_approved,
-                                final_reason,
-                                final_selected_prob,
-                                final_edge,
-                            ) = evaluate_execution_price(
-                                execute_row,
-                                fresh_estimate.get("price", 0),
-                            )
-
-                            if not final_approved:
-                                st.error(
-                                    "❌ Trade stopped before submission because the fresh "
-                                    f"execution price no longer meets the rule: {final_reason}"
-                                )
-                                st.session_state.pop("mcp_trade_preview", None)
-                                st.stop()
 
                             # Order placement is the critical step. Once this succeeds, a later
                             # journal failure must never be reported as a failed trade.
@@ -2618,7 +1643,6 @@ with tab1:
                                 float(fresh_estimate.get("price", 0) or 0) * 100
                             )
                             executed_row["Position Size $"] = capped_amount
-                            executed_row["Execution Mode"] = "MANUAL"
 
                             st.success("✅ Trade order was accepted by MCP.")
                             r1, r2, r3, r4 = st.columns(4)
@@ -2715,46 +1739,36 @@ with tab1:
 with tab2:
     st.subheader("Trade Journal")
 
-    c_refresh, c_update = st.columns(2)
-    if c_refresh.button("Load / Refresh Journal", key="load_refresh_journal_button"):
-        try:
-            journal = load_journal().copy()
-            st.session_state["journal_df"] = journal
-            st.session_state["auto_counts"] = get_auto_trade_counts(journal, datetime.now(ET))
-            st.success("Journal refreshed.")
-        except Exception as error:
-            st.error(f"Journal could not be loaded: {error}")
-
-    if c_update.button("Update Results", key="update_results_button"):
+    if st.button("Update Results", key="update_results_button"):
         try:
             journal, updates = update_results()
             load_journal.clear()
-            journal = journal.copy()
-            st.session_state["journal_df"] = journal
-            st.session_state["auto_counts"] = get_auto_trade_counts(journal, datetime.now(ET))
             st.success(f"Updated {updates} closed trades.")
         except Exception as error:
             st.error(f"Results could not be updated: {error}")
 
-    journal = st.session_state.get("journal_df", pd.DataFrame())
-    if isinstance(journal, pd.DataFrame) and len(journal) > 0:
-        st.dataframe(_safe_streamlit_dataframe(journal), width="stretch")
+    journal = load_journal()
+
+    if len(journal) > 0:
+        st.dataframe(journal, use_container_width=True)
     else:
-        st.info("Journal is not loaded. Click **Load / Refresh Journal** when you want to view it.")
+        st.info("No trades saved yet.")
 
 
 with tab3:
     st.subheader("Analytics")
 
-    journal = st.session_state.get("journal_df", pd.DataFrame())
-    if isinstance(journal, pd.DataFrame) and len(journal) > 0:
+    journal = load_journal()
+
+    if len(journal) > 0:
         if "Status" in journal.columns:
-            closed = journal[journal["Status"] == "Closed"]
-            open_trades = journal[journal["Status"] != "Closed"]
+            closed = journal[journal["Status"] == "Closed"].copy()
+            open_trades = journal[journal["Status"] != "Closed"].copy()
         else:
             closed = pd.DataFrame()
-            open_trades = journal
+            open_trades = journal.copy()
 
+        # Existing headline analytics retained.
         total_pnl = closed["PnL"].sum() if len(closed) > 0 else 0
         bankroll = STARTING_BANKROLL + total_pnl
 
@@ -2765,95 +1779,175 @@ with tab3:
         win_rate = (wins / len(closed) * 100) if len(closed) > 0 else 0
 
         c1, c2, c3, c4 = st.columns(4)
-
         c1.metric("Bankroll", f"${round(bankroll, 2)}")
         c2.metric("Total PnL", f"${round(total_pnl, 2)}")
         c3.metric("Closed Trades", len(closed))
         c4.metric("Win Rate", f"{round(win_rate, 2)}%")
 
         c5, c6, c7 = st.columns(3)
-
         c5.metric("Open Trades", len(open_trades))
         c6.metric("Buy Signals", buy_count)
         c7.metric("Avg Edge", round(avg_edge, 2))
 
+        # -------------------------------------------------------------
+        # MCP COMPETITION SCOREBOARD — read-only analytics only.
+        # -------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("MCP Competition Scoreboard")
+
+        completed_trades = len(closed)
+        progress_pct = min(completed_trades / 80.0, 1.0)
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Completed Trades", f"{completed_trades} / 80")
+        p2.metric("Competition Progress", f"{progress_pct * 100:.1f}%")
+        p3.metric("Bankroll Floor", "PASS" if bankroll >= 70 else "BELOW $70")
+        p4.metric("Total Return", f"{((bankroll / STARTING_BANKROLL) - 1) * 100:.2f}%")
+
+        st.progress(progress_pct)
+        st.caption(
+            "MCP requires at least 80 completed trades and a mark-to-market account value above $70. "
+            "The ratios below are an interim trade-level proxy until a daily portfolio-value history is stored."
+        )
+
+        sharpe = np.nan
+        sortino = np.nan
+        calmar = np.nan
+        max_drawdown = np.nan
+        volatility = np.nan
+        profit_factor = np.nan
+        expectancy = np.nan
+        avg_win = np.nan
+        avg_loss = np.nan
+        largest_win = np.nan
+        largest_loss = np.nan
+
+        if len(closed) > 0:
+            metric_closed = closed.copy()
+            metric_closed["PnL"] = pd.to_numeric(metric_closed["PnL"], errors="coerce")
+            metric_closed["Position Size $"] = pd.to_numeric(
+                metric_closed.get("Position Size $", np.nan), errors="coerce"
+            )
+
+            denominator = metric_closed["Position Size $"].where(
+                metric_closed["Position Size $"] > 0, 1.0
+            )
+            metric_closed["Trade Return"] = metric_closed["PnL"] / denominator
+            trade_returns = metric_closed["Trade Return"].replace([np.inf, -np.inf], np.nan).dropna()
+            pnl_values = metric_closed["PnL"].dropna()
+
+            if len(trade_returns) >= 2:
+                mean_return = trade_returns.mean()
+                std_return = trade_returns.std(ddof=1)
+                volatility = std_return
+
+                if np.isfinite(std_return) and std_return > 0:
+                    sharpe = mean_return / std_return
+
+                if (trade_returns < 0).any():
+                    downside_deviation = float(
+                        np.sqrt(np.mean(np.square(np.minimum(trade_returns, 0.0))))
+                    )
+                    if np.isfinite(downside_deviation) and downside_deviation > 0:
+                        sortino = mean_return / downside_deviation
+
+                equity_curve = STARTING_BANKROLL + pnl_values.cumsum()
+                running_peak = equity_curve.cummax()
+                drawdown_series = (equity_curve / running_peak) - 1.0
+                if len(drawdown_series) > 0:
+                    max_drawdown = float(drawdown_series.min())
+
+                total_return = (equity_curve.iloc[-1] / STARTING_BANKROLL) - 1.0
+                if np.isfinite(max_drawdown) and max_drawdown < 0:
+                    calmar = total_return / abs(max_drawdown)
+
+            winning_pnl = pnl_values[pnl_values > 0]
+            losing_pnl = pnl_values[pnl_values < 0]
+
+            if len(winning_pnl) > 0:
+                avg_win = float(winning_pnl.mean())
+                largest_win = float(winning_pnl.max())
+            if len(losing_pnl) > 0:
+                avg_loss = float(losing_pnl.mean())
+                largest_loss = float(losing_pnl.min())
+
+            gross_profit = float(winning_pnl.sum()) if len(winning_pnl) > 0 else 0.0
+            gross_loss = abs(float(losing_pnl.sum())) if len(losing_pnl) > 0 else 0.0
+            if gross_loss > 0:
+                profit_factor = gross_profit / gross_loss
+            if len(pnl_values) > 0:
+                expectancy = float(pnl_values.mean())
+
+        def _fmt_ratio(value):
+            return "—" if pd.isna(value) or not np.isfinite(value) else f"{value:.2f}"
+
+        def _fmt_pct(value):
+            return "—" if pd.isna(value) or not np.isfinite(value) else f"{value:.2%}"
+
+        st.markdown("#### Risk-Adjusted Performance")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Sortino Ratio*", _fmt_ratio(sortino))
+        r2.metric("Sharpe Ratio*", _fmt_ratio(sharpe))
+        r3.metric("Calmar Ratio*", _fmt_ratio(calmar))
+        r4.metric("Max Drawdown*", _fmt_pct(max_drawdown))
+
+        st.caption(
+            "*Interim trade-level estimates. For exact MCP-style portfolio ratios, use daily mark-to-market "
+            "portfolio returns once daily equity snapshots are available."
+        )
+
+        st.markdown("#### Trading Quality")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Profit Factor", _fmt_ratio(profit_factor))
+        q2.metric("Expectancy / Trade", "—" if pd.isna(expectancy) else f"${expectancy:.2f}")
+        q3.metric("Average Win", "—" if pd.isna(avg_win) else f"${avg_win:.2f}")
+        q4.metric("Average Loss", "—" if pd.isna(avg_loss) else f"${avg_loss:.2f}")
+
+        q5, q6, q7 = st.columns(3)
+        q5.metric("Largest Win", "—" if pd.isna(largest_win) else f"${largest_win:.2f}")
+        q6.metric("Largest Loss", "—" if pd.isna(largest_loss) else f"${largest_loss:.2f}")
+        q7.metric("Trade Return Volatility*", _fmt_pct(volatility))
+
+        # Existing charts retained.
         st.subheader("Edge Distribution")
         st.bar_chart(journal["Edge %"])
 
         if len(closed) > 0:
-            resolved_count = int(
-                closed["Result"].astype(str).str.upper().isin(["YES", "NO"]).sum()
-            )
-            if resolved_count < CALIBRATION_MIN_SAMPLES:
-                st.caption(
-                    f"Calibration: {resolved_count} resolved trades "
-                    f"(activates at {CALIBRATION_MIN_SAMPLES})"
-                )
-            else:
-                st.caption(
-                    f"Calibration: ACTIVE — {resolved_count} resolved trades"
-                )
-
             st.subheader("PnL by Trade")
             st.bar_chart(closed["PnL"])
+
+            pnl_curve = pd.to_numeric(closed["PnL"], errors="coerce").fillna(0.0)
+            equity_curve = STARTING_BANKROLL + pnl_curve.cumsum()
+            equity_curve.index = range(1, len(equity_curve) + 1)
+
+            st.subheader("Realized Equity Curve")
+            st.line_chart(equity_curve.rename("Bankroll"))
+
+            running_peak = equity_curve.cummax()
+            drawdown_curve = (equity_curve / running_peak) - 1.0
+            st.subheader("Realized Drawdown")
+            st.line_chart((drawdown_curve * 100).rename("Drawdown %"))
 
             resolved = closed[closed["Result"].astype(str).str.upper().isin(["YES", "NO"])].copy()
             if not resolved.empty:
                 resolved["Outcome YES"] = resolved["Result"].astype(str).str.upper().eq("YES")
-                resolved["Raw Model Brier"] = resolved.apply(
+                resolved["Model Brier"] = resolved.apply(
                     lambda row: brier_score(row.get("Final Prob %", 0), row["Outcome YES"]), axis=1
                 )
-                resolved["Calibrated Model Brier"] = resolved.apply(
-                    lambda row: brier_score(
-                        row.get("Calibrated Prob %", row.get("Final Prob %", 0)),
-                        row["Outcome YES"],
-                    ),
-                    axis=1,
-                )
-                resolved["Bayesian Model Brier"] = resolved.apply(
-                    lambda row: brier_score(
-                        row.get("Bayesian Prob %", row.get("Calibrated Prob %", row.get("Final Prob %", 0))),
-                        row["Outcome YES"],
-                    ),
-                    axis=1,
-                )
-                resolved["Model Brier"] = resolved["Bayesian Model Brier"]
                 resolved["Market Brier"] = resolved.apply(
                     lambda row: brier_score(row.get("Market Prob %", 0), row["Outcome YES"]), axis=1
                 )
 
                 st.subheader("Forecast Accuracy")
-                b1, b2, b3, b4 = st.columns(4)
-                raw_brier = resolved["Raw Model Brier"].mean()
-                calibrated_brier = resolved["Calibrated Model Brier"].mean()
-                bayesian_brier = resolved["Bayesian Model Brier"].mean()
+                b1, b2, b3 = st.columns(3)
+                model_brier = resolved["Model Brier"].mean()
                 market_brier = resolved["Market Brier"].mean()
-
-                b1.metric("Raw Model Brier", f"{raw_brier:.4f}")
-                b2.metric("Calibrated Brier", f"{calibrated_brier:.4f}")
-                b3.metric("Bayesian Brier", f"{bayesian_brier:.4f}")
-                b4.metric("Market Brier", f"{market_brier:.4f}")
-
-                comparison = "Better" if bayesian_brier < market_brier else "Worse"
-                st.caption(
-                    f"Bayesian Model vs Market: {comparison}. Lower Brier is better."
-                )
+                b1.metric("Model Brier Score", f"{model_brier:.4f}")
+                b2.metric("Market Brier Score", f"{market_brier:.4f}")
+                b3.metric("Model vs Market", "Better" if model_brier < market_brier else "Worse")
                 st.caption("Lower is better: 0 is perfect and 1 is the worst possible binary Brier score.")
 
-                # Superforecasting calibration view: compare confidence bands
-                # with realized YES rates so overconfidence becomes visible.
-                st.caption(
-                    "Superforecasting review: extreme probabilities are flagged; "
-                    "calibration is based on resolved forecasts rather than individual wins."
-                )
-
                 resolved["Final Prob %"] = pd.to_numeric(resolved["Final Prob %"], errors="coerce")
-                if "Calibrated Prob %" in resolved.columns:
-                    resolved["Calibrated Prob %"] = pd.to_numeric(
-                        resolved["Calibrated Prob %"], errors="coerce"
-                    )
-                else:
-                    resolved["Calibrated Prob %"] = resolved["Final Prob %"]
                 resolved = resolved[resolved["Final Prob %"].notna()].copy()
                 resolved["Probability Band"] = pd.cut(
                     resolved["Final Prob %"],
@@ -2872,7 +1966,54 @@ with tab3:
                 calibration["Actual_YES_Rate"] *= 100
                 calibration = calibration[calibration["Forecasts"] > 0]
                 st.subheader("Calibration by Probability Band")
-                st.dataframe(_safe_streamlit_dataframe(calibration), width="stretch")
+                st.dataframe(calibration, use_container_width=True)
+
+                st.subheader("Resolved Trade Breakdown")
+
+                if "Forecast Confidence" in resolved.columns:
+                    confidence_breakdown = (
+                        resolved.assign(Win=resolved["PnL"] > 0)
+                        .groupby("Forecast Confidence", dropna=False)
+                        .agg(
+                            Trades=("Market ID", "count"),
+                            Win_Rate=("Win", "mean"),
+                            Average_PnL=("PnL", "mean"),
+                        )
+                        .reset_index()
+                    )
+                    confidence_breakdown["Win_Rate"] *= 100
+                    st.markdown("**By Forecast Confidence**")
+                    st.dataframe(confidence_breakdown, use_container_width=True)
+
+                if "Type" in resolved.columns:
+                    type_breakdown = (
+                        resolved.assign(Win=resolved["PnL"] > 0)
+                        .groupby("Type", dropna=False)
+                        .agg(
+                            Trades=("Market ID", "count"),
+                            Win_Rate=("Win", "mean"),
+                            Average_PnL=("PnL", "mean"),
+                        )
+                        .reset_index()
+                    )
+                    type_breakdown["Win_Rate"] *= 100
+                    st.markdown("**By Market Type**")
+                    st.dataframe(type_breakdown, use_container_width=True)
+
+                if "Signal" in resolved.columns:
+                    signal_breakdown = (
+                        resolved.assign(Win=resolved["PnL"] > 0)
+                        .groupby("Signal", dropna=False)
+                        .agg(
+                            Trades=("Market ID", "count"),
+                            Win_Rate=("Win", "mean"),
+                            Average_PnL=("PnL", "mean"),
+                        )
+                        .reset_index()
+                    )
+                    signal_breakdown["Win_Rate"] *= 100
+                    st.markdown("**By Signal**")
+                    st.dataframe(signal_breakdown, use_container_width=True)
             else:
                 st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
     else:
