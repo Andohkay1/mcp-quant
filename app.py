@@ -482,17 +482,52 @@ def get_auto_trade_counts(journal, now_et=None):
 
 
 def build_scored_markets(markets_df):
-    if markets_df is None or markets_df.empty: return pd.DataFrame()
+    """Score eligible markets without allowing one bad market to crash the scan.
+
+    Scoring errors are recorded in session state so they are visible for debugging
+    instead of being silently discarded. A market that cannot be scored is never
+    passed to the execution layer.
+    """
+    if markets_df is None or markets_df.empty:
+        st.session_state["score_errors"] = pd.DataFrame(
+            columns=["Market ID", "Market", "Ticker", "Error"]
+        )
+        return pd.DataFrame()
+
     calibration = load_journal()
     if not calibration.empty and "Status" in calibration.columns and "Result" in calibration.columns:
-        stt = calibration["Status"].astype(str).str.upper(); res = calibration["Result"].astype(str).str.upper()
+        stt = calibration["Status"].astype(str).str.upper()
+        res = calibration["Result"].astype(str).str.upper()
         calibration = calibration[stt.eq("CLOSED") & res.isin(["YES", "NO"])].copy()
-    else: calibration = pd.DataFrame()
-    engine = MCPQuantEngine(); scored=[]
+    else:
+        calibration = pd.DataFrame()
+
+    engine = MCPQuantEngine()
+    scored = []
+    errors = []
+
     for _, row in markets_df.iterrows():
-        try: scored.append(engine.score_market(row, calibration))
-        except Exception: continue
-    return pd.DataFrame(scored).sort_values("Edge %", ascending=False).reset_index(drop=True) if scored else pd.DataFrame()
+        try:
+            scored.append(engine.score_market(row, calibration))
+        except Exception as exc:
+            errors.append({
+                "Market ID": row.get("Market ID", ""),
+                "Market": row.get("Market", ""),
+                "Ticker": row.get("Ticker", ""),
+                "Error": f"{type(exc).__name__}: {exc}",
+            })
+
+    st.session_state["score_errors"] = pd.DataFrame(
+        errors, columns=["Market ID", "Market", "Ticker", "Error"]
+    )
+
+    if not scored:
+        return pd.DataFrame()
+
+    results = pd.DataFrame(scored)
+    if "Edge %" in results.columns:
+        results = results.sort_values("Edge %", ascending=False)
+    return results.reset_index(drop=True)
 
 
 def execute_auto_trade(candidate):
@@ -552,7 +587,12 @@ def run_auto_trader_once():
         return {"status":"blocked", "message":f"Balance ${balance:.2f} is below ${DEFAULT_AUTO_MIN_BALANCE:.2f} minimum."}
     results = build_scored_markets(pull_markets())
     if results.empty: return {"status":"idle","message":"No eligible markets were scored."}
-    candidates = results[results["Signal"].isin(["BUY YES","BUY NO"]) & results["Execution Approved"].fillna(False).astype(bool)].copy()
+    if "Signal" not in results.columns or "Execution Approved" not in results.columns:
+        return {"status": "blocked", "message": "Scoring output is missing required execution columns; auto-trading was blocked safely."}
+    candidates = results[
+        results["Signal"].isin(["BUY YES", "BUY NO"])
+        & results["Execution Approved"].fillna(False).astype(bool)
+    ].copy()
     existing = set(journal.get("Market ID", pd.Series(dtype=str)).astype(str).str.strip())
     for _, r in candidates.iterrows():
         allowed, _ = overnight_resolution_allowed(r, now)
@@ -2076,11 +2116,21 @@ with tab1:
         # "no resolved trades".
         st.session_state["calibration_resolved_count"] = len(resolved_for_calibration)
 
+        score_errors = []
         for _, row in markets_df.iterrows():
             try:
                 scored.append(engine.score_market(row, resolved_for_calibration))
-            except Exception:
-                pass
+            except Exception as exc:
+                score_errors.append({
+                    "Market ID": row.get("Market ID", ""),
+                    "Market": row.get("Market", ""),
+                    "Ticker": row.get("Ticker", ""),
+                    "Error": f"{type(exc).__name__}: {exc}",
+                })
+
+        st.session_state["score_errors"] = pd.DataFrame(
+            score_errors, columns=["Market ID", "Market", "Ticker", "Error"]
+        )
 
         results = pd.DataFrame(scored)
         st.session_state["results"] = results
@@ -2144,21 +2194,33 @@ with tab1:
         st.subheader("Top Trade Candidates")
         st.dataframe(results, use_container_width=True)
 
+        # Defensive UI handling: an empty/partially-built result frame must not
+        # raise KeyError and take down the dashboard. Missing execution approval
+        # is treated as False (fail closed).
         if results.empty or "Signal" not in results.columns:
             buys = pd.DataFrame(columns=results.columns)
         else:
             execution_approved = (
                 results["Execution Approved"]
                 if "Execution Approved" in results.columns
-                else pd.Series(False, index=results.index)
+                else pd.Series(False, index=results.index, dtype=bool)
             )
             buys = results[
                 results["Signal"].isin(["BUY YES", "BUY NO"])
                 & execution_approved.fillna(False).astype(bool)
-            ]
+            ].copy()
 
         st.subheader("Actionable Trades")
         st.dataframe(buys, use_container_width=True)
+
+        score_errors = st.session_state.get("score_errors", pd.DataFrame())
+        if isinstance(score_errors, pd.DataFrame) and not score_errors.empty:
+            with st.expander(f"Scoring errors ({len(score_errors)}) — diagnostic"):
+                st.caption(
+                    "These markets were skipped because the model could not score them. "
+                    "Skipped markets are never auto-executed."
+                )
+                st.dataframe(score_errors, use_container_width=True)
 
         st.markdown("---")
         st.subheader("📰 News Validation")
@@ -2558,7 +2620,18 @@ with tab2:
     journal = load_journal()
 
     if len(journal) > 0:
-        st.dataframe(journal, use_container_width=True)
+        # Streamlit/PyArrow cannot serialize a mixed-type object column when
+        # some Execution Token ID values are strings and others are NaN/floats.
+        # Convert only the display copy; the underlying journal data and trading
+        # logic remain unchanged.
+        journal_display = journal.copy()
+        if "Execution Token ID" in journal_display.columns:
+            journal_display["Execution Token ID"] = (
+                journal_display["Execution Token ID"]
+                .where(journal_display["Execution Token ID"].notna(), "")
+                .astype(str)
+            )
+        st.dataframe(journal_display, use_container_width=True)
     else:
         st.info("No trades saved yet.")
 
