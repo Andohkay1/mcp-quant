@@ -561,7 +561,7 @@ def execute_auto_trade(candidate):
     try:
         action, row_number = save_to_journal(row, update_existing=False)
         verify_execution_fields(row_number, {k: row[k] for k in ["Execution Token ID","Execution Outcome","Estimated Fill Price","Executed Amount pUSD","MCP Order ID","CLOB Order ID","Execution Status","Execution Response"]})
-        load_journal.clear()
+        _clear_journal_cache()
     except Exception as e:
         st.session_state["auto_trading_halt"] = True
         return True, f"Trade submitted successfully, but journal update failed: {e}. AUTO trading has been halted to prevent a duplicate. Do not retry."
@@ -585,27 +585,7 @@ def run_auto_trader_once():
         return {"status":"blocked", "message":"Could not safely determine the available MCP balance; auto-trading was blocked."}
     if balance < DEFAULT_AUTO_MIN_BALANCE:
         return {"status":"blocked", "message":f"Balance ${balance:.2f} is below ${DEFAULT_AUTO_MIN_BALANCE:.2f} minimum."}
-    auto_markets = pull_markets()
-    if auto_markets is None or auto_markets.empty:
-        return {"status":"idle","message":"No eligible markets were found."}
-
-    # The overnight execution rule is <2 days remaining. Apply that existing
-    # gate before expensive model scoring; manual screener coverage is unchanged.
-    auto_markets = auto_markets.copy()
-    resolution = pd.to_datetime(
-        auto_markets.get("Resolution Date"), utc=True, errors="coerce"
-    )
-    remaining_days = (
-        resolution - pd.Timestamp(now)
-    ).dt.total_seconds() / 86400.0
-    auto_markets = auto_markets[
-        resolution.notna() & remaining_days.gt(0) & remaining_days.lt(OVERNIGHT_MAX_DAYS_REMAINING)
-    ].copy()
-
-    if auto_markets.empty:
-        return {"status":"idle","message":"No eligible markets with <2 days remaining."}
-
-    results = build_scored_markets(auto_markets)
+    results = build_scored_markets(pull_markets())
     if results.empty: return {"status":"idle","message":"No eligible markets were scored."}
     if "Signal" not in results.columns or "Execution Approved" not in results.columns:
         return {"status": "blocked", "message": "Scoring output is missing required execution columns; auto-trading was blocked safely."}
@@ -1468,6 +1448,8 @@ def pull_markets():
         "rejected_markets": len(financial_candidates) - len(eligible),
         "catalogue_markets_fetched": len(markets_raw),
     }
+    # DataFrame.attrs must remain JSON-serializable for Streamlit. Store plain records,
+    # not a nested DataFrame, which previously triggered repeated serialization errors.
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
     ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]].to_dict("records")
@@ -1712,9 +1694,15 @@ def _safe_streamlit_dataframe(df):
         return pd.DataFrame()
     out = df.copy()
     out.attrs = {}
+    string_columns = {
+        "Execution Token ID", "Execution Outcome", "MCP Order ID", "CLOB Order ID",
+        "Execution Status", "Execution Mode", "Date Saved", "Status", "Result",
+        "clobTokenIds", "Signal", "Market Type", "Ticker", "Asset Phrase"
+    }
     for col in out.columns:
-        if out[col].dtype == "object":
+        if out[col].dtype == "object" or col in string_columns:
             out[col] = out[col].map(lambda v: "" if pd.isna(v) else str(v))
+    out.attrs = {}
     return out
 
 
@@ -1973,8 +1961,8 @@ def verify_execution_fields(sheet_row_number, expected):
 
 
 @st.cache_data(ttl=30)
-def load_journal():
-    """Load the permanent journal from Google Sheets."""
+def _load_journal_from_sheet():
+    """Load the permanent journal from Google Sheets. This is the blocking I/O path."""
     try:
         worksheet = get_journal_worksheet()
         records = worksheet.get_all_records(
@@ -2010,6 +1998,31 @@ def load_journal():
     return df
 
 
+def load_journal():
+    """Return the journal for trading logic; Google Sheets I/O is cached."""
+    return _load_journal_from_sheet()
+
+
+def refresh_ui_journal():
+    """Explicitly refresh the UI journal cache. Avoids blocking page renders on Sheets I/O."""
+    df = _load_journal_from_sheet()
+    st.session_state["ui_journal"] = df.copy()
+    return df
+
+
+def get_ui_journal():
+    """Return the last explicitly loaded journal without making a network call."""
+    df = st.session_state.get("ui_journal")
+    if isinstance(df, pd.DataFrame):
+        return df.copy()
+    return pd.DataFrame(columns=JOURNAL_COLUMNS)
+
+
+def _clear_journal_cache():
+    _load_journal_from_sheet.clear()
+    st.session_state.pop("ui_journal", None)
+
+
 def _write_journal_dataframe(df):
     """Replace the worksheet contents after result updates."""
     worksheet = get_journal_worksheet()
@@ -2043,7 +2056,7 @@ def _write_journal_dataframe(df):
         values=values,
         value_input_option="USER_ENTERED",
     )
-    load_journal.clear()
+    _clear_journal_cache()
 
 
 def update_results():
@@ -2119,13 +2132,29 @@ with tab1:
     st.subheader("🤖 Automatic Overnight Trading")
     st.caption("Auto scans every 10 minutes. It can execute at most 1 trade per cycle and 6 auto trades per ET day. Auto execution is allowed only from 12:00–04:00 ET and only when resolution is under 2 days. All existing execution safeguards remain active.")
     auto_enabled = st.toggle("Enable automatic overnight trading", value=False, key="auto_trading_enabled", help="Requires live_trading_enabled=true in Streamlit Secrets.")
-    aj = load_journal(); ac, oc = get_auto_trade_counts(aj, datetime.now(ET))
-    a1,a2,a3,a4=st.columns(4); a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S")); a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}"); a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}"); a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
+    # Never hit Google Sheets during the main page render. A Sheets/API stall was
+    # making the entire Streamlit page appear blank/loading. Counters use the last
+    # explicitly loaded journal; the trading fragment does its own I/O when due.
+    aj = get_ui_journal(); ac, oc = get_auto_trade_counts(aj, datetime.now(ET))
+    a1,a2,a3,a4=st.columns(4); a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S")); a1.caption("Page is responsive; journal refresh is explicit")
+    a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}"); a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}"); a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
     if auto_enabled:
+        if "auto_next_scan_at" not in st.session_state:
+            # Arm without doing a blocking scan during the initial page render.
+            st.session_state["auto_next_scan_at"] = datetime.now(ET) + timedelta(minutes=AUTO_SCAN_INTERVAL_MINUTES)
+
         @st.fragment(run_every=f"{AUTO_SCAN_INTERVAL_MINUTES}m")
         def automatic_trading_loop():
             try:
+                now_et = datetime.now(ET)
+                next_scan = st.session_state.get("auto_next_scan_at")
+                if next_scan is not None and now_et < next_scan:
+                    remaining = max(1, int((next_scan - now_et).total_seconds() // 60))
+                    st.info(f"🤖 Auto-trader armed. Next scan in about {remaining} min.")
+                    return
+
                 result=run_auto_trader_once()
+                st.session_state["auto_next_scan_at"] = datetime.now(ET) + timedelta(minutes=AUTO_SCAN_INTERVAL_MINUTES)
                 if result["status"]=="executed": st.success("🤖 "+result["message"])
                 elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
                 else: st.info("ℹ️ "+result["message"])
@@ -2138,12 +2167,9 @@ with tab1:
     if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
         scan_stats = markets_df.attrs.get("scan_stats", {})
-        rejections_raw = markets_df.attrs.get("rejections", [])
-        rejections = (
-            pd.DataFrame(rejections_raw)
-            if isinstance(rejections_raw, list)
-            else rejections_raw
-        )
+        rejections = markets_df.attrs.get("rejections", [])
+        if not isinstance(rejections, pd.DataFrame):
+            rejections = pd.DataFrame(rejections)
         markets_df = markets_df.copy()
         markets_df.attrs = {}
         st.session_state["markets_df"] = markets_df
@@ -2245,8 +2271,6 @@ with tab1:
         )
 
         rejected = st.session_state.get("rejections", pd.DataFrame())
-        if isinstance(rejected, list):
-            rejected = pd.DataFrame(rejected)
         if isinstance(rejected, pd.DataFrame) and not rejected.empty:
             with st.expander("See rejected binary price markets and reasons"):
                 st.dataframe(_safe_streamlit_dataframe(rejected), width="stretch")
@@ -2614,7 +2638,7 @@ with tab1:
                                         "Execution Response": order_response,
                                     },
                                 )
-                                load_journal.clear()
+                                _clear_journal_cache()
                                 if journal_action == "updated":
                                     st.success("📒 Existing Google Sheets journal row updated.")
                                 else:
@@ -2662,7 +2686,7 @@ with tab1:
 
                 try:
                     journal_action, _ = save_to_journal(row, update_existing=True)
-                    load_journal.clear()
+                    _clear_journal_cache()
                     if journal_action == "updated":
                         st.success("The existing Google Sheets trade row was refreshed.")
                     else:
@@ -2673,16 +2697,23 @@ with tab1:
 
 with tab2:
     st.subheader("Trade Journal")
+    rj1, rj2 = st.columns(2)
+    if rj1.button("Refresh Journal", key="refresh_journal_button"):
+        try:
+            refresh_ui_journal()
+            st.success("Journal refreshed from Google Sheets.")
+        except Exception as error:
+            st.error(f"Journal could not be refreshed: {error}")
 
-    if st.button("Update Results", key="update_results_button"):
+    if rj2.button("Update Results", key="update_results_button"):
         try:
             journal, updates = update_results()
-            load_journal.clear()
+            _clear_journal_cache()
             st.success(f"Updated {updates} closed trades.")
         except Exception as error:
             st.error(f"Results could not be updated: {error}")
 
-    journal = load_journal()
+    journal = get_ui_journal()
 
     if len(journal) > 0:
         st.dataframe(_safe_streamlit_dataframe(journal), width="stretch")
@@ -2693,7 +2724,7 @@ with tab2:
 with tab3:
     st.subheader("Analytics")
 
-    journal = load_journal()
+    journal = get_ui_journal()
 
     if len(journal) > 0:
         if "Status" in journal.columns:
