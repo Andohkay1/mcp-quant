@@ -561,7 +561,7 @@ def execute_auto_trade(candidate):
     try:
         action, row_number = save_to_journal(row, update_existing=False)
         verify_execution_fields(row_number, {k: row[k] for k in ["Execution Token ID","Execution Outcome","Estimated Fill Price","Executed Amount pUSD","MCP Order ID","CLOB Order ID","Execution Status","Execution Response"]})
-        _clear_journal_cache()
+        load_journal.clear()
     except Exception as e:
         st.session_state["auto_trading_halt"] = True
         return True, f"Trade submitted successfully, but journal update failed: {e}. AUTO trading has been halted to prevent a duplicate. Do not retry."
@@ -1320,7 +1320,7 @@ def find_ticker(market):
     return yahoo_symbol_search(extract_asset_phrase(market))
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def pull_markets():
     """Paginate the stable Gamma discovery feed and keep supported price markets.
 
@@ -1448,11 +1448,13 @@ def pull_markets():
         "rejected_markets": len(financial_candidates) - len(eligible),
         "catalogue_markets_fetched": len(markets_raw),
     }
-    # DataFrame.attrs must remain JSON-serializable for Streamlit. Store plain records,
-    # not a nested DataFrame, which previously triggered repeated serialization errors.
-    eligible.attrs["rejections"] = financial_candidates[
+    rejection_columns = ["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]
+    rejection_df = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
-    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]].to_dict("records")
+    ][rejection_columns].copy()
+    # IMPORTANT: cache_data and Streamlit cannot serialize a DataFrame nested inside
+    # DataFrame.attrs. Store plain Python records instead.
+    eligible.attrs["rejections"] = rejection_df.to_dict("records")
     return eligible
 
 
@@ -1694,15 +1696,21 @@ def _safe_streamlit_dataframe(df):
         return pd.DataFrame()
     out = df.copy()
     out.attrs = {}
-    string_columns = {
-        "Execution Token ID", "Execution Outcome", "MCP Order ID", "CLOB Order ID",
-        "Execution Status", "Execution Mode", "Date Saved", "Status", "Result",
-        "clobTokenIds", "Signal", "Market Type", "Ticker", "Asset Phrase"
-    }
+    # Streamlit/Arrow must never receive mixed Python objects (e.g. floats + strings)
+    # in an object column. Convert every display column to a deterministic string.
     for col in out.columns:
-        if out[col].dtype == "object" or col in string_columns:
-            out[col] = out[col].map(lambda v: "" if pd.isna(v) else str(v))
-    out.attrs = {}
+        def _display_value(v):
+            if v is None:
+                return ""
+            try:
+                if pd.isna(v):
+                    return ""
+            except Exception:
+                pass
+            if isinstance(v, (dict, list, tuple, set)):
+                return json.dumps(v, default=str)
+            return str(v)
+        out[col] = out[col].map(_display_value)
     return out
 
 
@@ -1729,7 +1737,7 @@ def _clean_sheet_value(value):
     return value
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_journal_worksheet():
     """Connect to the permanent Google Sheets trading journal."""
     required_sections = {"google_service_account", "google_sheets"}
@@ -1960,9 +1968,9 @@ def verify_execution_fields(sheet_row_number, expected):
     return saved
 
 
-@st.cache_data(ttl=30)
-def _load_journal_from_sheet():
-    """Load the permanent journal from Google Sheets. This is the blocking I/O path."""
+@st.cache_data(ttl=30, show_spinner=False)
+def load_journal():
+    """Load the permanent journal from Google Sheets."""
     try:
         worksheet = get_journal_worksheet()
         records = worksheet.get_all_records(
@@ -1998,31 +2006,6 @@ def _load_journal_from_sheet():
     return df
 
 
-def load_journal():
-    """Return the journal for trading logic; Google Sheets I/O is cached."""
-    return _load_journal_from_sheet()
-
-
-def refresh_ui_journal():
-    """Explicitly refresh the UI journal cache. Avoids blocking page renders on Sheets I/O."""
-    df = _load_journal_from_sheet()
-    st.session_state["ui_journal"] = df.copy()
-    return df
-
-
-def get_ui_journal():
-    """Return the last explicitly loaded journal without making a network call."""
-    df = st.session_state.get("ui_journal")
-    if isinstance(df, pd.DataFrame):
-        return df.copy()
-    return pd.DataFrame(columns=JOURNAL_COLUMNS)
-
-
-def _clear_journal_cache():
-    _load_journal_from_sheet.clear()
-    st.session_state.pop("ui_journal", None)
-
-
 def _write_journal_dataframe(df):
     """Replace the worksheet contents after result updates."""
     worksheet = get_journal_worksheet()
@@ -2056,7 +2039,7 @@ def _write_journal_dataframe(df):
         values=values,
         value_input_option="USER_ENTERED",
     )
-    _clear_journal_cache()
+    load_journal.clear()
 
 
 def update_results():
@@ -2132,44 +2115,67 @@ with tab1:
     st.subheader("🤖 Automatic Overnight Trading")
     st.caption("Auto scans every 10 minutes. It can execute at most 1 trade per cycle and 6 auto trades per ET day. Auto execution is allowed only from 12:00–04:00 ET and only when resolution is under 2 days. All existing execution safeguards remain active.")
     auto_enabled = st.toggle("Enable automatic overnight trading", value=False, key="auto_trading_enabled", help="Requires live_trading_enabled=true in Streamlit Secrets.")
-    # Never hit Google Sheets during the main page render. A Sheets/API stall was
-    # making the entire Streamlit page appear blank/loading. Counters use the last
-    # explicitly loaded journal; the trading fragment does its own I/O when due.
-    aj = get_ui_journal(); ac, oc = get_auto_trade_counts(aj, datetime.now(ET))
-    a1,a2,a3,a4=st.columns(4); a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S")); a1.caption("Page is responsive; journal refresh is explicit")
-    a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}"); a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}"); a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
-    if auto_enabled:
-        if "auto_next_scan_at" not in st.session_state:
-            # Arm without doing a blocking scan during the initial page render.
-            st.session_state["auto_next_scan_at"] = datetime.now(ET) + timedelta(minutes=AUTO_SCAN_INTERVAL_MINUTES)
 
+    # Do NOT call Google Sheets during the main page render. A slow Sheets request
+    # previously blocked the entire UI and, on repeated reruns, exhausted Streamlit
+    # worker threads. Counters are refreshed by the auto fragment instead.
+    ac = st.session_state.get("auto_trades_today", None)
+    oc = st.session_state.get("auto_open_trades", None)
+    a1,a2,a3,a4=st.columns(4)
+    a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S"))
+    a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}" if ac is not None else f"—/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}")
+    a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}" if oc is not None else f"—/{DEFAULT_AUTO_MAX_OPEN_TRADES}")
+    a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
+
+    if auto_enabled:
         @st.fragment(run_every=f"{AUTO_SCAN_INTERVAL_MINUTES}m")
         def automatic_trading_loop():
             try:
-                now_et = datetime.now(ET)
-                next_scan = st.session_state.get("auto_next_scan_at")
-                if next_scan is not None and now_et < next_scan:
-                    remaining = max(1, int((next_scan - now_et).total_seconds() // 60))
-                    st.info(f"🤖 Auto-trader armed. Next scan in about {remaining} min.")
+                # Never let the first fragment invocation block the initial page load.
+                # The regular 10-minute fragment cadence performs the first real cycle.
+                if not st.session_state.get("auto_fragment_armed", False):
+                    st.session_state["auto_fragment_armed"] = True
+                    st.info("🤖 Automatic trading armed. First scan will run on the 10-minute cycle.")
                     return
 
-                result=run_auto_trader_once()
-                st.session_state["auto_next_scan_at"] = datetime.now(ET) + timedelta(minutes=AUTO_SCAN_INTERVAL_MINUTES)
-                if result["status"]=="executed": st.success("🤖 "+result["message"])
-                elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
-                else: st.info("ℹ️ "+result["message"])
+                if st.session_state.get("auto_cycle_running", False):
+                    st.info("⏳ Previous automatic trading cycle is still running; skipping this cycle.")
+                    return
+
+                st.session_state["auto_cycle_running"] = True
+                try:
+                    result=run_auto_trader_once()
+                    # Refresh counters only inside the isolated fragment, never on the main render.
+                    try:
+                        aj = load_journal()
+                        ac2, oc2 = get_auto_trade_counts(aj, datetime.now(ET))
+                        st.session_state["auto_trades_today"] = ac2
+                        st.session_state["auto_open_trades"] = oc2
+                    except Exception as count_error:
+                        st.warning(f"Trade executed/checked, but status counters could not refresh: {count_error}")
+                    if result["status"]=="executed": st.success("🤖 "+result["message"])
+                    elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
+                    else: st.info("ℹ️ "+result["message"])
+                finally:
+                    st.session_state["auto_cycle_running"] = False
             except Exception as e: st.error(f"Automatic trading cycle failed safely: {e}")
         automatic_trading_loop()
-    else: st.info("Automatic trading is OFF.")
+    else:
+        st.session_state["auto_fragment_armed"] = False
+        st.info("Automatic trading is OFF.")
     st.markdown("---")
     st.subheader("Run Market Screener")
 
     if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
         scan_stats = markets_df.attrs.get("scan_stats", {})
-        rejections = markets_df.attrs.get("rejections", [])
-        if not isinstance(rejections, pd.DataFrame):
-            rejections = pd.DataFrame(rejections)
+        rejection_payload = markets_df.attrs.get("rejections", [])
+        if isinstance(rejection_payload, pd.DataFrame):
+            rejections = rejection_payload.copy()
+        elif isinstance(rejection_payload, list):
+            rejections = pd.DataFrame(rejection_payload)
+        else:
+            rejections = pd.DataFrame()
         markets_df = markets_df.copy()
         markets_df.attrs = {}
         st.session_state["markets_df"] = markets_df
@@ -2638,7 +2644,7 @@ with tab1:
                                         "Execution Response": order_response,
                                     },
                                 )
-                                _clear_journal_cache()
+                                load_journal.clear()
                                 if journal_action == "updated":
                                     st.success("📒 Existing Google Sheets journal row updated.")
                                 else:
@@ -2686,7 +2692,7 @@ with tab1:
 
                 try:
                     journal_action, _ = save_to_journal(row, update_existing=True)
-                    _clear_journal_cache()
+                    load_journal.clear()
                     if journal_action == "updated":
                         st.success("The existing Google Sheets trade row was refreshed.")
                     else:
@@ -2697,23 +2703,16 @@ with tab1:
 
 with tab2:
     st.subheader("Trade Journal")
-    rj1, rj2 = st.columns(2)
-    if rj1.button("Refresh Journal", key="refresh_journal_button"):
-        try:
-            refresh_ui_journal()
-            st.success("Journal refreshed from Google Sheets.")
-        except Exception as error:
-            st.error(f"Journal could not be refreshed: {error}")
 
-    if rj2.button("Update Results", key="update_results_button"):
+    if st.button("Update Results", key="update_results_button"):
         try:
             journal, updates = update_results()
-            _clear_journal_cache()
+            load_journal.clear()
             st.success(f"Updated {updates} closed trades.")
         except Exception as error:
             st.error(f"Results could not be updated: {error}")
 
-    journal = get_ui_journal()
+    journal = load_journal()
 
     if len(journal) > 0:
         st.dataframe(_safe_streamlit_dataframe(journal), width="stretch")
@@ -2724,7 +2723,7 @@ with tab2:
 with tab3:
     st.subheader("Analytics")
 
-    journal = get_ui_journal()
+    journal = load_journal()
 
     if len(journal) > 0:
         if "Status" in journal.columns:
