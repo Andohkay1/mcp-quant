@@ -69,6 +69,22 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def _safe_streamlit_dataframe(df):
+    """Return a display-only Arrow-safe copy without changing source data."""
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    display_df = df.copy()
+    # DataFrame attrs can contain nested DataFrames and break Streamlit serialization.
+    display_df.attrs = {}
+    # Object columns may contain mixed str/float values (e.g. execution token IDs).
+    for column in display_df.columns:
+        if display_df[column].dtype == "object":
+            display_df[column] = display_df[column].map(
+                lambda value: "" if pd.isna(value) else str(value)
+            )
+    return display_df
+
+
 def forecast_confidence(ewma_probability, historical_probability, liquidity):
     """Transparent confidence label for forecast review."""
     disagreement = abs(_safe_float(ewma_probability) - _safe_float(historical_probability))
@@ -716,14 +732,26 @@ def token_for_signal(row):
 
 
 class MCPQuantEngine:
+    def __init__(self):
+        # Reuse downloaded price history during one scan. This prevents the same
+        # ticker from spawning repeated Yahoo requests and keeps Cloud resource
+        # usage bounded without changing model calculations.
+        self._price_cache = {}
+        self._ohlc_cache = {}
+
     def get_prices(self, ticker, period="5y"):
-        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+        cache_key = (str(ticker), str(period))
+        if cache_key in self._price_cache:
+            return self._price_cache[cache_key].copy()
+        data = yf.download(ticker, period=period, auto_adjust=True, progress=False, threads=False)
         close = data["Close"]
 
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
 
-        return close.dropna()
+        close = close.dropna()
+        self._price_cache[cache_key] = close.copy()
+        return close
 
     def ewma_volatility(self, close):
         returns = np.log(close / close.shift(1)).dropna()
@@ -761,10 +789,15 @@ class MCPQuantEngine:
         return (future_returns <= required_return).mean() * 100
 
     def get_ohlc(self, ticker, period="5y", interval="1d"):
-        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+        cache_key = (str(ticker), str(period), str(interval))
+        if cache_key in self._ohlc_cache:
+            return self._ohlc_cache[cache_key].copy()
+        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
-        return data.dropna(how="all")
+        data = data.dropna(how="all")
+        self._ohlc_cache[cache_key] = data.copy()
+        return data
 
     def ewma_barrier_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
@@ -2164,7 +2197,7 @@ with tab1:
         st.subheader("Filtered Markets")
 
         st.dataframe(
-            markets_df[
+            _safe_streamlit_dataframe(markets_df[
                 [
                     "Market",
                     "Market Type",
@@ -2177,14 +2210,14 @@ with tab1:
                     "Days",
                     "Liquidity",
                 ]
-            ],
+            ]),
             use_container_width=True,
         )
 
         rejected = st.session_state.get("rejections", pd.DataFrame())
         if isinstance(rejected, pd.DataFrame) and not rejected.empty:
             with st.expander("See rejected binary price markets and reasons"):
-                st.dataframe(rejected, use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(rejected), use_container_width=True)
 
     if "results" in st.session_state:
         results = st.session_state["results"]
@@ -2192,7 +2225,7 @@ with tab1:
             results = pd.DataFrame()
 
         st.subheader("Top Trade Candidates")
-        st.dataframe(results, use_container_width=True)
+        st.dataframe(_safe_streamlit_dataframe(results), use_container_width=True)
 
         # Defensive UI handling: an empty/partially-built result frame must not
         # raise KeyError and take down the dashboard. Missing execution approval
@@ -2211,7 +2244,7 @@ with tab1:
             ].copy()
 
         st.subheader("Actionable Trades")
-        st.dataframe(buys, use_container_width=True)
+        st.dataframe(_safe_streamlit_dataframe(buys), use_container_width=True)
 
         score_errors = st.session_state.get("score_errors", pd.DataFrame())
         if isinstance(score_errors, pd.DataFrame) and not score_errors.empty:
@@ -2220,7 +2253,7 @@ with tab1:
                     "These markets were skipped because the model could not score them. "
                     "Skipped markets are never auto-executed."
                 )
-                st.dataframe(score_errors, use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(score_errors), use_container_width=True)
 
         st.markdown("---")
         st.subheader("📰 News Validation")
@@ -2238,7 +2271,7 @@ with tab1:
             if st.button("Get News", key="get_news_button"):
                 news_df = get_news(ticker_for_news)
 
-                st.dataframe(news_df, use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(news_df), use_container_width=True)
 
                 st.info(
                     "Use news as validation only. News should confirm or reject "
@@ -2620,18 +2653,7 @@ with tab2:
     journal = load_journal()
 
     if len(journal) > 0:
-        # Streamlit/PyArrow cannot serialize a mixed-type object column when
-        # some Execution Token ID values are strings and others are NaN/floats.
-        # Convert only the display copy; the underlying journal data and trading
-        # logic remain unchanged.
-        journal_display = journal.copy()
-        if "Execution Token ID" in journal_display.columns:
-            journal_display["Execution Token ID"] = (
-                journal_display["Execution Token ID"]
-                .where(journal_display["Execution Token ID"].notna(), "")
-                .astype(str)
-            )
-        st.dataframe(journal_display, use_container_width=True)
+        st.dataframe(_safe_streamlit_dataframe(journal), use_container_width=True)
     else:
         st.info("No trades saved yet.")
 
@@ -2766,7 +2788,7 @@ with tab3:
                 calibration["Actual_YES_Rate"] *= 100
                 calibration = calibration[calibration["Forecasts"] > 0]
                 st.subheader("Calibration by Probability Band")
-                st.dataframe(calibration, use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(calibration), use_container_width=True)
             else:
                 st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
     else:
