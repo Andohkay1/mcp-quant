@@ -585,7 +585,27 @@ def run_auto_trader_once():
         return {"status":"blocked", "message":"Could not safely determine the available MCP balance; auto-trading was blocked."}
     if balance < DEFAULT_AUTO_MIN_BALANCE:
         return {"status":"blocked", "message":f"Balance ${balance:.2f} is below ${DEFAULT_AUTO_MIN_BALANCE:.2f} minimum."}
-    results = build_scored_markets(pull_markets())
+    auto_markets = pull_markets()
+    if auto_markets is None or auto_markets.empty:
+        return {"status":"idle","message":"No eligible markets were found."}
+
+    # The overnight execution rule is <2 days remaining. Apply that existing
+    # gate before expensive model scoring; manual screener coverage is unchanged.
+    auto_markets = auto_markets.copy()
+    resolution = pd.to_datetime(
+        auto_markets.get("Resolution Date"), utc=True, errors="coerce"
+    )
+    remaining_days = (
+        resolution - pd.Timestamp(now)
+    ).dt.total_seconds() / 86400.0
+    auto_markets = auto_markets[
+        resolution.notna() & remaining_days.gt(0) & remaining_days.lt(OVERNIGHT_MAX_DAYS_REMAINING)
+    ].copy()
+
+    if auto_markets.empty:
+        return {"status":"idle","message":"No eligible markets with <2 days remaining."}
+
+    results = build_scored_markets(auto_markets)
     if results.empty: return {"status":"idle","message":"No eligible markets were scored."}
     if "Signal" not in results.columns or "Execution Approved" not in results.columns:
         return {"status": "blocked", "message": "Scoring output is missing required execution columns; auto-trading was blocked safely."}
@@ -1450,7 +1470,7 @@ def pull_markets():
     }
     eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
-    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]]
+    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]].to_dict("records")
     return eligible
 
 
@@ -2118,7 +2138,12 @@ with tab1:
     if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
         scan_stats = markets_df.attrs.get("scan_stats", {})
-        rejections = markets_df.attrs.get("rejections", pd.DataFrame())
+        rejections_raw = markets_df.attrs.get("rejections", [])
+        rejections = (
+            pd.DataFrame(rejections_raw)
+            if isinstance(rejections_raw, list)
+            else rejections_raw
+        )
         markets_df = markets_df.copy()
         markets_df.attrs = {}
         st.session_state["markets_df"] = markets_df
@@ -2220,6 +2245,8 @@ with tab1:
         )
 
         rejected = st.session_state.get("rejections", pd.DataFrame())
+        if isinstance(rejected, list):
+            rejected = pd.DataFrame(rejected)
         if isinstance(rejected, pd.DataFrame) and not rejected.empty:
             with st.expander("See rejected binary price markets and reasons"):
                 st.dataframe(_safe_streamlit_dataframe(rejected), width="stretch")
