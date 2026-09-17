@@ -69,22 +69,6 @@ def _safe_float(value, default=0.0):
         return default
 
 
-def _safe_streamlit_dataframe(df):
-    """Return a display-only Arrow-safe copy without changing source data."""
-    if not isinstance(df, pd.DataFrame):
-        return pd.DataFrame()
-    display_df = df.copy()
-    # DataFrame attrs can contain nested DataFrames and break Streamlit serialization.
-    display_df.attrs = {}
-    # Object columns may contain mixed str/float values (e.g. execution token IDs).
-    for column in display_df.columns:
-        if display_df[column].dtype == "object":
-            display_df[column] = display_df[column].map(
-                lambda value: "" if pd.isna(value) else str(value)
-            )
-    return display_df
-
-
 def forecast_confidence(ewma_probability, historical_probability, liquidity):
     """Transparent confidence label for forecast review."""
     disagreement = abs(_safe_float(ewma_probability) - _safe_float(historical_probability))
@@ -733,16 +717,13 @@ def token_for_signal(row):
 
 class MCPQuantEngine:
     def __init__(self):
-        # Reuse downloaded price history during one scan. This prevents the same
-        # ticker from spawning repeated Yahoo requests and keeps Cloud resource
-        # usage bounded without changing model calculations.
         self._price_cache = {}
         self._ohlc_cache = {}
 
     def get_prices(self, ticker, period="5y"):
-        cache_key = (str(ticker), str(period))
-        if cache_key in self._price_cache:
-            return self._price_cache[cache_key].copy()
+        key = (str(ticker).upper(), str(period))
+        if key in self._price_cache:
+            return self._price_cache[key].copy()
         data = yf.download(ticker, period=period, auto_adjust=True, progress=False, threads=False)
         close = data["Close"]
 
@@ -750,8 +731,8 @@ class MCPQuantEngine:
             close = close.iloc[:, 0]
 
         close = close.dropna()
-        self._price_cache[cache_key] = close.copy()
-        return close
+        self._price_cache[key] = close.copy()
+        return close.copy()
 
     def ewma_volatility(self, close):
         returns = np.log(close / close.shift(1)).dropna()
@@ -789,15 +770,15 @@ class MCPQuantEngine:
         return (future_returns <= required_return).mean() * 100
 
     def get_ohlc(self, ticker, period="5y", interval="1d"):
-        cache_key = (str(ticker), str(period), str(interval))
-        if cache_key in self._ohlc_cache:
-            return self._ohlc_cache[cache_key].copy()
+        key = (str(ticker).upper(), str(period), str(interval))
+        if key in self._ohlc_cache:
+            return self._ohlc_cache[key].copy()
         data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         data = data.dropna(how="all")
-        self._ohlc_cache[cache_key] = data.copy()
-        return data
+        self._ohlc_cache[key] = data.copy()
+        return data.copy()
 
     def ewma_barrier_probability(self, ticker, target, days, direction):
         close = self.get_prices(ticker, "1y")
@@ -1705,6 +1686,18 @@ NUMERIC_JOURNAL_COLUMNS = [
 ]
 
 
+def _safe_streamlit_dataframe(df):
+    """Display-only Arrow-safe copy; source DataFrame remains unchanged."""
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    out = df.copy()
+    out.attrs = {}
+    for col in out.columns:
+        if out[col].dtype == "object":
+            out[col] = out[col].map(lambda v: "" if pd.isna(v) else str(v))
+    return out
+
+
 def _clean_sheet_value(value):
     """Convert Python and pandas values to Google Sheets-safe values."""
     if value is None:
@@ -1988,6 +1981,12 @@ def load_journal():
     if "PnL" in df.columns:
         df["PnL"] = df["PnL"].fillna(0.0)
 
+    for column in ["clobTokenIds", "Execution Token ID", "Execution Outcome",
+                   "MCP Order ID", "CLOB Order ID", "Execution Status",
+                   "Execution Mode", "Date Saved", "Status", "Result"]:
+        if column in df.columns:
+            df[column] = df[column].fillna("").astype(str)
+
     return df
 
 
@@ -2118,9 +2117,13 @@ with tab1:
 
     if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
+        scan_stats = markets_df.attrs.get("scan_stats", {})
+        rejections = markets_df.attrs.get("rejections", pd.DataFrame())
+        markets_df = markets_df.copy()
+        markets_df.attrs = {}
         st.session_state["markets_df"] = markets_df
-        st.session_state["scan_stats"] = markets_df.attrs.get("scan_stats", {})
-        st.session_state["rejections"] = markets_df.attrs.get("rejections", pd.DataFrame())
+        st.session_state["scan_stats"] = scan_stats
+        st.session_state["rejections"] = rejections
 
         engine = MCPQuantEngine()
         scored = []
@@ -2197,27 +2200,29 @@ with tab1:
         st.subheader("Filtered Markets")
 
         st.dataframe(
-            _safe_streamlit_dataframe(markets_df[
-                [
-                    "Market",
-                    "Market Type",
-                    "Ticker",
-                    "Target",
-                    "Upper",
-                    "Direction",
-                    "Market Prob %",
-                    "No Prob %",
-                    "Days",
-                    "Liquidity",
+            _safe_streamlit_dataframe(
+                markets_df[
+                    [
+                        "Market",
+                        "Market Type",
+                        "Ticker",
+                        "Target",
+                        "Upper",
+                        "Direction",
+                        "Market Prob %",
+                        "No Prob %",
+                        "Days",
+                        "Liquidity",
+                    ]
                 ]
-            ]),
-            use_container_width=True,
+            ),
+            width="stretch",
         )
 
         rejected = st.session_state.get("rejections", pd.DataFrame())
         if isinstance(rejected, pd.DataFrame) and not rejected.empty:
             with st.expander("See rejected binary price markets and reasons"):
-                st.dataframe(_safe_streamlit_dataframe(rejected), use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(rejected), width="stretch")
 
     if "results" in st.session_state:
         results = st.session_state["results"]
@@ -2225,7 +2230,7 @@ with tab1:
             results = pd.DataFrame()
 
         st.subheader("Top Trade Candidates")
-        st.dataframe(_safe_streamlit_dataframe(results), use_container_width=True)
+        st.dataframe(_safe_streamlit_dataframe(results), width="stretch")
 
         # Defensive UI handling: an empty/partially-built result frame must not
         # raise KeyError and take down the dashboard. Missing execution approval
@@ -2244,7 +2249,7 @@ with tab1:
             ].copy()
 
         st.subheader("Actionable Trades")
-        st.dataframe(_safe_streamlit_dataframe(buys), use_container_width=True)
+        st.dataframe(_safe_streamlit_dataframe(buys), width="stretch")
 
         score_errors = st.session_state.get("score_errors", pd.DataFrame())
         if isinstance(score_errors, pd.DataFrame) and not score_errors.empty:
@@ -2253,7 +2258,7 @@ with tab1:
                     "These markets were skipped because the model could not score them. "
                     "Skipped markets are never auto-executed."
                 )
-                st.dataframe(_safe_streamlit_dataframe(score_errors), use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(score_errors), width="stretch")
 
         st.markdown("---")
         st.subheader("📰 News Validation")
@@ -2271,7 +2276,7 @@ with tab1:
             if st.button("Get News", key="get_news_button"):
                 news_df = get_news(ticker_for_news)
 
-                st.dataframe(_safe_streamlit_dataframe(news_df), use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(news_df), width="stretch")
 
                 st.info(
                     "Use news as validation only. News should confirm or reject "
@@ -2653,7 +2658,7 @@ with tab2:
     journal = load_journal()
 
     if len(journal) > 0:
-        st.dataframe(_safe_streamlit_dataframe(journal), use_container_width=True)
+        st.dataframe(_safe_streamlit_dataframe(journal), width="stretch")
     else:
         st.info("No trades saved yet.")
 
@@ -2788,7 +2793,7 @@ with tab3:
                 calibration["Actual_YES_Rate"] *= 100
                 calibration = calibration[calibration["Forecasts"] > 0]
                 st.subheader("Calibration by Probability Band")
-                st.dataframe(_safe_streamlit_dataframe(calibration), use_container_width=True)
+                st.dataframe(_safe_streamlit_dataframe(calibration), width="stretch")
             else:
                 st.info("Brier score and calibration will appear after resolved YES/NO trades are available.")
     else:
