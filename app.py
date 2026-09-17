@@ -573,7 +573,10 @@ def run_auto_trader_once():
         return {"status": "blocked", "message": "Auto-trading is halted for this session after a journal/execution safety error."}
     now = datetime.now(timezone.utc)
     if not is_overnight_window_et(now): return {"status":"idle","message":"Auto-trading is active only from 12:00–04:00 ET."}
-    journal = load_journal().copy(); today, open_count = get_auto_trade_counts(journal, now.astimezone(ET))
+    journal = load_journal().copy()
+    today, open_count = get_auto_trade_counts(journal, now.astimezone(ET))
+    st.session_state["journal_df"] = journal.copy()
+    st.session_state["auto_counts"] = (today, open_count)
     if today >= DEFAULT_AUTO_MAX_TRADES_PER_DAY: return {"status":"blocked","message":f"Daily auto-trade limit reached ({today}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY})."}
     if open_count >= DEFAULT_AUTO_MAX_OPEN_TRADES: return {"status":"blocked","message":f"Open-trade limit reached ({open_count}/{DEFAULT_AUTO_MAX_OPEN_TRADES})."}
     client = MCPTradingClient()
@@ -1320,7 +1323,7 @@ def find_ticker(market):
     return yahoo_symbol_search(extract_asset_phrase(market))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300)
 def pull_markets():
     """Paginate the stable Gamma discovery feed and keep supported price markets.
 
@@ -1448,13 +1451,12 @@ def pull_markets():
         "rejected_markets": len(financial_candidates) - len(eligible),
         "catalogue_markets_fetched": len(markets_raw),
     }
-    rejection_columns = ["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]
-    rejection_df = financial_candidates[
+    # Store rejection rows as plain records, not a nested DataFrame. Streamlit
+    # attempts to serialize DataFrame.attrs and nested DataFrames cause repeated
+    # "Could not serialize pd.DataFrame.attrs" warnings.
+    eligible.attrs["rejections"] = financial_candidates[
         financial_candidates["Screen Result"] != "Eligible"
-    ][rejection_columns].copy()
-    # IMPORTANT: cache_data and Streamlit cannot serialize a DataFrame nested inside
-    # DataFrame.attrs. Store plain Python records instead.
-    eligible.attrs["rejections"] = rejection_df.to_dict("records")
+    ][["Market", "Market Type", "Asset Phrase", "Ticker", "Screen Result", "Liquidity", "Days"]].to_dict("records")
     return eligible
 
 
@@ -1691,26 +1693,62 @@ NUMERIC_JOURNAL_COLUMNS = [
 
 
 def _safe_streamlit_dataframe(df):
-    """Display-only Arrow-safe copy; source DataFrame remains unchanged."""
+    """Return a display-only DataFrame that is safe for Streamlit/Arrow serialization."""
     if not isinstance(df, pd.DataFrame):
         return pd.DataFrame()
-    out = df.copy()
+
+    out = df.copy(deep=True)
+    # DataFrame.attrs is not needed for display and can contain non-serializable
+    # objects such as nested DataFrames. Never pass those attrs to Streamlit.
     out.attrs = {}
-    # Streamlit/Arrow must never receive mixed Python objects (e.g. floats + strings)
-    # in an object column. Convert every display column to a deterministic string.
-    for col in out.columns:
-        def _display_value(v):
-            if v is None:
+
+    def _display_value(value):
+        if value is None:
+            return ""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, np.bool_)) and bool(missing):
                 return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, (list, tuple, dict, set)):
             try:
-                if pd.isna(v):
-                    return ""
+                return json.dumps(value, default=str)
             except Exception:
-                pass
-            if isinstance(v, (dict, list, tuple, set)):
-                return json.dumps(v, default=str)
-            return str(v)
-        out[col] = out[col].map(_display_value)
+                return str(value)
+        if isinstance(value, (pd.Timestamp, datetime, np.datetime64)):
+            return str(value)
+        if isinstance(value, np.generic):
+            try:
+                return value.item()
+            except Exception:
+                return str(value)
+        return value
+
+    for col in out.columns:
+        series = out[col]
+        # Mixed/object columns are the source of the recurring ArrowTypeError
+        # (for example Execution Token ID containing strings and floats).
+        if (
+            pd.api.types.is_object_dtype(series)
+            or pd.api.types.is_string_dtype(series)
+            or pd.api.types.is_categorical_dtype(series)
+            or pd.api.types.is_datetime64_any_dtype(series)
+            or pd.api.types.is_datetime64tz_dtype(series)
+        ):
+            out[col] = series.map(_display_value).astype(str)
+        elif pd.api.types.is_extension_array_dtype(series):
+            # Normalize nullable extension arrays to ordinary Python-friendly
+            # values while preserving numeric columns where possible.
+            if pd.api.types.is_numeric_dtype(series):
+                out[col] = pd.to_numeric(series, errors="coerce")
+            else:
+                out[col] = series.map(_display_value).astype(str)
+
+    # Explicitly normalize the historically problematic execution identifier.
+    if "Execution Token ID" in out.columns:
+        out["Execution Token ID"] = out["Execution Token ID"].map(_display_value).astype(str)
+
     return out
 
 
@@ -1737,7 +1775,7 @@ def _clean_sheet_value(value):
     return value
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def get_journal_worksheet():
     """Connect to the permanent Google Sheets trading journal."""
     required_sections = {"google_service_account", "google_sheets"}
@@ -1968,7 +2006,7 @@ def verify_execution_fields(sheet_row_number, expected):
     return saved
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=30)
 def load_journal():
     """Load the permanent journal from Google Sheets."""
     try:
@@ -2115,67 +2153,38 @@ with tab1:
     st.subheader("🤖 Automatic Overnight Trading")
     st.caption("Auto scans every 10 minutes. It can execute at most 1 trade per cycle and 6 auto trades per ET day. Auto execution is allowed only from 12:00–04:00 ET and only when resolution is under 2 days. All existing execution safeguards remain active.")
     auto_enabled = st.toggle("Enable automatic overnight trading", value=False, key="auto_trading_enabled", help="Requires live_trading_enabled=true in Streamlit Secrets.")
-
-    # Do NOT call Google Sheets during the main page render. A slow Sheets request
-    # previously blocked the entire UI and, on repeated reruns, exhausted Streamlit
-    # worker threads. Counters are refreshed by the auto fragment instead.
-    ac = st.session_state.get("auto_trades_today", None)
-    oc = st.session_state.get("auto_open_trades", None)
-    a1,a2,a3,a4=st.columns(4)
-    a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S"))
-    a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}" if ac is not None else f"—/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}")
-    a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}" if oc is not None else f"—/{DEFAULT_AUTO_MAX_OPEN_TRADES}")
-    a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
-
+    # Do not contact Google Sheets during the normal page render. Streamlit tabs
+    # render eagerly, so an unconditional load here used to block the entire app.
+    ac, oc = st.session_state.get("auto_counts", (0, 0))
+    a1,a2,a3,a4=st.columns(4); a1.metric("ET Time",datetime.now(ET).strftime("%H:%M:%S")); a2.metric("Auto Trades Today",f"{ac}/{DEFAULT_AUTO_MAX_TRADES_PER_DAY}"); a3.metric("Open Trades",f"{oc}/{DEFAULT_AUTO_MAX_OPEN_TRADES}"); a4.metric("Auto Window","OPEN" if is_overnight_window_et() else "CLOSED")
+    if st.button("Refresh Journal Stats", key="refresh_journal_stats_button"):
+        try:
+            aj = load_journal().copy()
+            ac, oc = get_auto_trade_counts(aj, datetime.now(ET))
+            st.session_state["auto_counts"] = (ac, oc)
+            st.session_state["journal_df"] = aj
+            st.rerun()
+        except Exception as error:
+            st.error(f"Journal stats could not be refreshed: {error}")
     if auto_enabled:
         @st.fragment(run_every=f"{AUTO_SCAN_INTERVAL_MINUTES}m")
         def automatic_trading_loop():
             try:
-                # Never let the first fragment invocation block the initial page load.
-                # The regular 10-minute fragment cadence performs the first real cycle.
-                if not st.session_state.get("auto_fragment_armed", False):
-                    st.session_state["auto_fragment_armed"] = True
-                    st.info("🤖 Automatic trading armed. First scan will run on the 10-minute cycle.")
-                    return
-
-                if st.session_state.get("auto_cycle_running", False):
-                    st.info("⏳ Previous automatic trading cycle is still running; skipping this cycle.")
-                    return
-
-                st.session_state["auto_cycle_running"] = True
-                try:
-                    result=run_auto_trader_once()
-                    # Refresh counters only inside the isolated fragment, never on the main render.
-                    try:
-                        aj = load_journal()
-                        ac2, oc2 = get_auto_trade_counts(aj, datetime.now(ET))
-                        st.session_state["auto_trades_today"] = ac2
-                        st.session_state["auto_open_trades"] = oc2
-                    except Exception as count_error:
-                        st.warning(f"Trade executed/checked, but status counters could not refresh: {count_error}")
-                    if result["status"]=="executed": st.success("🤖 "+result["message"])
-                    elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
-                    else: st.info("ℹ️ "+result["message"])
-                finally:
-                    st.session_state["auto_cycle_running"] = False
+                result=run_auto_trader_once()
+                if result["status"]=="executed": st.success("🤖 "+result["message"])
+                elif result["status"]=="blocked": st.warning("🛑 "+result["message"])
+                else: st.info("ℹ️ "+result["message"])
             except Exception as e: st.error(f"Automatic trading cycle failed safely: {e}")
         automatic_trading_loop()
-    else:
-        st.session_state["auto_fragment_armed"] = False
-        st.info("Automatic trading is OFF.")
+    else: st.info("Automatic trading is OFF.")
     st.markdown("---")
     st.subheader("Run Market Screener")
 
     if st.button("Run MCP Screener", key="run_screener_button"):
         markets_df = pull_markets()
         scan_stats = markets_df.attrs.get("scan_stats", {})
-        rejection_payload = markets_df.attrs.get("rejections", [])
-        if isinstance(rejection_payload, pd.DataFrame):
-            rejections = rejection_payload.copy()
-        elif isinstance(rejection_payload, list):
-            rejections = pd.DataFrame(rejection_payload)
-        else:
-            rejections = pd.DataFrame()
+        rejections_raw = markets_df.attrs.get("rejections", [])
+        rejections = pd.DataFrame(rejections_raw) if isinstance(rejections_raw, list) else pd.DataFrame()
         markets_df = markets_df.copy()
         markets_df.attrs = {}
         st.session_state["markets_df"] = markets_df
@@ -2188,7 +2197,9 @@ with tab1:
         # Use only CLOSED trades with a resolved YES/NO outcome for calibration.
         # This uses the same definition of a resolved trade as Analytics.
         # Open trades never train the calibration layer.
-        calibration_journal = load_journal()
+        calibration_journal = load_journal().copy()
+        st.session_state["journal_df"] = calibration_journal.copy()
+        st.session_state["auto_counts"] = get_auto_trade_counts(calibration_journal, datetime.now(ET))
 
         if (
             not calibration_journal.empty
@@ -2704,28 +2715,39 @@ with tab1:
 with tab2:
     st.subheader("Trade Journal")
 
-    if st.button("Update Results", key="update_results_button"):
+    c_refresh, c_update = st.columns(2)
+    if c_refresh.button("Load / Refresh Journal", key="load_refresh_journal_button"):
+        try:
+            journal = load_journal().copy()
+            st.session_state["journal_df"] = journal
+            st.session_state["auto_counts"] = get_auto_trade_counts(journal, datetime.now(ET))
+            st.success("Journal refreshed.")
+        except Exception as error:
+            st.error(f"Journal could not be loaded: {error}")
+
+    if c_update.button("Update Results", key="update_results_button"):
         try:
             journal, updates = update_results()
             load_journal.clear()
+            journal = journal.copy()
+            st.session_state["journal_df"] = journal
+            st.session_state["auto_counts"] = get_auto_trade_counts(journal, datetime.now(ET))
             st.success(f"Updated {updates} closed trades.")
         except Exception as error:
             st.error(f"Results could not be updated: {error}")
 
-    journal = load_journal()
-
-    if len(journal) > 0:
+    journal = st.session_state.get("journal_df", pd.DataFrame())
+    if isinstance(journal, pd.DataFrame) and len(journal) > 0:
         st.dataframe(_safe_streamlit_dataframe(journal), width="stretch")
     else:
-        st.info("No trades saved yet.")
+        st.info("Journal is not loaded. Click **Load / Refresh Journal** when you want to view it.")
 
 
 with tab3:
     st.subheader("Analytics")
 
-    journal = load_journal()
-
-    if len(journal) > 0:
+    journal = st.session_state.get("journal_df", pd.DataFrame())
+    if isinstance(journal, pd.DataFrame) and len(journal) > 0:
         if "Status" in journal.columns:
             closed = journal[journal["Status"] == "Closed"]
             open_trades = journal[journal["Status"] != "Closed"]
